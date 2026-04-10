@@ -128,6 +128,31 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def _post_slow_down(server_base: str, forward_sleep_time: Optional[float]) -> None:
+    """POST /slow_down on a SGLang HTTP server (SGLANG admin/testing endpoint)."""
+    url = server_base.rstrip("/") + "/slow_down"
+    try:
+        resp = requests.post(
+            url,
+            json={"forward_sleep_time": forward_sleep_time},
+            headers=get_auth_headers(),
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            print(
+                f"Warning: slow_down POST {url} -> HTTP {resp.status_code}: {resp.text[:500]}"
+            )
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: slow_down POST {url} failed: {e}")
+
+
+def _post_slow_down_all(
+    server_bases: List[str], forward_sleep_time: Optional[float]
+) -> None:
+    for base in server_bases:
+        _post_slow_down(base, forward_sleep_time)
+
+
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
@@ -1184,6 +1209,9 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    slow_down_servers: Optional[List[str]] = None,
+    slow_down_sleep_time: float = 1.0,
+    slow_down_wait_time: float = 60.0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1310,6 +1338,39 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    slow_down_bases = [
+        s.strip()
+        for s in (slow_down_servers or [])
+        if isinstance(s, str) and s.strip()
+    ]
+    slow_down_active = False
+    slow_down_task: Optional[asyncio.Task] = None
+    if slow_down_bases:
+        if "sglang" not in backend:
+            print(
+                "Warning: --slow-down-server is ignored when backend is not an sglang family backend."
+            )
+        else:
+            slow_down_active = True
+            listed = ", ".join(f"{b.rstrip('/')}/slow_down" for b in slow_down_bases)
+            print(
+                f"Enabling slow_down (forward_sleep_time={slow_down_sleep_time}s) on "
+                f"{listed}; will auto-disable after {slow_down_wait_time}s."
+            )
+            _post_slow_down_all(slow_down_bases, slow_down_sleep_time)
+
+            bases_snapshot = list(slow_down_bases)
+
+            async def _slow_down_disable_after_wait():
+                await asyncio.sleep(slow_down_wait_time)
+                print(
+                    f"slow_down auto-disabled after {slow_down_wait_time}s on "
+                    f"{len(bases_snapshot)} server(s)."
+                )
+                _post_slow_down_all(bases_snapshot, None)
+
+            slow_down_task = asyncio.create_task(_slow_down_disable_after_wait())
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -1380,6 +1441,14 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
+    
+    if slow_down_active and slow_down_task is not None and not slow_down_task.done():
+        slow_down_task.cancel()
+        try:
+            await slow_down_task
+        except asyncio.CancelledError:
+            pass
+        _post_slow_down_all(slow_down_bases, None)
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1851,6 +1920,13 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
 
+    if not hasattr(args, "slow_down_servers"):
+        args.slow_down_servers = None
+    if not hasattr(args, "slow_down_sleep_time"):
+        args.slow_down_sleep_time = 1.0
+    if not hasattr(args, "slow_down_wait_time"):
+        args.slow_down_wait_time = 60.0
+
     # Prepare LoRA arguments
     lora_request_distribution = (
         args.lora_request_distribution if args.lora_name is not None else None
@@ -1886,6 +1962,9 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            slow_down_servers=args.slow_down_servers,
+            slow_down_sleep_time=args.slow_down_sleep_time,
+            slow_down_wait_time=args.slow_down_wait_time,
         )
     )
 
@@ -2239,6 +2318,30 @@ if __name__ == "__main__":
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--slow-down-server",
+        type=str,
+        nargs="*",
+        default=None,
+        dest="slow_down_servers",
+        metavar="URL",
+        help="One or more base URLs of SGLang HTTP servers to call /slow_down on before the timed "
+        "benchmark (e.g. --slow-down-server http://d0:30010 http://d1:30010). "
+        "Only applied for sglang-family backends. Should be decode nodes in PD disaggregation mode.",
+    )
+    parser.add_argument(
+        "--slow-down-sleep-time",
+        type=float,
+        default=1.0,
+        help="forward_sleep_time passed to /slow_down when --slow-down-server is set. Default: 1 (seconds).",
+    )
+    parser.add_argument(
+        "--slow-down-wait-time",
+        type=float,
+        default=60.0,
+        help="After this many seconds, POST /slow_down with forward_sleep_time=null to disable. "
+        "Also cleared when the benchmark ends. Default: 60.",
     )
     parser.add_argument(
         "--warmup-requests",
