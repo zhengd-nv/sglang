@@ -1283,6 +1283,10 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
+    def _decode_init_batch_reset_deadline(self: Scheduler) -> None:
+        if getattr(self, "_decode_init_batch_wait_deadline", None) is not None:
+            self._decode_init_batch_wait_deadline = None
+
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -1291,6 +1295,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
+            self._decode_init_batch_reset_deadline()
             return None
 
         curr_batch_size = self.running_batch.batch_size()
@@ -1299,14 +1304,70 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
+        init_bs = int(
+            getattr(
+                self.server_args,
+                "disaggregation_decode_init_batch_size",
+                0,
+            )
+            or 0
+        )
+        timeout_s = float(
+            getattr(
+                self.server_args,
+                "disaggregation_decode_init_batch_timeout_secs",
+                0.0,
+            )
+            or 0.0
+        )
+
+        # TensorRT-LLM gen_only style: from an empty running batch, wait until
+        # enough KV-complete requests sit in waiting_queue before first prebuilt.
+        take_cap = min(num_not_used_batch, len(self.waiting_queue))
+        if init_bs > 0 and curr_batch_size == 0:
+            effective_target = min(init_bs, batch_size)
+            wlen = len(self.waiting_queue)
+            # PD server startup warmup only sends O(dp_size) fake-bootstrap requests
+            # (see http_server._execute_server_warmup). Never block on init_bs for
+            # those or the server never schedules decode and /health stays unhealthy.
+            if wlen > 0 and all(
+                _is_fake_transfer(r, self.server_args) for r in self.waiting_queue
+            ):
+                effective_target = wlen
+            elif wlen < effective_target:
+                if timeout_s > 0:
+                    now = time.monotonic()
+                    if getattr(self, "_decode_init_batch_wait_deadline", None) is None:
+                        self._decode_init_batch_wait_deadline = now + timeout_s
+                    if now < self._decode_init_batch_wait_deadline:
+                        return None
+                    # Timeout: flush with whatever is available (>=1 because wlen>0).
+                    effective_target = min(effective_target, wlen)
+                    self._decode_init_batch_reset_deadline()
+                    if self.tp_rank == 0:
+                        logger.warning(
+                            "disaggregation_decode_init_batch_size=%d not met "
+                            "within %ss; flushing %d request(s) from waiting_queue",
+                            init_bs,
+                            timeout_s,
+                            wlen,
+                        )
+                else:
+                    return None
+            else:
+                self._decode_init_batch_reset_deadline()
+
+            take_cap = min(num_not_used_batch, len(self.waiting_queue), effective_target)
+        elif init_bs > 0:
+            self._decode_init_batch_reset_deadline()
+
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if i < take_cap:
                 can_run_list.append(req)
                 req.init_next_round_input(self.tree_cache)
             else:

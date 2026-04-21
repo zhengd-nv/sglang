@@ -702,6 +702,14 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Decode-side bootstrap batching (similar to TensorRT-LLM gen_only +
+    # TLLM_BENCHMARK_REQ_QUEUES_SIZE): wait until this many requests have
+    # finished KV transfer and sit in waiting_queue before forming the first
+    # prebuilt batch from an empty running_batch. 0 disables.
+    disaggregation_decode_init_batch_size: int = 0
+    # If > 0, when init_batch_size is not yet satisfied, flush with whatever is
+    # in waiting_queue after this many seconds (bounded decode bench).
+    disaggregation_decode_init_batch_timeout_secs: float = 0.0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -3557,9 +3565,46 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if self.disaggregation_decode_init_batch_size > 0:
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "--disaggregation-decode-init-batch-size and "
+                    "--disaggregation-decode-init-batch-timeout-secs are only "
+                    "valid with --disaggregation-mode decode"
+                )
+            if self.disaggregation_decode_init_batch_size < 0:
+                raise ValueError(
+                    "--disaggregation-decode-init-batch-size must be >= 0"
+                )
+            if self.disaggregation_decode_init_batch_timeout_secs < 0:
+                raise ValueError(
+                    "--disaggregation-decode-init-batch-timeout-secs must be >= 0"
+                )
+
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.disaggregation_decode_init_batch_size > 0:
+                eff = min(
+                    self.disaggregation_decode_init_batch_size,
+                    self.max_running_requests,
+                )
+                if eff < self.disaggregation_decode_init_batch_size:
+                    logger.warning(
+                        "disaggregation_decode_init_batch_size=%d capped by "
+                        "max_running_requests=%d -> effective %d",
+                        self.disaggregation_decode_init_batch_size,
+                        self.max_running_requests,
+                        eff,
+                    )
+                # Align with TRT-LLM gen_only: disable scheduler overlap so batch
+                # results are processed in lockstep with forwards.
+                if not self.disable_overlap_schedule:
+                    logger.warning(
+                        "disaggregation-decode-init-batch-size > 0: forcing "
+                        "--disable-overlap-schedule (TRT-LLM gen_only style)."
+                    )
+                    self.disable_overlap_schedule = True
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -6173,6 +6218,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-init-batch-size",
+            type=int,
+            default=ServerArgs.disaggregation_decode_init_batch_size,
+            help="PD decode only: wait until this many requests have completed KV "
+            "transfer (waiting_queue) before forming the first prebuilt batch "
+            "when running_batch is empty — TensorRT-LLM gen_only / "
+            "TLLM_BENCHMARK_REQ_QUEUES_SIZE style. 0 disables. Capped by "
+            "max-running-requests.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-init-batch-timeout-secs",
+            type=float,
+            default=ServerArgs.disaggregation_decode_init_batch_timeout_secs,
+            help="With --disaggregation-decode-init-batch-size > 0: if the queue "
+            "does not reach the target within this many seconds, flush with the "
+            "requests currently in waiting_queue. 0 = wait indefinitely.",
         )
 
         # Encode prefill disaggregation
