@@ -29,15 +29,18 @@ class EGMHiCacheStorage(HiCacheStorage):
         self.server = None
         self.closed = False
         self.remote = bool(extra.get("peer_path"))
-        self.store = PeerClient(extra["peer_path"]) if self.remote else EGMStore(
-            int(extra.get("capacity_bytes", 64 << 20)), int(extra.get("numa", 0)))
+        self.store = PeerClient(extra["peer_path"], device=int(extra.get("device", 0)),
+                                     secret=extra.get("peer_secret")) if self.remote else EGMStore(
+            int(extra.get("capacity_bytes", 64 << 20)), int(extra.get("numa", 0)),
+            hbm_capacity=int(extra.get("hbm_capacity_bytes", 0)),
+            device=int(extra.get("device", 0)), default_tier=extra.get("write_tier", "dram"))
         self.namespace = str(extra.get("namespace", "egm-v1"))
         self.audit_path = extra.get("audit_path")
         try:
             if extra.get("listen_path"):
                 if self.remote:
                     raise ValueError("peer clients cannot serve")
-                self.server = PeerServer(self.store, extra["listen_path"])
+                self.server = PeerServer(self.store, extra["listen_path"], secret=extra.get("peer_secret"))
         except BaseException:
             if not self.remote:
                 self.store.close()

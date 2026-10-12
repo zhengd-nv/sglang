@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
-"""Same-user Unix control plane; payloads travel via CUDA Fabric mappings.
+"""Unix or job-private authenticated TCP metadata; CUDA Fabric carries payloads.
 
 No timeout-based lease reclamation: a lost reader quarantines its pin until
 explicit recovery/process restart. This favors safety over availability.
 """
+import hmac
 import json
 import os
 import socket
@@ -19,10 +20,12 @@ from .store import validate_ranges
 MAX_MESSAGE = 1 << 20
 
 
-def receive(stream):
+def receive(stream, stats=None):
     line = stream.readline(MAX_MESSAGE + 1)
     if not line.endswith(b"\n") or len(line) > MAX_MESSAGE:
         raise ValueError("invalid/oversized control message")
+    if stats is not None:
+        stats["received"] += len(line)
     return json.loads(line)
 
 
@@ -31,6 +34,10 @@ class _Handler(socketserver.StreamRequestHandler):
         self.request.settimeout(30)
         try:
             req = receive(self.rfile)
+            if self.server.secret is not None:
+                supplied = req.pop("auth", None)
+                if not isinstance(supplied, str) or not hmac.compare_digest(supplied, self.server.secret):
+                    raise PermissionError("control authentication failed")
             store = self.server.store
             if req["op"] == "exists":
                 value = [store.exists(k) for k in req["keys"]]
@@ -48,13 +55,21 @@ class _Handler(socketserver.StreamRequestHandler):
 
 
 class PeerServer:
-    def __init__(self, store, path):
+    def __init__(self, store, path, secret=None):
         # The caller owns a private directory; never unlink an existing endpoint.
-        if os.path.exists(path):
+        tcp = isinstance(path, (tuple, list))
+        if tcp and (not isinstance(secret, str) or len(secret) < 32):
+            raise ValueError("TCP requires a private job-scoped secret (>=32 chars)")
+        if not tcp and os.path.exists(path):
             raise FileExistsError(path)
         self.path = path
-        self.server = socketserver.UnixStreamServer(path, _Handler)
-        os.chmod(path, 0o600)
+        self.server = (socketserver.TCPServer(tuple(path), _Handler) if tcp
+                       else socketserver.UnixStreamServer(path, _Handler))
+        self.path = self.server.server_address
+        self.tcp = tcp
+        self.server.secret = secret
+        if not tcp:
+            os.chmod(path, 0o600)
         self.server.store = store
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -63,24 +78,28 @@ class PeerServer:
         self.server.shutdown()
         self.thread.join()
         self.server.server_close()
-        os.unlink(self.path)
+        if not self.tcp:
+            os.unlink(self.path)
 
 
 class PeerClient:
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, path, device=0, secret=None):
+        self.path = tuple(path) if isinstance(path, (tuple, list)) else path
+        self.device, self.secret = device, secret
         self.quarantined = []
+        self.control_bytes = {"sent": 0, "received": 0}
 
     def rpc(self, op, **args):
-        payload = json.dumps(dict(op=op, **args)).encode() + b"\n"
+        payload = json.dumps(dict(op=op, auth=self.secret, **args)).encode() + b"\n"
         if len(payload) > MAX_MESSAGE:
             raise ValueError("control message too large")
-        with socket.socket(socket.AF_UNIX) as sock:
+        with socket.socket(socket.AF_INET if isinstance(self.path, tuple) else socket.AF_UNIX) as sock:
             sock.settimeout(30)
             sock.connect(self.path)
             sock.sendall(payload)
+            self.control_bytes["sent"] += len(payload)
             with sock.makefile("rb") as stream:
-                result = receive(stream)
+                result = receive(stream, self.control_bytes)
         if not result["ok"]:
             raise RuntimeError(result["error"])
         return result["value"]
@@ -97,29 +116,45 @@ class PeerClient:
     @contextmanager
     def reader(self, keys):
         lease = self.rpc("acquire", keys=list(dict.fromkeys(keys)))
-        region = None
+        regions = {}
         started = False
+
+        def close_mappings():
+            for region in regions.values():
+                region.close()
+
         try:
-            region = Region(descriptor=lease["region"])
+            if lease.get("version") != 2:
+                raise ValueError("unsupported Store lease protocol")
+            for tier, descriptor in lease["regions"].items():
+                if descriptor.get("tier") != tier:
+                    raise ValueError("lease tier/descriptor mismatch")
+                regions[tier] = Region(descriptor=descriptor, device=self.device)
             class Reader:
                 def get(self, key, ranges, device=False):
                     nonlocal started
-                    offset, size = lease["objects"][key]
-                    validate_ranges(ranges, size)
+                    obj = lease["objects"][key]
+                    validate_ranges(ranges, obj["size"])
+                    region = regions[obj["tier"]]
                     for ptr, n, off in ranges:
                         started = True
-                        region.copy(offset + off, ptr, n, 3 if device else 1)
+                        region.copy(obj["offset"] + off, ptr, n, 3 if device else 1)
                     return True
             yield Reader()
-            region.close()
-            region = None
+            close_mappings()
         except BaseException:
             if started:
-                # Unknown completion: never ACK or let an allocation be reused.
-                self.quarantined.append((lease, region))
+                self.quarantined.append((lease, regions))
             else:
-                if region is not None:
-                    region.close()
-                self.rpc("release", token=lease["token"], epoch=lease["region"]["epoch"])
+                try:
+                    close_mappings()
+                    self.rpc("release", token=lease["token"], epoch=lease["epoch"])
+                except BaseException:
+                    self.quarantined.append((lease, regions))
             raise
-        self.rpc("release", token=lease["token"], epoch=lease["region"]["epoch"])
+        try:
+            self.rpc("release", token=lease["token"], epoch=lease["epoch"])
+        except BaseException:
+            # Lost ACK is not evidence that the owner released the pin.
+            self.quarantined.append((lease, regions))
+            raise

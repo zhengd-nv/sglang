@@ -65,8 +65,8 @@ def main():
     rejects(store.clear, RuntimeError)
     rejects(store.close, RuntimeError)
     rejects(lambda: store.release(lease["token"], "wrong-epoch"), ValueError)
-    store.release(lease["token"], lease["region"]["epoch"])
-    rejects(lambda: store.release(lease["token"], lease["region"]["epoch"]), ValueError)
+    store.release(lease["token"], lease["epoch"])
+    rejects(lambda: store.release(lease["token"], lease["epoch"]), ValueError)
     results["region"] = {"status": "PASS", "allocation_bytes": store.region.allocation_bytes,
                          "granularity": store.region.granularity, "kind": "HOST_NUMA_FABRIC"}
     with tempfile.TemporaryDirectory(prefix="egm-peer-") as tmp:
@@ -103,8 +103,9 @@ def main():
             rejects(store.close, RuntimeError)
             abandoned, mapping = client.quarantined.pop()
             # Injection ran no DMA; explicit test-only recovery is safe.
-            mapping.close()
-            store.release(abandoned["token"], abandoned["region"]["epoch"])
+            for region in mapping.values():
+                region.close()
+            store.release(abandoned["token"], abandoned["epoch"])
         finally:
             peer.Region = original
         results["failed_reader_pin"] = {"status": "PASS", "reclaim": "refused until explicit safe recovery"}
@@ -124,6 +125,7 @@ def main():
     results["lifecycle"] = {"status": "PASS", "cycles": 16, "numa": [0, 1]}
     test_hicache(results)
     test_linker(results)
+    test_linker(results, "hbm")
     Path(args.output, "egm-results.json").write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results, indent=2))
 
@@ -174,7 +176,7 @@ def test_hicache(results):
     results["hicache"] = {"status": "PASS", "layouts": ["layer_first", "page_first"], "factory": "dynamic", "api": ["v1", "v2"]}
 
 
-def test_linker(results):
+def test_linker(results, tier="dram"):
     from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
     from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
     from sglang.srt.mem_cache.storage.egm.linker import EGMDirectLinker
@@ -183,7 +185,8 @@ def test_linker(results):
     saved = [x.clone() for x in k + v]
     entry = DevicePoolEntry(name=PoolName.KV, indices_from_pool=PoolName.KV, device_pool=None,
         components=[k, v], layer_mapping={0: 0, 1: 1}, page_size=2, rows_are_pages=False, packed=True)
-    store = EGMStore(4 << 20)
+    store = EGMStore(4 << 20 if tier == "dram" else 0,
+                     hbm_capacity=4 << 20 if tier == "hbm" else 0, default_tier=tier)
     linker = EGMDirectLinker(entry, 2, store, "test-model")
     indices = torch.tensor([4, 5, 0, 1], device="cuda")
     transfer = PoolTransfer(name=PoolName.KV, keys=["p2", "p0"], device_indices=indices)
@@ -204,17 +207,18 @@ def test_linker(results):
         assert torch.equal(actual[indices], expected[indices])
         assert actual[2:4].eq(-1).all()
     linker.reset(); linker.close(); store.close()
-    results["direct_linker"] = {"status": "PASS", "mode": "synchronous FULL TP1", "layers": 2}
+    results["direct_linker" if tier == "dram" else "direct_linker_hbm"] = {"status": "PASS", "mode": "synchronous FULL TP1", "layers": 2}
 
     # Lookup-to-read miss fails before forward, and cannot be reset into service.
-    store = EGMStore(4 << 20)
+    store = EGMStore(4 << 20 if tier == "dram" else 0,
+                     hbm_capacity=4 << 20 if tier == "hbm" else 0, default_tier=tier)
     linker = EGMDirectLinker(entry, 2, store, "failure-model")
     linker.load("missing", [transfer])
     rejects(linker.start_layer_wise_loading, RuntimeError)
     rejects(linker.reset, RuntimeError)
     rejects(lambda: linker.load("next", [transfer]), RuntimeError)
     linker.close(); store.close()
-    results["linker_failure"] = {"status": "PASS", "recovery": "Engine restart required"}
+    results["linker_failure" if tier == "dram" else "linker_failure_hbm"] = {"status": "PASS", "recovery": "Engine restart required"}
 
 
 if __name__ == "__main__":

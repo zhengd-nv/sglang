@@ -11,28 +11,38 @@ import uuid
 class Region:
     """Explicit owner. No raw tensor views escape; each copy drains before return."""
 
-    def __init__(self, size=None, numa=0, descriptor=None):
+    def __init__(self, size=None, numa=0, descriptor=None, tier="dram", device=0):
         self._lock = threading.RLock()
         self._handle = C.c_void_p()
         self._lib = lib = C.CDLL(os.environ["EGM_NATIVE_LIB"])
+        if not hasattr(lib, "egm_abi_version") or lib.egm_abi_version() != 2:
+            raise RuntimeError("rebuild EGM_NATIVE_LIB: native ABI 2 required")
         lib.egm_error.restype = C.c_char_p
         lib.egm_fabric_size.restype = C.c_size_t
-        lib.egm_create.argtypes = [C.c_size_t, C.c_int, C.POINTER(C.c_void_p)]
-        lib.egm_import.argtypes = [C.c_void_p, C.c_size_t, C.c_size_t, C.POINTER(C.c_void_p)]
+        lib.egm_create.argtypes = [C.c_size_t, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p)]
+        lib.egm_import.argtypes = [C.c_void_p, C.c_size_t, C.c_size_t, C.c_int, C.c_int, C.POINTER(C.c_void_p)]
         lib.egm_export.argtypes = [C.c_void_p, C.c_void_p]
         for name in ["egm_size", "egm_granularity"]:
             fn = getattr(lib, name); fn.argtypes = [C.c_void_p]; fn.restype = C.c_size_t
         lib.egm_copy.argtypes = [C.c_void_p, C.c_size_t, C.c_uint64, C.c_size_t, C.c_int]
         lib.egm_close.argtypes = [C.c_void_p]
         self.imported = descriptor is not None
+        self.device = device
+        if descriptor is not None:
+            tier = descriptor.get("tier")
+        if tier not in ("dram", "hbm") or not isinstance(device, int) or device < 0:
+            raise ValueError("invalid tier/local device")
+        self.tier = tier
+        kind = "HOST_NUMA_FABRIC" if tier == "dram" else "DEVICE_FABRIC"
+        tier_id = int(tier == "hbm")
         if descriptor is None:
             if not isinstance(size, int) or not 0 < size < 2**63 or numa < 0:
                 raise ValueError("invalid size/NUMA")
-            self._check(lib.egm_create(size, numa, C.byref(self._handle)))
+            self._check(lib.egm_create(size, tier_id, numa if tier == "dram" else device, device, C.byref(self._handle)))
             self.epoch = uuid.uuid4().hex
             self.logical_size = size
         else:
-            if descriptor["version"] != 1 or descriptor["kind"] != "HOST_NUMA_FABRIC":
+            if descriptor["version"] != 2 or descriptor["kind"] != kind:
                 raise ValueError("unsupported EGM descriptor")
             raw = base64.b64decode(descriptor["fabric"], validate=True)
             if len(raw) != lib.egm_fabric_size():
@@ -43,7 +53,7 @@ class Region:
             self.logical_size = descriptor["logical_bytes"]
             if not 0 < self.logical_size <= n:
                 raise ValueError("invalid logical size")
-            self._check(lib.egm_import(C.create_string_buffer(raw), n, gran, C.byref(self._handle)))
+            self._check(lib.egm_import(C.create_string_buffer(raw), n, gran, tier_id, device, C.byref(self._handle)))
             self.epoch = descriptor["epoch"]
         self.allocation_bytes = lib.egm_size(self._handle)
         self.granularity = lib.egm_granularity(self._handle)
@@ -63,7 +73,7 @@ class Region:
                 raise ValueError("cannot re-export imported region")
             raw = C.create_string_buffer(self._lib.egm_fabric_size())
             self._check(self._lib.egm_export(self._handle, raw))
-            return dict(version=1, kind="HOST_NUMA_FABRIC", epoch=self.epoch,
+            return dict(version=2, tier=self.tier, kind="HOST_NUMA_FABRIC" if self.tier == "dram" else "DEVICE_FABRIC", epoch=self.epoch,
                         logical_bytes=self.logical_size, allocation_bytes=self.allocation_bytes,
                         granularity=self.granularity, fabric=base64.b64encode(raw.raw).decode())
 

@@ -4,6 +4,7 @@
 import _bootstrap  # Optional installed-runtime overlay for manual tests.
 
 """Actual Engine smoke: dynamic EGM backend + small locally generated model."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,9 @@ import sglang
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tier", choices=("dram", "hbm"), default="dram")
+    args = parser.parse_args()
     root = Path(os.environ["EGM_RUNROOT"])
     audit = root / "engine-storage-audit.jsonl"
     if audit.exists():
@@ -39,6 +43,7 @@ def main():
         hicache_storage_backend_extra_config=json.dumps({
             "backend_name": "egm", "module_path": "sglang.srt.mem_cache.storage.egm.hicache", "class_name": "EGMHiCacheStorage",
             "interface_v1": True, "capacity_bytes": 64 << 20,
+            "hbm_capacity_bytes": 64 << 20 if args.tier == "hbm" else 0, "write_tier": args.tier,
             "namespace": "tiny-engine-smoke", "numa": 0,
             "audit_path": str(audit),
         }))
@@ -62,7 +67,7 @@ def main():
         assert responses[0]["output_ids"] == responses[1]["output_ids"]
         events = [json.loads(line) for line in audit.read_text().splitlines()]
         assert any(e["op"] == "get" and e["success"] > 0 for e in events), events
-        (root / "engine-egm.json").write_text(json.dumps({"status": "PASS", "responses": responses, "storage_events": events}, indent=2))
+        (root / "engine-egm.json").write_text(json.dumps({"status": "PASS", "tier": args.tier, "responses": responses, "storage_events": events}, indent=2))
     finally:
         engine.shutdown()
 
