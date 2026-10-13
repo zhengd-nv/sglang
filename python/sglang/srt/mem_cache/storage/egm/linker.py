@@ -41,14 +41,17 @@ class LayerCounter:
 
 
 class EGMDirectLinker(UnifiedCacheLinker):
+    load_before_insert = True
+
     def __init__(self, entry, num_layers, store, namespace, tp_size=1):
         if tp_size != 1 or str(entry.name) != "kv" or not entry.packed:
             raise ValueError("FULL packed TP1 only")
         if set(entry.layer_mapping) != set(range(num_layers)):
             raise ValueError("all logical layers must be present")
-        if any(not t.is_contiguous() or t.device.type != "cuda" or t.device.index != 0
+        self.device = entry.kv_buffer[0].device.index
+        if any(not t.is_contiguous() or t.device.type != "cuda" or t.device.index != self.device
                for t in entry.kv_buffer):
-            raise ValueError("contiguous cuda:0 pool required")
+            raise ValueError("contiguous pool on one CUDA device required")
         self.entry, self.store = entry, store
         self.num_layers = num_layers
         if not namespace:
@@ -61,6 +64,21 @@ class EGMDirectLinker(UnifiedCacheLinker):
         self.pending = {}
         self.loads, self.offloads = deque(), deque()
         self.failed = self.closed = False
+
+    def load_private(self, rid, transfers):
+        """Return only after every destination write and source read drains.
+
+        The tree still owns the uninserted allocation. No request or eviction
+        path can see these slots yet. Unknown failures deliberately fail-stop.
+        """
+        self._open()
+        if self.pending or self.loads:
+            raise RuntimeError("private load cannot mix with queued loads")
+        self.load(rid, transfers)
+        self.start_layer_wise_loading()
+        if self.pop_completed_load() != [rid]:
+            self.failed = True
+            raise RuntimeError("private load completion mismatch")
 
     def _open(self):
         if self.failed or self.closed:
@@ -108,8 +126,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
         counter.producer_index += 1
         index = counter.producer_index
         tasks, self.pending = self.pending, {}
-        torch.cuda.synchronize(0)
         try:
+            torch.cuda.synchronize(self.device)
             keys = list(dict.fromkeys(self.prefix + k for t in tasks.values() for k in t.keys))
             if keys:
                 with self.store.reader(keys) as reader:
@@ -138,7 +156,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
         t = self._transfer(transfers)
         if not hasattr(self.store, "put"):
             return False
-        torch.cuda.synchronize(0)
+        torch.cuda.synchronize(self.device)
         ptrs, sizes = self.entry.get_page_buffer_meta(t.device_indices)
         width = len(ptrs) // len(t.keys)
         try:

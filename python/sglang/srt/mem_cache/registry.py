@@ -211,6 +211,10 @@ def create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "egm":
+            from sglang.srt.mem_cache.storage.egm.engine import EGMEngineLinker
+
+            linker_cls = EGMEngineLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"

@@ -4,7 +4,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import test_unified_radix_cache_unittest as shared_cache_suite
@@ -21,6 +21,7 @@ from test_unified_radix_cache_unittest import (
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     InitLoadBackParams,
     InsertResult,
     MatchPrefixParams,
@@ -331,6 +332,88 @@ class _TreeCoreBackendTestMixin:
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
+    def _check_private_restore(self, fail=False, abort=None):
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        stored_keys = defaultdict(set)
+        producer, allocator, req_pool = build_fixture(self.cfg)
+        source_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(source_linker)
+        tokens = list(range(1, 9))
+        self._insert(producer, allocator, req_pool, tokens)
+        source_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        linker.load_before_insert = True
+        cache.init_cache_linker(linker)
+        req = self._make_req(req_pool)
+        key = RadixKey(array("q", tokens))
+        match = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+        self._apply_match_to_req(req, match)
+        before = allocator.available_size()
+        seen = []
+
+        def load_private(rid, transfers):
+            seen.append(rid)
+            self.assertEqual(allocator.available_size(), before - len(tokens))
+            self.assertEqual(cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 0)
+            cache.evict(EvictParams(num_tokens=len(tokens)))
+            self.assertEqual(allocator.available_size(), before - len(tokens))
+            self.assertEqual(len(transfers[0].device_indices), len(tokens))
+            if fail:
+                raise RuntimeError("injected partial copy")
+
+        linker.load_private = load_private
+        params = InitLoadBackParams(best_match_node=match.best_match_node,
+                                   host_hit_length=match.host_hit_length, req=req)
+        if abort:
+            if abort == "cancel":
+                cache.linker.release_request(req.rid)
+                self.assertFalse(cache.linker.has_hit(req.rid))
+                loaded, _ = cache.linker.load_back(req)
+            else:
+                with patch.object(allocator, "alloc", return_value=None):
+                    loaded, _ = cache.init_load_back(params)
+            self.assertEqual(loaded, 0)
+            self.assertEqual(allocator.available_size(), before)
+            self.assertFalse(seen)
+            self.assertFalse(cache.linker.quarantined_private_loads)
+            self.assertEqual(cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 0)
+            return
+        if fail:
+            with self.assertRaisesRegex(RuntimeError, "injected partial copy"):
+                cache.init_load_back(params)
+            self.assertEqual(cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 0)
+            self.assertIn(req.rid, cache.linker.quarantined_private_loads)
+            cache.linker.release_request(req.rid)
+            self.assertEqual(allocator.available_size(), before - len(tokens))
+            with self.assertRaisesRegex(RuntimeError, "restart Engine"):
+                cache.linker.reset()
+            with self.assertRaisesRegex(RuntimeError, "restart Engine"):
+                cache.linker.close()
+        else:
+            loaded, node = cache.init_load_back(params)
+            self.assertEqual(loaded, len(tokens))
+            self.assertEqual(cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, len(tokens))
+            self.assertFalse(cache.linker.pending_loads)
+            self.assertFalse(linker.queued_loads)
+            self.assertFalse(cache.linker.quarantined_private_loads)
+            cache.sanity_check()
+        self.assertEqual(seen, [req.rid])
+
+    def test_private_restore_publishes_only_after_drain(self):
+        self._check_private_restore(False)
+
+    def test_private_restore_failure_retains_unpublished_slots(self):
+        self._check_private_restore(True)
+
+    def test_private_restore_cancel_before_allocation(self):
+        self._check_private_restore(abort="cancel")
+
+    def test_private_restore_no_capacity_does_not_start_transfer(self):
+        self._check_private_restore(abort="no_capacity")
+
     def test_full_offload_load_round_trip_and_dedup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg

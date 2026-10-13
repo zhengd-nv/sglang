@@ -63,6 +63,14 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
 
+    # Opt-in synchronous path: finish and drain into private allocations before
+    # the tree adopts them. An exception is fatal: the caller must not reclaim
+    # the allocations without proof that all device accesses have drained.
+    load_before_insert: bool = False
+
+    def load_private(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
@@ -174,6 +182,10 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
+        # Keep ownership of failed private reservations until Engine teardown.
+        # They never enter the tree or a request KV row, hence neither eviction
+        # nor request cleanup may return them to the allocator.
+        self.quarantined_private_loads: dict[str, list[PoolTransfer]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -288,6 +300,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- init_load_back: remote -> device, then insert ----
 
     def load_back(self, req: Req) -> tuple[int, NodeId]:
+        if self.quarantined_private_loads:
+            raise RuntimeError("Private restore failed; restart Engine")
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
@@ -315,6 +329,15 @@ class UnifiedCacheLinkerWrapper:
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
+        if self.cache_linker.load_before_insert:
+            transfers = [transfer for _, transfer in component_transfers]
+            try:
+                self.cache_linker.load_private(req.rid, transfers)
+            except BaseException:
+                self.quarantined_private_loads[req.rid] = transfers
+                # Fail-stop: do not ABORT/free a possibly partially written
+                # destination, and do not publish it in the cache tree.
+                raise
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
             req,
@@ -385,11 +408,16 @@ class UnifiedCacheLinkerWrapper:
             canonical_full=canonical_tail,
         )
 
-        self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
+        if not self.cache_linker.load_before_insert:
+            self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
         cache.tree_core.mark_external_cache_stored_path(
             insert_result.last_device_node, req.last_node
         )
+        if self.cache_linker.load_before_insert:
+            # The admission interface calls this a host hit, but the private
+            # direct restore never allocates or passes through a CPU HostPool.
+            req.host_hit_is_storage = True
         return len(canonical_tail), insert_result.last_device_node
 
     def _queue_load(
@@ -577,6 +605,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- lifecycle ----
 
     def reset(self) -> None:
+        if self.quarantined_private_loads:
+            raise RuntimeError("Private restore failed; restart Engine")
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
@@ -601,5 +631,7 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
 
     def close(self) -> None:
+        if self.quarantined_private_loads:
+            raise RuntimeError("Private restore failed; restart Engine")
         self.cache_linker.close()
         self._release_pending_locks()
