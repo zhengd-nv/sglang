@@ -2495,6 +2495,7 @@ class RpcReqInput(BaseReq, kw_only=True):
 class RpcReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    result: Optional[str] = None
 
 
 class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):

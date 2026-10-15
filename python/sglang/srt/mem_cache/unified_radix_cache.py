@@ -318,6 +318,9 @@ class UnifiedRadixCache(BasePrefixCache):
             "l1l2_miss_tokens": 0,
         }
 
+        from sglang.srt.mem_cache.source_lease import SourceLeaseManager
+
+        self.source_leases = SourceLeaseManager(self)
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
@@ -385,13 +388,23 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def acquire_source_lease(self, key, *, fingerprint, ready):
+        """Scheduler-thread API; ready() must synchronize producer writes."""
+        return self.source_leases.acquire(key, fingerprint=fingerprint, ready=ready)
+
+    def release_source_lease(self, lease, *, drained):
+        return self.source_leases.release(lease, drained=drained)
+
     def reset(self) -> None:
+        if self.source_leases.busy:
+            raise RuntimeError("cache has active source leases")
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        self.source_leases.reset()
         self.tree_core.reset()
         self.session_refs.reset()
 

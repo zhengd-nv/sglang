@@ -1848,12 +1848,25 @@ class Engine(EngineScoreMixin, EngineBase):
     Execute an RPC call on all scheduler processes.
     """
 
+    def l1_peer(self, action: str, **payload):
+        """Experimental fixed-peer cache control; call only on an idle TP1 Engine.
+
+        init(identity), listen(host, port), serve(), restore(tokens, host, port),
+        finish(), stats(). A restored prefix remains pinned through generate()
+        until finish(). Both endpoints must use the same explicit identity.
+        """
+        import json
+        return json.loads(self.collective_rpc(
+            "l1_peer", action=action, payload=json.dumps(payload)
+        ))
+
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
         sock_send(self.send_to_rpc, obj)
         recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
+        return recv_req.result
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

@@ -5375,6 +5375,9 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        leases = getattr(self.tree_cache, "source_leases", None)
+        if leases is not None and leases.busy:
+            return False
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -5416,6 +5419,10 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def l1_peer(self, action: str, payload: str = "{}"):
+        from sglang.srt.mem_cache.l1_transfer.peer.scheduler import scheduler_peer_rpc
+        return scheduler_peer_rpc(self, action, payload)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -5424,19 +5431,21 @@ class Scheduler(
 
         success = True
         exec = None
+        result = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
-                func(**recv_req.parameters)
+                result = func(**recv_req.parameters)
             else:
-                func()
+                result = func()
         except Exception as e:
             success = False
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier(group=self.tp_group.cpu_group)
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        return RpcReqOutput(success=success, message="" if not exec else str(exec),
+                            result=result if isinstance(result, str) else None)
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput

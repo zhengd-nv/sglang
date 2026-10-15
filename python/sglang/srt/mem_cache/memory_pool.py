@@ -2651,6 +2651,8 @@ class MHATokenToKVPool(KVCache):
         self._finalize_backing_tokens(config.max_total_num_tokens)
 
     def _finalize_backing_tokens(self, final_num_tokens: int) -> None:
+        if getattr(self, "_l1_transfer_lease_count", 0):
+            raise RuntimeError("pool has active L1 transfer leases")
         """Token-count primitive shared by composite pools (e.g. SWA sub-pools)."""
         self._post_capture_owner.finalize(final_num_tokens)
         self.size = int(final_num_tokens)
@@ -2660,6 +2662,8 @@ class MHATokenToKVPool(KVCache):
         return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
 
     def _clear_buffers(self):
+        if getattr(self, "_l1_transfer_lease_count", 0):
+            raise RuntimeError("pool has active L1 transfer leases")
         del self.k_buffer
         del self.v_buffer
         if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:

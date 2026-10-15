@@ -326,6 +326,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return out_indices
 
     def free(self, free_index: torch.Tensor):
+        if getattr(self, "_l1_pinned_pages", None):
+            self._check_source_pages(free_index // self.page_size)
         if free_index.numel() == 0:
             return
 
@@ -357,6 +359,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_ids(reps // ps)
 
     def free_page_ids(self, page_ids: torch.Tensor):
+        self._check_source_pages(page_ids)
         """Free exactly these pages; no page twice, no dedup."""
         if page_ids.numel() == 0:
             return
@@ -372,7 +375,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         pages = self.get_all_free_pages()
         assert len(torch.unique(pages)) == len(pages)
 
+    def _check_source_pages(self, page_ids):
+        pinned = getattr(self, "_l1_pinned_pages", None)
+        if pinned and any(int(p) in pinned for p in page_ids.tolist()):
+            raise RuntimeError("cannot free source-leased pages")
+
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        for ids in page_ids:
+            self._check_source_pages(ids)
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
@@ -393,6 +403,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def clear(self):
+        if getattr(self, "_l1_pinned_pages", None) or getattr(self, "_l1_target_count", 0):
+            raise RuntimeError("allocator has active L1 transfer leases")
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
