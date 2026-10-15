@@ -585,6 +585,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        if self.transfer_backend == TransferBackend.NVLINK:
+            kv_args.nvlink_pool = self.token_to_kv_pool
 
         attn_tp_size = get_parallel().attn_tp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)

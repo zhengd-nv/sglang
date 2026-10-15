@@ -235,6 +235,8 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        if self.transfer_backend == TransferBackend.NVLINK:
+            kv_args.nvlink_pool = self.token_to_kv_pool
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = get_parallel().dp_rank

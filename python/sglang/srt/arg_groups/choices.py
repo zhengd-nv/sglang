@@ -120,6 +120,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
 ]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "nvlink",
     "mooncake",
     "nixl",
     "ascend",

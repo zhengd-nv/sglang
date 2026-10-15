@@ -633,6 +633,7 @@ class MetadataBuffers:
 
 
 class TransferBackend(Enum):
+    NVLINK = "nvlink"
     MOONCAKE = "mooncake"
     MORI = "mori"
     NIXL = "nixl"
@@ -679,7 +680,17 @@ def get_kv_class(
     if class_type == KVClassType.KVARGS:
         return KVArgs
 
-    if transfer_backend == TransferBackend.MOONCAKE:
+    if transfer_backend == TransferBackend.NVLINK:
+        from sglang.srt.disaggregation.nvlink import (
+            NvlinkKVBootstrapServer, NvlinkKVManager, NvlinkKVReceiver, NvlinkKVSender,
+        )
+        class_mapping = {
+            KVClassType.MANAGER: NvlinkKVManager,
+            KVClassType.SENDER: NvlinkKVSender,
+            KVClassType.RECEIVER: NvlinkKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: NvlinkKVBootstrapServer,
+        }
+    elif transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
