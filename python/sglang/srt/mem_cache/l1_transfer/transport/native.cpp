@@ -5,6 +5,11 @@
 // event completion, active-region lifetime tracking and the nvt_* C ABI.
 // Independent CUDA Driver data plane; no framework or transport-library dependency.
 #include <cuda.h>
+#include <chrono>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -25,18 +30,70 @@ struct Context {
     explicit Context(CUcontext ctx) { check(cuCtxPushCurrent(ctx)); }
     ~Context() { CUcontext old; cuCtxPopCurrent(&old); }
 };
+// Idle pairs are bounded and scoped to the lifetime of registered regions.
+// Each in-flight batch owns its pair exclusively, including its completion event.
+bool enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return !value || std::string(value) != "0";
+}
+struct Resources { CUstream stream = nullptr; CUevent event = nullptr; };
+struct ResourcePool {
+    CUdevice device;
+    CUcontext ctx;
+    std::mutex mutex;
+    std::vector<Resources> idle;
+    explicit ResourcePool(CUdevice d) : device(d) {
+        idle.reserve(8);
+        check(cuDevicePrimaryCtxRetain(&ctx, device));
+    }
+    Resources acquire(bool reuse) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (reuse && !idle.empty()) {
+            auto r = idle.back(); idle.pop_back(); return r;
+        }
+        Resources r;
+        check(cuStreamCreate(&r.stream, CU_STREAM_NON_BLOCKING));
+        CUresult rc = cuEventCreate(&r.event, CU_EVENT_DISABLE_TIMING);
+        if (rc != CUDA_SUCCESS) { cuStreamDestroy(r.stream); check(rc); }
+        return r;
+    }
+    void release(Resources r, bool reuse) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (reuse && idle.size() < 8) { idle.push_back(r); return; }
+        check(cuEventDestroy(r.event));
+        check(cuStreamDestroy(r.stream));
+    }
+    ~ResourcePool() {
+        // All batches and regions have relinquished their references.
+        CUresult rc = cuCtxPushCurrent(ctx);
+        if (rc == CUDA_SUCCESS) {
+            for (auto r : idle) { cuEventDestroy(r.event); cuStreamDestroy(r.stream); }
+            CUcontext old; cuCtxPopCurrent(&old);
+        }
+        cuDevicePrimaryCtxRelease(device);
+    }
+};
+std::shared_ptr<ResourcePool> poolFor(CUdevice device) {
+    static std::mutex mutex;
+    static std::map<CUdevice, std::weak_ptr<ResourcePool>> pools;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto pool = pools[device].lock();
+    if (!pool) { pool = std::make_shared<ResourcePool>(device); pools[device] = pool; }
+    return pool;
+}
 struct Region {
+    std::shared_ptr<ResourcePool> pool;
     CUcontext ctx = nullptr;
     CUdevice device = 0;
     CUmemGenericAllocationHandle allocation = 0;
     CUdeviceptr ptr = 0;
     size_t bytes = 0, logical = 0, granularity = 0;
-    bool mapped = false, poisoned = false;
+    bool mapped = false, poisoned = false, imported = false;
     unsigned active = 0;
     void init(int ordinal) {
         check(cuInit(0));
         check(cuDeviceGet(&device, ordinal));
-        check(cuDevicePrimaryCtxRetain(&ctx, device));
+        pool = poolFor(device); ctx = pool->ctx;
     }
     void map() {
         Context scope(ctx);
@@ -57,7 +114,7 @@ struct Region {
               if (ptr) { check(cuMemAddressFree(ptr, bytes)); ptr = 0; }
               if (allocation) { check(cuMemRelease(allocation)); allocation = 0; }
             }
-            check(cuDevicePrimaryCtxRelease(device)); ctx = nullptr;
+            ctx = nullptr; pool.reset();
         }
     }
     ~Region() { try { close(); } catch (...) {} }
@@ -68,6 +125,8 @@ void range(Region* r, size_t offset, size_t length) {
 }
 // state: 0 in flight, 1 success, 2 failed drained, 3 failed uncertain.
 struct Batch {
+    std::shared_ptr<ResourcePool> pool;
+    bool reuse = false;
     CUcontext ctx = nullptr;
     CUstream stream = nullptr;
     CUevent event = nullptr;
@@ -92,14 +151,14 @@ struct Batch {
     void close() {
         if (state == 0 || state == 3) throw std::runtime_error("batch is not safely drained");
         Context scope(ctx);
-        if (event) { check(cuEventDestroy(event)); event = nullptr; }
-        if (stream) { check(cuStreamDestroy(stream)); stream = nullptr; }
+        if (event && stream) pool->release({stream, event}, reuse && state == 1);
+        event = nullptr; stream = nullptr;
     }
 };
 }
 extern "C" {
 struct NvRange { void* source; uint64_t source_offset; void* target; uint64_t target_offset; uint64_t length; };
-int nvt_abi_version() { return 1; }
+int nvt_abi_version() { return 2; }
 const char* nvt_error() { return last_error.c_str(); }
 size_t nvt_fabric_size() { return sizeof(CUmemFabricHandle); }
 #define BEGIN try {
@@ -136,7 +195,7 @@ int nvt_import(int device, const void* fabric, size_t length, size_t physical, s
     if (!fabric || !out || !length || length > physical || !granularity || physical%granularity)
         throw std::invalid_argument("invalid import descriptor");
     auto r = std::make_unique<Region>(); r->init(device);
-    r->logical=length; r->bytes=physical; r->granularity=granularity;
+    r->logical=length; r->bytes=physical; r->granularity=granularity; r->imported=true;
     { Context scope(r->ctx);
       check(cuMemImportFromShareableHandle(&r->allocation, const_cast<void*>(fabric), CU_MEM_HANDLE_TYPE_FABRIC));
       CUmemAllocationProp prop{}; check(cuMemGetAllocationPropertiesFromHandle(&prop, r->allocation));
@@ -160,18 +219,53 @@ int nvt_host_copy(void* handle, size_t offset, void* data, size_t length, int re
 int nvt_submit(const NvRange* ranges, size_t count, void** out) { BEGIN
     if (!ranges || !count || !out) throw std::invalid_argument("empty batch");
     auto b=std::make_unique<Batch>();
+#if CUDA_VERSION >= 13000
+    bool uniform_direction = true;
+#endif
     for (size_t i=0;i<count;++i) {
         auto* s=static_cast<Region*>(ranges[i].source); auto* t=static_cast<Region*>(ranges[i].target);
         range(s,ranges[i].source_offset,ranges[i].length); range(t,ranges[i].target_offset,ranges[i].length);
         if (s->ctx!=t->ctx || (b->ctx && b->ctx!=s->ctx)) throw std::invalid_argument("mixed CUDA contexts");
-        b->ctx=s->ctx; b->regions.push_back(s); b->regions.push_back(t);
+#if CUDA_VERSION >= 13000
+        if (s->imported != static_cast<Region*>(ranges[0].source)->imported)
+            uniform_direction = false;
+#endif
+        b->ctx=s->ctx; b->pool=s->pool; b->regions.push_back(s); b->regions.push_back(t);
     }
     Context scope(b->ctx);
-    check(cuStreamCreate(&b->stream,CU_STREAM_NON_BLOCKING));
-    CUresult rc=cuEventCreate(&b->event,CU_EVENT_DISABLE_TIMING);
-    if (rc!=CUDA_SUCCESS) { cuStreamDestroy(b->stream); check(rc); }
+    // Prepare all host-side arrays before acquiring resources or issuing CUDA work.
+#if CUDA_VERSION >= 13000
+    // Mixed READ/WRITE batches can contain local data dependencies. CUDA batch
+    // copies are unordered, so retain sequential stream submission for them.
+    const bool batched = uniform_direction && enabled("NVT_BATCH_COPY");
+    std::vector<CUdeviceptr> sources, targets;
+    std::vector<size_t> sizes;
+    if (batched) {
+        sources.reserve(count); targets.reserve(count); sizes.reserve(count);
+        for (size_t i=0; i<count; ++i) {
+            sources.push_back(static_cast<Region*>(ranges[i].source)->ptr + ranges[i].source_offset);
+            targets.push_back(static_cast<Region*>(ranges[i].target)->ptr + ranges[i].target_offset);
+            sizes.push_back(ranges[i].length);
+        }
+    }
+#endif
+    b->reuse = enabled("NVT_RESOURCE_POOL");
+    auto resources = b->pool->acquire(b->reuse);
+    b->stream = resources.stream; b->event = resources.event;
+    CUresult rc = CUDA_SUCCESS;
     for (auto* r:b->regions) ++r->active;
     b->held=true;
+#if CUDA_VERSION >= 13000
+    if (batched) {
+        CUmemcpyAttributes attr{};
+        attr.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+        size_t attr_index = 0;
+        rc = cuMemcpyBatchAsync(targets.data(), sources.data(), sizes.data(), count,
+                                &attr, &attr_index, 1, b->stream);
+        // A failed batch may have submitted some copies: drain, never retry it.
+        if (rc != CUDA_SUCCESS) b->fail(rc);
+    } else
+#endif
     for (size_t i=0;i<count;++i) {
         auto* s=static_cast<Region*>(ranges[i].source); auto* t=static_cast<Region*>(ranges[i].target);
         rc=cuMemcpyDtoDAsync(t->ptr+ranges[i].target_offset,s->ptr+ranges[i].source_offset,ranges[i].length,b->stream);
@@ -187,6 +281,27 @@ int nvt_poll(void* handle, int* state) { BEGIN
         else if(rc!=CUDA_ERROR_NOT_READY) b->fail(rc);
     }
     *state=b->state; END }
+// timeout < 0 blocks on this batch's event. Finite waits poll in native code
+// (ctypes releases the GIL), periodically yielding rather than sleeping 100 us.
+// A timeout is observational: ownership and the CUDA operation remain unchanged.
+int nvt_wait(void* handle, double timeout) { BEGIN
+    auto* b=static_cast<Batch*>(handle); Context scope(b->ctx);
+    if (b->state != 0) return 0;
+    if (timeout < 0) {
+        CUresult rc = cuEventSynchronize(b->event);
+        if (rc == CUDA_SUCCESS) b->finish(1); else b->fail(rc);
+    } else {
+        const auto start = std::chrono::steady_clock::now();
+        unsigned polls = 0;
+        while (b->state == 0) {
+            CUresult rc = cuEventQuery(b->event);
+            if (rc == CUDA_SUCCESS) { b->finish(1); break; }
+            if (rc != CUDA_ERROR_NOT_READY) { b->fail(rc); break; }
+            if (std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count() >= timeout) break;
+            if (++polls % 64 == 0) std::this_thread::yield();
+        }
+    }
+    END }
 const char* nvt_batch_error(void* handle) { return static_cast<Batch*>(handle)->failure.c_str(); }
 int nvt_release_batch(void* handle) { BEGIN auto* b=static_cast<Batch*>(handle); b->close(); delete b; END }
 int nvt_close(void* handle) { BEGIN auto* r=static_cast<Region*>(handle); r->close(); delete r; END }

@@ -279,9 +279,24 @@ class NvlinkEngine:
                     memory.poisoned = True
         return item.status
 
+    @locked
     def wait(self, batch, timeout=None):
         if timeout is not None and (not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0):
             raise ValueError("timeout must be finite and non-negative")
+        if os.environ.get("NVT_NATIVE_WAIT", "1") != "0" and hasattr(self._driver, "wait"):
+            item = self._batch(batch)
+            if item.status.state == TransferState.IN_FLIGHT:
+                try:
+                    self._driver.wait(item.native, timeout)
+                except Exception as exc:
+                    item.status = TransferStatus(TransferState.FAILED_UNCERTAIN,
+                                                 item.status.requested_bytes, None, error=str(exc))
+                    for key in item.memories:
+                        self._memories[key].poisoned = True
+            result = self.get_transfer_status(batch)
+            if result.state == TransferState.IN_FLIGHT:
+                raise TimeoutError("transfer still in flight; buffers must not be released")
+            return result
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             result = self.get_transfer_status(batch)

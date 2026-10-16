@@ -44,6 +44,36 @@ Transport GPU tests can be run with `test/manual/l1_transfer/test-gpu.py --local
 --output OUTPUT`, or one process on each of two nodes with `--rank 0/1` and a
 shared output directory. Set PYTHONPATH and NVLINK_TRANSFER_LIB first.
 
+## Transfer execution
+
+The native ABI is version 2; rebuild the library after updating Python bindings.
+CUDA 13+ builds submit independent ranges with `cuMemcpyBatchAsync`, using
+stream-ordered source access. Older toolkit builds use per-range
+`cuMemcpyDtoDAsync`. This is a Driver API implementation with no cudart or TE
+runtime dependency. The caller must make source writes ready before submission;
+this API does not infer a PyTorch producer stream or synchronize a remote writer.
+
+Registered regions on a device share a primary-context resource pool. Each batch
+exclusively owns a nonblocking stream and completion event until release; at most
+eight idle pairs are retained. Failed batches are not returned to the pool.
+Idle resources are destroyed when the last associated region/batch is closed.
+This preserves batch-local completion when multiple disjoint batches are active.
+
+`wait(timeout=None)` blocks on the batch's native event. Finite timeouts poll in
+C++ and periodically yield the CPU, removing the Python 100-microsecond sleep;
+ctypes releases the GIL, but the engine's serialized API lock remains held.
+Finite waits can consume a CPU core. Timeout does not cancel, drain or release
+the transfer. Uncertain failures still quarantine affected regions.
+
+For controlled ablations, set `NVT_NATIVE_WAIT=0`, `NVT_RESOURCE_POOL=0`, or
+`NVT_BATCH_COPY=0` to disable that optimization (default: enabled). Set these
+before starting the process; do not change them during concurrent calls.
+Batching preserves the range list, with no implicit coalescing or layout packing.
+Mixed READ/WRITE batches retain per-range stream submission because they can
+contain local producer/consumer dependencies; CUDA batch copies are unordered.
+`test/manual/l1_transfer/test-resource-reuse.py` validates simultaneous batches,
+reverse completion waits and repeated resource-pool teardown on two GPUs.
+
 ## License and provenance
 
 This distribution contains code adapted from the local SGLang experimental
@@ -66,6 +96,11 @@ Mooncake Transfer Engine and SGLang PD adapters were design references for
 range/batch interfaces and completion contracts. No Mooncake, NIXL or MORI
 implementation is bundled in this distribution. This notice records the
 local adaptation; it is not an upstream SGLang NOTICE file.
+
+Batch copy submission and resource reuse were informed by Mooncake classic TE
+`nvlink_transport.cpp` at `97abb51488208b97b1f19a775df70a03e861241b` (Apache-2.0).
+The implementation here uses CUDA Driver APIs, region-scoped resource ownership
+and per-batch completion events; no TE source is incorporated.
 
 The paired-contiguous planning in `transport/layout.py` follows SGLang
 python/sglang/srt/disaggregation/common/utils.py::group_concurrent_contiguous

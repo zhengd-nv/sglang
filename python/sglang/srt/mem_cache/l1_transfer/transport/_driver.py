@@ -25,6 +25,7 @@ class Driver:
             "nvt_info": ([C.c_void_p, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)], C.c_int),
             "nvt_host_copy": ([C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t, C.c_int], C.c_int),
             "nvt_submit": ([C.POINTER(_Range), C.c_size_t, C.POINTER(C.c_void_p)], C.c_int),
+            "nvt_wait": ([C.c_void_p, C.c_double], C.c_int),
             "nvt_poll": ([C.c_void_p, C.POINTER(C.c_int)], C.c_int),
             "nvt_batch_error": ([C.c_void_p], C.c_char_p),
             "nvt_release_batch": ([C.c_void_p], C.c_int),
@@ -32,7 +33,7 @@ class Driver:
         }
         for name, (args, result) in definitions.items():
             fn = getattr(self.lib, name); fn.argtypes = args; fn.restype = result
-        if self.lib.nvt_abi_version() != 1 or self.lib.nvt_fabric_size() != 64:
+        if self.lib.nvt_abi_version() != 2 or self.lib.nvt_fabric_size() != 64:
             raise TransferError("native ABI mismatch")
 
     def check(self, code):
@@ -80,6 +81,9 @@ class Driver:
     def poll(self, handle):
         state = C.c_int(); self.check(self.lib.nvt_poll(handle, C.byref(state)))
         return state.value, self.lib.nvt_batch_error(handle).decode()
+
+    def wait(self, handle, timeout):
+        self.check(self.lib.nvt_wait(handle, -1.0 if timeout is None else timeout))
 
     def release_batch(self, handle):
         self.check(self.lib.nvt_release_batch(handle))

@@ -149,6 +149,37 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(self.b.wait(h).state, TransferState.FAILED_UNCERTAIN)
         with self.assertRaises(BusyError): self.b.close()
 
+    def test_native_wait_timeout_preserves_ownership(self):
+        self.driver.wait = lambda handle, timeout: None
+        h = self.b.submit_transfer([self.request()])
+        with self.assertRaises(TimeoutError): self.b.wait(h, 0)
+        with self.assertRaises(BusyError): self.b.release_batch(h)
+        with self.assertRaises(BusyError): self.b.unregister_memory(self.local)
+        self.driver.state = 1
+        self.assertEqual(self.b.wait(h, 1).state, TransferState.SUCCESS)
+        self.b.release_batch(h)
+
+    def test_native_wait_exception_quarantines(self):
+        def fail(handle, timeout): raise RuntimeError("wait failed")
+        self.driver.wait = fail
+        h = self.b.submit_transfer([self.request()])
+        status = self.b.wait(h, 1)
+        self.assertEqual(status.state, TransferState.FAILED_UNCERTAIN)
+        self.assertEqual(status.error, "wait failed")
+        with self.assertRaises(BusyError): self.b.unregister_memory(self.local)
+        with self.assertRaises(BusyError): self.b.release_batch(h)
+
+    def test_native_wait_completion_and_terminal_idempotence(self):
+        calls = []
+        def complete(handle, timeout):
+            calls.append(timeout); self.driver.state = 1
+        self.driver.wait = complete
+        h = self.b.submit_transfer([self.request()])
+        self.assertEqual(self.b.wait(h).state, TransferState.SUCCESS)
+        self.assertEqual(self.b.wait(h, 0).state, TransferState.SUCCESS)
+        self.assertEqual(calls, [None])
+        self.b.release_batch(h)
+
     def test_foreign_and_forged_handles(self):
         for req in (self.request(local=self.source), self.request(local=replace(self.local))):
             with self.assertRaises(ValueError): self.b.submit_transfer([req])
