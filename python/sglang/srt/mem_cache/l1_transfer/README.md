@@ -46,16 +46,24 @@ shared output directory. Set PYTHONPATH and NVLINK_TRANSFER_LIB first.
 
 ## Transfer execution
 
-The native ABI is version 2; rebuild the library after updating Python bindings.
+The native ABI is version 3; rebuild the library after updating Python bindings.
 CUDA 13+ builds submit independent ranges with `cuMemcpyBatchAsync`, using
 stream-ordered source access. Older toolkit builds use per-range
 `cuMemcpyDtoDAsync`. This is a Driver API implementation with no cudart or TE
-runtime dependency. The caller must make source writes ready before submission;
-this API does not infer a PyTorch producer stream or synchronize a remote writer.
+runtime dependency. By default the caller must make source writes ready before
+submission. For local producer work, use
+`engine.submit_transfer(requests, producer_stream=stream.cuda_stream)`.
+The native layer records a reusable event on that stream and enqueues a wait on
+the copy stream, without a host wait. `None` means externally ready; `0` explicitly
+selects the default stream. The handle must belong to the engine context and stay
+valid until batch release. Do not append overlapping writes after the readiness
+marker until the transfer completes. This does not synchronize a remote writer;
+remote readiness and export leases remain the peer protocol's responsibility.
+The PD adapter currently retains its existing explicit producer synchronization.
 
 Registered regions on a device share a primary-context resource pool. Each batch
 exclusively owns a nonblocking stream and completion event until release; at most
-eight idle pairs are retained. Failed batches are not returned to the pool.
+eight idle resource sets are retained, each optionally including a readiness event. Failed batches are not returned to the pool.
 Idle resources are destroyed when the last associated region/batch is closed.
 This preserves batch-local completion when multiple disjoint batches are active.
 
@@ -65,6 +73,15 @@ ctypes releases the GIL, but the engine's serialized API lock remains held.
 Finite waits can consume a CPU core. Timeout does not cancel, drain or release
 the transfer. Uncertain failures still quarantine affected regions.
 
+Partial submission, completion-record and asynchronous query/wait errors drain the
+copy stream before reporting `FAILED_DRAINED`. If readiness setup failed before
+the dependency was enqueued, the producer stream is also drained. Any required
+drain failure yields `FAILED_UNCERTAIN`: pins stay held, regions are quarantined,
+and resources cannot be reused. Failed cleanup also quarantines the batch and its
+regions; successfully destroyed handles are cleared immediately to avoid double
+destruction. There is no automatic retry, cancellation or fallback after submission.
+Error diagnostics include the original CUDA code and drain results.
+
 For controlled ablations, set `NVT_NATIVE_WAIT=0`, `NVT_RESOURCE_POOL=0`, or
 `NVT_BATCH_COPY=0` to disable that optimization (default: enabled). Set these
 before starting the process; do not change them during concurrent calls.
@@ -73,6 +90,20 @@ Mixed READ/WRITE batches retain per-range stream submission because they can
 contain local producer/consumer dependencies; CUDA batch copies are unordered.
 `test/manual/l1_transfer/test-resource-reuse.py` validates simultaneous batches,
 reverse completion waits and repeated resource-pool teardown on two GPUs.
+
+## Safety tests
+
+`test/manual/l1_transfer/test-producer-stream.py` checks delayed producer writes,
+byte correctness, timeout ownership and reuse on two GPUs. Run it with the same
+`PYTHONPATH` and `NVLINK_TRANSFER_LIB` settings as the GPU range tests.
+
+`test/manual/l1_transfer/test-native-failures.cpp` includes the production native
+state machine and overrides CUDA calls in the test executable. Build with C++17,
+CUDA headers and `-lcuda`, without `NDEBUG`; run each scenario in a fresh process.
+It tests partial issue, event record/query/wait failures, readiness setup failures,
+drain failures, timeout followed by completion, and cleanup failure isolation.
+These deterministic tests do not inject real GPU resets or validate device recovery.
+Python contract tests separately check handle ownership and failure propagation.
 
 ## License and provenance
 

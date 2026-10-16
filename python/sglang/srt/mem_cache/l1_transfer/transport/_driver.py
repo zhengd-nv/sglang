@@ -15,6 +15,9 @@ class _Range(C.Structure):
 class Driver:
     def __init__(self, library: str):
         self.lib = C.CDLL(str(Path(library).resolve()))
+        self.lib.nvt_abi_version.restype = C.c_int
+        if self.lib.nvt_abi_version() != 3:
+            raise TransferError("native ABI mismatch; rebuild l1_transfer/build-native.sh")
         definitions = {
             "nvt_abi_version": ([], C.c_int), "nvt_fabric_size": ([], C.c_size_t),
             "nvt_error": ([], C.c_char_p),
@@ -24,7 +27,7 @@ class Driver:
             "nvt_export": ([C.c_void_p, C.c_void_p], C.c_int),
             "nvt_info": ([C.c_void_p, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)], C.c_int),
             "nvt_host_copy": ([C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t, C.c_int], C.c_int),
-            "nvt_submit": ([C.POINTER(_Range), C.c_size_t, C.POINTER(C.c_void_p)], C.c_int),
+            "nvt_submit": ([C.POINTER(_Range), C.c_size_t, C.c_void_p, C.c_int, C.POINTER(C.c_void_p)], C.c_int),
             "nvt_wait": ([C.c_void_p, C.c_double], C.c_int),
             "nvt_poll": ([C.c_void_p, C.POINTER(C.c_int)], C.c_int),
             "nvt_batch_error": ([C.c_void_p], C.c_char_p),
@@ -33,7 +36,7 @@ class Driver:
         }
         for name, (args, result) in definitions.items():
             fn = getattr(self.lib, name); fn.argtypes = args; fn.restype = result
-        if self.lib.nvt_abi_version() != 2 or self.lib.nvt_fabric_size() != 64:
+        if self.lib.nvt_fabric_size() != 64:
             raise TransferError("native ABI mismatch")
 
     def check(self, code):
@@ -73,9 +76,9 @@ class Driver:
         self.check(self.lib.nvt_host_copy(handle, offset, raw, length, 1))
         return raw.raw
 
-    def submit(self, ranges):
+    def submit(self, ranges, *, producer_stream=None):
         rows = (_Range * len(ranges))(*[_Range(*r) for r in ranges])
-        out = C.c_void_p(); self.check(self.lib.nvt_submit(rows, len(rows), C.byref(out)))
+        out = C.c_void_p(); self.check(self.lib.nvt_submit(rows, len(rows), producer_stream, int(producer_stream is not None), C.byref(out)))
         return out.value
 
     def poll(self, handle):

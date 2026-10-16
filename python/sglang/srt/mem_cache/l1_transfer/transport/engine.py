@@ -213,7 +213,17 @@ class NvlinkEngine:
             raise
 
     @locked
-    def submit_transfer(self, requests):
+    def submit_transfer(self, requests, *, producer_stream=None):
+        """Copy ready remote data; optionally order after a local producer stream.
+
+        None means the caller already established readiness. An integer is a
+        CUDA stream handle in this engine's context (0 means the default stream).
+        The stream only covers local work, never an unsynchronized remote writer.
+        Keep it valid until batch release. Do not append overlapping writes after
+        the readiness marker until the transfer completes.
+        """
+        if producer_stream is not None:
+            checked_int(producer_stream, "producer_stream")
         requests = tuple(requests)
         if not requests:
             raise ValueError("empty transfer batch")
@@ -246,7 +256,8 @@ class NvlinkEngine:
                 raise ValueError("overlapping destination ranges")
         # If the native call raises unexpectedly after partial issue, conservatively quarantine.
         try:
-            native = self._driver.submit(ranges)
+            native = (self._driver.submit(ranges) if producer_stream is None else
+                      self._driver.submit(ranges, producer_stream=producer_stream))
         except Exception:
             for key in touched:
                 self._memories[key].poisoned = True
@@ -312,7 +323,16 @@ class NvlinkEngine:
         item = self._batch(batch)
         if not self.get_transfer_status(batch).drained:
             raise BusyError("batch not safely drained")
-        self._driver.release_batch(item.native)
+        try:
+            self._driver.release_batch(item.native)
+        except Exception as exc:
+            # Cleanup errors must never permit an uncertain handle to be retried
+            # or its memory to be recycled by a later close/unregister call.
+            item.status = TransferStatus(TransferState.FAILED_UNCERTAIN,
+                                         item.status.requested_bytes, None, error=str(exc))
+            for key in item.memories:
+                self._memories[key].poisoned = True
+            raise
         for key in item.memories:
             self._memories[key].active.remove(batch.batch_id)
         del self._batches[batch.batch_id]

@@ -180,6 +180,43 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(calls, [None])
         self.b.release_batch(h)
 
+    def test_release_error_is_terminal_and_keeps_ownership(self):
+        calls = []
+        def fail(handle):
+            calls.append(handle)
+            raise TransferError("event destroy failed")
+        self.driver.release_batch = fail
+        h = self.b.submit_transfer([self.request()])
+        self.driver.state = 1
+        self.b.wait(h)
+        with self.assertRaises(TransferError): self.b.release_batch(h)
+        self.assertEqual(self.b.get_transfer_status(h).state, TransferState.FAILED_UNCERTAIN)
+        self.assertEqual(self.b.get_transfer_status(h).error, "event destroy failed")
+        with self.assertRaises(BusyError): self.b.release_batch(h)
+        with self.assertRaises(BusyError): self.b.unregister_memory(self.local)
+        with self.assertRaises(BusyError): self.b.close()
+        self.assertEqual(len(calls), 1)
+
+    def test_explicit_producer_stream_forwarding(self):
+        calls = []
+        submit = self.driver.submit
+        def with_dependency(ranges, *, producer_stream):
+            calls.append(producer_stream)
+            return submit(ranges)
+        self.driver.submit = with_dependency
+        for stream in (0, 1234):
+            h = self.b.submit_transfer([self.request()], producer_stream=stream)
+            self.driver.state = 1
+            self.b.wait(h); self.b.release_batch(h)
+        self.assertEqual(calls, [0, 1234])
+
+    def test_bad_producer_handle_rejected_before_submit(self):
+        for stream in (-1, True, 1.5, 'bad'):
+            with self.assertRaises(ValueError):
+                self.b.submit_transfer([self.request()], producer_stream=stream)
+        self.assertEqual(self.driver.submits, 0)
+        self.b.unregister_memory(self.local)
+
     def test_foreign_and_forged_handles(self):
         for req in (self.request(local=self.source), self.request(local=replace(self.local))):
             with self.assertRaises(ValueError): self.b.submit_transfer([req])

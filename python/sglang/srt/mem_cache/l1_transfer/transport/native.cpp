@@ -36,7 +36,7 @@ bool enabled(const char* name) {
     const char* value = std::getenv(name);
     return !value || std::string(value) != "0";
 }
-struct Resources { CUstream stream = nullptr; CUevent event = nullptr; };
+struct Resources { CUstream stream = nullptr; CUevent event = nullptr; CUevent ready = nullptr; };
 struct ResourcePool {
     CUdevice device;
     CUcontext ctx;
@@ -57,17 +57,22 @@ struct ResourcePool {
         if (rc != CUDA_SUCCESS) { cuStreamDestroy(r.stream); check(rc); }
         return r;
     }
-    void release(Resources r, bool reuse) {
+    void release(CUstream& stream, CUevent& event, CUevent& ready, bool reuse) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (reuse && idle.size() < 8) { idle.push_back(r); return; }
-        check(cuEventDestroy(r.event));
-        check(cuStreamDestroy(r.stream));
+        if (reuse && idle.size() < 8) {
+            idle.push_back({stream, event, ready});
+            stream = nullptr; event = nullptr; ready = nullptr; return;
+        }
+        // Preserve each successful destruction even if a later call fails.
+        if (ready) { check(cuEventDestroy(ready)); ready = nullptr; }
+        if (event) { check(cuEventDestroy(event)); event = nullptr; }
+        if (stream) { check(cuStreamDestroy(stream)); stream = nullptr; }
     }
     ~ResourcePool() {
         // All batches and regions have relinquished their references.
         CUresult rc = cuCtxPushCurrent(ctx);
         if (rc == CUDA_SUCCESS) {
-            for (auto r : idle) { cuEventDestroy(r.event); cuStreamDestroy(r.stream); }
+            for (auto r : idle) { if (r.ready) cuEventDestroy(r.ready); cuEventDestroy(r.event); cuStreamDestroy(r.stream); }
             CUcontext old; cuCtxPopCurrent(&old);
         }
         cuDevicePrimaryCtxRelease(device);
@@ -130,7 +135,11 @@ struct Batch {
     CUcontext ctx = nullptr;
     CUstream stream = nullptr;
     CUevent event = nullptr;
+    CUevent ready = nullptr;
     std::vector<Region*> regions;
+    CUstream producer = nullptr;
+    bool has_producer = false;
+    bool dependency_enqueued = false;
     int state = 0;
     bool held = false;
     std::string failure;
@@ -144,21 +153,33 @@ struct Batch {
     }
     void fail(CUresult cause) {
         const char* msg = nullptr; cuGetErrorString(cause, &msg);
-        failure = msg ? msg : "CUDA transfer failure";
         CUresult drained = cuStreamSynchronize(stream);
-        finish(drained == CUDA_SUCCESS ? 2 : 3);
+        // A failed readiness setup leaves the producer outside the copy stream's
+        // dependency chain. Drain it too before declaring source memory reusable.
+        CUresult producer_drained = CUDA_SUCCESS;
+        if (has_producer && !dependency_enqueued)
+            producer_drained = cuStreamSynchronize(producer);
+        finish(drained == CUDA_SUCCESS && producer_drained == CUDA_SUCCESS ? 2 : 3);
+        failure = "CUDA error " + std::to_string(int(cause)) + ": " +
+                  (msg ? msg : "CUDA transfer failure") +
+                  "; stream drain result=" + std::to_string(int(drained)) +
+                  "; producer drain result=" + std::to_string(int(producer_drained));
     }
     void close() {
         if (state == 0 || state == 3) throw std::runtime_error("batch is not safely drained");
         Context scope(ctx);
-        if (event && stream) pool->release({stream, event}, reuse && state == 1);
-        event = nullptr; stream = nullptr;
+        try {
+            pool->release(stream, event, ready, reuse && state == 1);
+        } catch (...) {
+            finish(3);
+            throw;
+        }
     }
 };
 }
 extern "C" {
 struct NvRange { void* source; uint64_t source_offset; void* target; uint64_t target_offset; uint64_t length; };
-int nvt_abi_version() { return 2; }
+int nvt_abi_version() { return 3; }
 const char* nvt_error() { return last_error.c_str(); }
 size_t nvt_fabric_size() { return sizeof(CUmemFabricHandle); }
 #define BEGIN try {
@@ -216,7 +237,7 @@ int nvt_host_copy(void* handle, size_t offset, void* data, size_t length, int re
     CUresult drained=cuCtxSynchronize();
     if (rc!=CUDA_SUCCESS || drained!=CUDA_SUCCESS) r->poisoned=true;
     check(rc); check(drained); END }
-int nvt_submit(const NvRange* ranges, size_t count, void** out) { BEGIN
+int nvt_submit(const NvRange* ranges, size_t count, CUstream producer, int has_producer, void** out) { BEGIN
     if (!ranges || !count || !out) throw std::invalid_argument("empty batch");
     auto b=std::make_unique<Batch>();
 #if CUDA_VERSION >= 13000
@@ -233,6 +254,12 @@ int nvt_submit(const NvRange* ranges, size_t count, void** out) { BEGIN
         b->ctx=s->ctx; b->pool=s->pool; b->regions.push_back(s); b->regions.push_back(t);
     }
     Context scope(b->ctx);
+    if (has_producer) {
+        CUcontext producer_context = nullptr;
+        check(cuStreamGetCtx(producer, &producer_context));
+        if (producer_context != b->ctx)
+            throw std::invalid_argument("producer stream belongs to another context");
+    }
     // Prepare all host-side arrays before acquiring resources or issuing CUDA work.
 #if CUDA_VERSION >= 13000
     // Mixed READ/WRITE batches can contain local data dependencies. CUDA batch
@@ -251,10 +278,22 @@ int nvt_submit(const NvRange* ranges, size_t count, void** out) { BEGIN
 #endif
     b->reuse = enabled("NVT_RESOURCE_POOL");
     auto resources = b->pool->acquire(b->reuse);
-    b->stream = resources.stream; b->event = resources.event;
+    b->stream = resources.stream; b->event = resources.event; b->ready = resources.ready;
     CUresult rc = CUDA_SUCCESS;
     for (auto* r:b->regions) ++r->active;
     b->held=true;
+    b->producer = producer; b->has_producer = has_producer;
+    if (has_producer) {
+        // This event orders local producer work without synchronizing the host
+        // or unrelated streams. Remote readiness still belongs to the peer protocol.
+        if (!b->ready) rc = cuEventCreate(&b->ready, CU_EVENT_DISABLE_TIMING);
+        if (rc == CUDA_SUCCESS) rc = cuEventRecord(b->ready, producer);
+        if (rc == CUDA_SUCCESS) rc = cuStreamWaitEvent(b->stream, b->ready, 0);
+        if (rc != CUDA_SUCCESS) {
+            b->fail(rc); *out=b.release(); return 0;
+        }
+        b->dependency_enqueued = true;
+    }
 #if CUDA_VERSION >= 13000
     if (batched) {
         CUmemcpyAttributes attr{};
