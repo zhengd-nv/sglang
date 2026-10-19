@@ -16,6 +16,7 @@ class TestSchedulerPeer(unittest.TestCase):
     def peer(self):
         peer = object.__new__(SchedulerPeer)
         peer.cache = peer.adapter = peer.identity = None
+        peer.engine = SimpleNamespace(device=3)
         peer.receiver = None
         peer.stats = Mock(return_value={})
         return peer
@@ -31,9 +32,22 @@ class TestSchedulerPeer(unittest.TestCase):
         self.assertEqual(result['local_tokens'], 16)
         connect.assert_not_called()
         self.assertIs(peer.receiver, receiver)
-        peer.finish()
+        with patch('sglang.srt.mem_cache.l1_transfer.peer.scheduler.torch.cuda.synchronize') as sync:
+            sync.side_effect = lambda device: receiver.finish_consumer.assert_not_called()
+            peer.finish()
+            sync.assert_called_once_with(3)
         receiver.finish_consumer.assert_called_once()
         self.assertIsNone(peer.receiver)
+
+    def test_failed_gpu_sync_retains_consumer(self):
+        peer = self.peer()
+        receiver = peer.receiver = Mock()
+        with patch('sglang.srt.mem_cache.l1_transfer.peer.scheduler.torch.cuda.synchronize',
+                   side_effect=RuntimeError('GPU sync failed')):
+            with self.assertRaisesRegex(RuntimeError, 'GPU sync failed'):
+                peer.finish()
+        receiver.finish_consumer.assert_not_called()
+        self.assertIs(peer.receiver, receiver)
 
     @patch('sglang.srt.mem_cache.l1_transfer.peer.scheduler.os._exit')
     @patch('sglang.srt.mem_cache.l1_transfer.peer.scheduler.PeerReceiver')
