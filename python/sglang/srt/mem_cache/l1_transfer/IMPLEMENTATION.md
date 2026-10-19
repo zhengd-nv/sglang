@@ -15,8 +15,9 @@ See [README](README.md) for native execution and provenance and
 
 The integration requires identical FULL/MHA/NHD layouts, plain radix caching,
 a finalized CUDA VMM KV pool, TP/PP/DP = 1, no speculation or LoRA, and
-`max_running_requests=1`. Peer operations execute serially on the idle
-scheduler's cache-owner thread. The tested model setup uses post-capture VMM
+`max_running_requests=1`. Cache/transport mutations execute serially on the
+scheduler's cache-owner thread. The nonblocking request mode additionally
+requires `disable_overlap_schedule=True` and pauses forward while sharing. The tested model setup uses post-capture VMM
 sizing. An ordinary cudaMalloc pool is not exportable through this adapter.
 
 Peers are trusted. The control socket is unauthenticated; descriptor permissions
@@ -29,8 +30,10 @@ initializing a peer.
 
 | Layer | Files | Responsibility |
 | --- | --- | --- |
-| Public API | [Engine](../../entrypoints/engine.py) | `Engine.l1_peer(action, **payload)` |
-| Scheduler integration | [peer/scheduler.py](peer/scheduler.py) | Idle/configuration checks; init/listen/serve/restore/finish/stats; fail-stop boundary |
+| Public API | [Engine](../../entrypoints/engine.py) | `Engine.l1_peer(action, **payload)` and `generate(l1_restore=...)` |
+| Scheduler integration | [peer/scheduler.py](peer/scheduler.py) | Configuration/ownership checks; explicit controls and nonblocking request state; fail-stop boundary |
+| Network workers | [peer/nonblocking.py](peer/nonblocking.py) | Persistent source listener, async target RPC; no cache/CUDA operations |
+| Request lifecycle | [io_struct.py](../../managers/io_struct.py), [tokenizer](../../managers/tokenizer_manager.py), [scheduler](../../managers/scheduler.py), [common.py](../common.py) | Carry context, hold requests until READY, pump each turn, release consumer at terminal KV cleanup |
 | Control protocol | [peer/control.py](peer/control.py) | Identity/layout contract, request IDs, bounded length-prefixed JSON socket messages |
 | Peer endpoints | [peer/peer.py](peer/peer.py) | Source offers/receipts, target local-hit handling, imports and READ plan |
 | Transaction | [peer/restore.py](peer/restore.py) | DMA completion, unmapping, publication and source release ordering |
@@ -132,8 +135,9 @@ while a lease remains active. This is not a coordinated peer recovery protocol.
 A partially failed publication cannot be treated as a clean, discardable private
 reservation. `finish_consumer()` requires source release to have completed.
 
-Do not issue other generation/control calls concurrently on either Engine. A
-source `serve` blocks scheduling for one acquire/release exchange. The native core
+For the explicit/synchronous modes, do not issue other generation/control calls
+concurrently on either Engine. A source `serve` blocks scheduling for one
+acquire/release exchange. The native core
 can handle disjoint batches; this does not make the Engine integration concurrent.
 
 ## Calling the ordinary Engine interface
@@ -194,3 +198,81 @@ future request contract. A generate/finish exception after successful restore
 shuts down the target Engine instead of freeing potentially live pages. Restore
 failures retain the existing scheduler fail-stop rules; no retry/fallback is added.
 The original explicit l1_peer workflow remains available.
+
+
+## Minimal nonblocking scheduler path
+
+This opt-in path admits the request before restore and keeps both schedulers
+available for control messages while waiting for peer RPC or device completion:
+
+```python
+# Both Engines: ordinary TP/PP/DP1, max_running_requests=1,
+# disable_overlap_schedule=True; same model, FULL/MHA/NHD cache and page size.
+source.l1_peer("init", identity=identity)
+target.l1_peer("init", identity=identity)
+source.generate(input_ids=source_prefix, sampling_params={"max_new_tokens": 1})
+address = source.l1_peer("start_service")  # once per source Engine lifetime
+result = target.generate(
+    input_ids=request_ids,
+    sampling_params={"temperature": 0, "max_new_tokens": 24},
+    l1_restore={"mode": "nonblocking", "source": address, "prefix_tokens": 112},
+)
+```
+
+The Python call still returns the terminal generation result synchronously. The
+nonblocking property applies to scheduler progress, not the caller's API.
+Source selection and prefix availability are supplied by the caller; this does
+not implement Router discovery or decisions. The default mode and explicit
+listen/serve/restore/finish APIs retain their previous behavior.
+
+The request context travels through `GenerateReqInput`, tokenizer and
+`TokenizedGenerateReqInput`. After normal request validation, `SchedulerPeer`
+keeps the request outside the ordinary waiting queue:
+
+```text
+WAIT_ACQUIRE -> WAIT_TRANSFER -> WAIT_RELEASE -> READY -> ordinary forward -> finish
+```
+
+- `WAIT_ACQUIRE`: reserve/pin the target prefix and private missing pages on the
+  scheduler thread; a network worker connects and requests a source lease.
+- Source's persistent `SourceService` only receives/sends bytes. It queues a
+  request/future for `SchedulerPeer.pump`, which validates readiness, pins pages
+  and exports regions on the cache owner thread. A busy source rejects before
+  acquiring ownership. The service handles subsequent connections automatically.
+- `WAIT_TRANSFER`: the scheduler imports the offer, builds the missing-page READ
+  plan, submits once, and polls `get_transfer_status` each turn. No transport
+  `wait()` is used on the successful path.
+- `WAIT_RELEASE`: after confirmed completion, release the batch, unmap imports
+  and publish once. Send the exact source receipt with `unmapped=True`, then poll
+  the network future for the release ACK. Publication alone does not make the
+  request schedulable; READY requires that ACK.
+- `READY`: put the request in the ordinary queue. Normal radix matching consumes
+  the restored prefix and normal prefill computes the remaining tail. At terminal
+  request KV cleanup, synchronize outstanding local GPU work and release the
+  consumer reservation before ordinary cache/page cleanup. The request result
+  exposes restore counters, wait poll counts and `consumer_released`.
+- An all-local prefix skips all three wait phases and all source RPCs.
+
+Each normal scheduler turn ingests input, pumps peer progress, then considers
+forward. While the target is waiting or the source holds a lease, **ordinary
+GPU forward on that Engine is paused**. Control queries and peer messages still
+progress. `stats` reports `wait_state`; destructive idle-only operations cannot
+flush an owned request. Network workers never call CUDA or mutate the cache.
+Readiness synchronization, import/export, cache publication and terminal GPU
+synchronization are still synchronous operations: this is not a guarantee that
+every scheduler operation has bounded latency.
+
+Relevant code: `peer/nonblocking.py` (network only), `peer/scheduler.py` (request
+state and source dispatch), `peer/peer.py::prepare_steps` (serialized preparation),
+`peer/restore.py::poll` (READ/release completion), normal scheduler loop/request
+admission, and `mem_cache/common.py::release_kv_cache` (consumer release hook).
+
+Limits remain intentional: one shared transaction per Engine, fixed trusted
+source, no grammar/session/LoRA/multimodal/PD request context, no transfer/forward
+overlap, no tail/decode capacity admission policy, no retries or fallback.
+Cancellation/retraction and uncertain ownership fail-stop instead of reclaiming
+potentially live pages. There is no independently stoppable source service;
+its listener lives with the Engine. Do not mix explicit ownership operations
+with an active nonblocking request/service. Only the synchronous Python Engine
+entry is covered by the model harness; HTTP/async/multi-rank integrations are not
+validated. Router metadata delivery remains separate follow-up work.

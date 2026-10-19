@@ -166,3 +166,35 @@ Run without the flag to retain the explicit API regression, including flush
 rejection while a consumer reservation is active. These modes use separate output
 paths. CPU request tests also check validation-before-acquire and shutdown rather
 than premature finish on ambiguous generate/finish errors.
+
+
+## Minimal nonblocking request validation
+
+```bash
+bash test/manual/l1_transfer/run-peer-model.sh \
+  /absolute/output/nonblocking-model /absolute/models/Qwen2-1.5B --nonblocking
+```
+
+This runs the same four model cases with one persistent source service and
+scheduler-owned target request admission/release. A test-only TCP proxy delays
+acquire and release replies by 250 ms each. A serialized observation thread
+queries target stats during generation; the driver also queries source stats.
+The test requires observing both WAIT_ACQUIRE and WAIT_RELEASE on target, an
+active source lease, correct generated tokens, automatic pin release, and full
+pool recovery. The injected delays are diagnostic and cannot measure latency or
+throughput benefits. No production delay hook is added.
+
+The CPU suite checks polling without transport wait, no duplicate publication
+while release ACK is pending, READY gating, pending-acquire progress, read-only
+control while busy, and repeated connections to the source service. Run the
+synchronous request and explicit modes separately as regressions.
+
+Validation on 2026-10-19 at runtime commit `205c1e3a5`: all 69 CPU tests
+passed. Nonblocking, synchronous wrapper and explicit modes each passed all four
+model cases (288 generated tokens total, all equal to their references), with
+the same configuration and transfer byte counts recorded above. Maximum
+output-token logprob difference remained 0.0023036450147628784. Both request
+modes released consumer pins automatically; all modes recovered 4096 pool
+tokens after flush. Delayed replies exposed both target RPC waits and a live
+source lease while control queries continued returning. This demonstrates
+progress, not a control-latency SLA or forward/transfer overlap.

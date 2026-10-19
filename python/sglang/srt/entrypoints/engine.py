@@ -1876,11 +1876,14 @@ class Engine(EngineScoreMixin, EngineBase):
     """
 
     def l1_peer(self, action: str, **payload):
-        """Experimental fixed-peer cache control; call only on an idle TP1 Engine.
+        """Experimental fixed-peer cache control for TP1 Engines.
 
-        init(identity), listen(host, port), serve(), restore(tokens, host, port),
-        finish(), stats(). A restored prefix remains pinned through generate()
-        until finish(). Both endpoints must use the same explicit identity.
+        Explicit mode: init(identity), listen(host, port), serve(),
+        restore(tokens, host, port), finish(). Nonblocking requests use
+        start_service(host, port) once and generate(l1_restore=...) instead.
+        stats() and request_result(rid) are observations allowed while busy;
+        mutations require idle ownership. Serialize access to this RPC socket.
+        Both endpoints must use the same explicit identity.
         """
         import json
         return json.loads(self.collective_rpc(

@@ -4,7 +4,9 @@ This branch layers Engine page ownership and explicit fixed-peer restoration on
 `feat/nvlink-transfer` (native ABI 3). Neither branch includes the experimental PD
 backend or its tests; `feat/nvlink-transfer-pd` remains an independent, unchanged
 branch. Same-layout FULL/MHA/NHD, TP/PP/DP1 and trusted serial callers are required.
-Normal request admission does not automatically look up remote prefixes.
+Normal request admission does not automatically look up remote prefixes. An
+opt-in `generate(l1_restore={"mode": "nonblocking", ...})` path waits inside the
+scheduler with a caller-selected source; see the implementation guide.
 
 ## Reading guide
 
