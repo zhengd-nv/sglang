@@ -112,6 +112,9 @@ class SchedulerPeer:
 
     def finish(self):
         if self.receiver is not None:
+            # A terminal response can precede deferred device work completing.
+            # Keep consumer pins until all preceding local GPU work is done.
+            torch.cuda.synchronize(self.engine.device)
             self.receiver.finish_consumer()
             self.receiver = None
         return self.stats()

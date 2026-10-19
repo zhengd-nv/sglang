@@ -2,6 +2,7 @@
 set -euo pipefail
 run="${1:?output directory}"
 model="${2:?model path}"
+shift 2
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 umask 077
@@ -45,4 +46,4 @@ python -m unittest discover -s "$repo/test/registered/unit/mem_cache/l1_transfer
 hostname
 nvidia-smi --query-gpu=index,uuid,driver_version --format=csv
 bash "$repo/python/sglang/srt/mem_cache/l1_transfer/build-native.sh"
-python "$here/test-peer-model.py" --model "$model" --output "$run"
+python "$here/test-peer-model.py" --model "$model" --output "$run" "$@"

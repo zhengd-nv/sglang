@@ -160,3 +160,37 @@ for Engine arguments, identity construction and process orchestration.
 This is explicit pre-restoration, not a remote-cache hook inside `generate`.
 Application orchestration is responsible for selecting the source, establishing
 that it holds the prefix, and deciding when to restore.
+
+## Synchronous request convenience API
+
+The Python `Engine.generate` entry now accepts a narrow `l1_restore` option:
+
+```python
+# Both peers have already run l1_peer("init", identity=...). The driver
+# starts source listen/serve in its owning process before this call.
+result = target.generate(
+    input_ids=request_ids,
+    sampling_params={"temperature": 0, "max_new_tokens": 24},
+    l1_restore={"source": source_address, "prefix_tokens": 112},
+)
+```
+
+This runs existing synchronous restore, ordinary non-streaming generation, then
+finish. The scheduler synchronizes local GPU work before releasing consumer pins.
+`result["meta_info"]["l1_restore"]` contains restore-time counters and a
+`consumer_released` flag; use `l1_peer("stats")` for current counters. An all-local
+hit performs no source RPC; the source address is still syntactically required.
+
+Only one tokenized text request with `n=1`, no sessions/cache salt/LoRA/multimodal
+inputs or PD bootstrap fields is accepted. `prefix_tokens` must be page-aligned
+and strictly shorter than the input. Unsupported fields are rejected before
+acquiring ownership. Both Engines still require exclusive serial callers and
+explicit peer initialization. Do not start blocking source serve for an all-local
+hit. Source startup/serve remains driver-owned.
+
+This is Python API orchestration, not a new scheduler request queue or an
+HTTP/async API. It does not reserve tail/decode growth space or implement the full
+future request contract. A generate/finish exception after successful restore
+shuts down the target Engine instead of freeing potentially live pages. Restore
+failures retain the existing scheduler fail-stop rules; no retry/fallback is added.
+The original explicit l1_peer workflow remains available.

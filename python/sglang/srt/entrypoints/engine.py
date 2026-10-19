@@ -478,11 +478,22 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        l1_restore: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        # Narrow synchronous convenience API; async/HTTP and scheduler-level
+        # restore admission are deliberately not enabled by this argument.
+        if l1_restore is not None:
+            arguments = dict(locals())
+            arguments.pop("self")
+            arguments.pop("l1_restore")
+            from sglang.srt.mem_cache.l1_transfer.peer.request import generate_with_restore
+
+            return generate_with_restore(self, arguments, l1_restore)
+
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
         )

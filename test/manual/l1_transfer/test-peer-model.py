@@ -36,7 +36,8 @@ def actor(pipe, gpu, model, output):
                 elif op == 'generate':
                     answer = engine.generate(input_ids=command['tokens'],
                         sampling_params={'temperature':0, 'max_new_tokens':command.get('new',24), 'ignore_eos':True},
-                        return_logprob=True, logprob_start_len=-1)
+                        return_logprob=True, logprob_start_len=-1,
+                        l1_restore=command.get('l1_restore'))
                 elif op == 'flush':
                     answer = engine.flush_cache().success
                 else:
@@ -55,6 +56,8 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--model',required=True)
     parser.add_argument('--output',required=True)
+    parser.add_argument('--request-restore', action='store_true',
+                        help='Use generate(l1_restore=...) with automatic consumer release')
     args=parser.parse_args()
     out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
     from transformers import AutoTokenizer
@@ -94,29 +97,36 @@ def main():
                 call(1,'generate',tokens=tokens[:local]+[777],new=1)
             request=tokens[:119]
             reference=call(2,'generate',tokens=request)
+            address = {'host': '127.0.0.1', 'port': 1}  # unused for all-local
             if local<112:
                 address=peer(0,'listen')
                 pipes[0].send(dict(op='peer',action='serve'))
+            if args.request_restore:
+                actual=call(1,'generate',tokens=request,
+                            l1_restore=dict(source=address, prefix_tokens=112))
+                restored=actual['meta_info']['l1_restore']
+                assert restored['consumer_released'], restored
+            else:
                 restored=peer(1,'restore',tokens=tokens[:112],**address)
+                # Target consumer pin must survive until ordinary generate completes.
+                assert not call(1,'flush'), 'flush accepted a live target reservation'
+                actual=call(1,'generate',tokens=request)
+            if local<112:
                 source=recv(0)
                 assert source['source_leases']==source['exports']==0
-            else:
-                restored=peer(1,'restore',tokens=tokens[:112])
             assert restored['local_tokens']==local,restored
             assert restored['restored_tokens']==112
             assert restored['pinned_pages']==7
             assert restored['imports']==restored['batches']==0
-            # Target consumer pin must survive until ordinary generate completes.
-            assert not call(1,'flush'), 'flush accepted a live target reservation'
-            actual=call(1,'generate',tokens=request)
             ids=lambda x:[t[1] for t in x['meta_info']['output_token_logprobs']]
             assert ids(reference)==ids(actual),(case,ids(reference),ids(actual))
             assert actual['meta_info']['cached_tokens']==112,actual['meta_info']
-            released=peer(1,'finish')
+            released=peer(1,'stats') if args.request_restore else peer(1,'finish')
             assert released['pinned_pages']==0 and not released['target_active']
             assert call(1,'flush')
             assert peer(1,'stats')['available_tokens']==4096
-            row=dict(case=case,**restored,cached_tokens=actual['meta_info']['cached_tokens'],
+            row=dict(restored,case=case,mode='request' if args.request_restore else 'explicit',
+                     cached_tokens=actual['meta_info']['cached_tokens'],
                      generated_tokens=len(ids(actual)),tokens_equal=True,consumer_released=True,
                      max_output_logprob_delta=max(abs(a[0]-b[0]) for a,b in zip(
                          reference['meta_info']['output_token_logprobs'],

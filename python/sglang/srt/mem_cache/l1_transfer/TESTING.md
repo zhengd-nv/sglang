@@ -149,3 +149,20 @@ bundled in this repository. The scripts and recorded configuration make the
 checks repeatable, but this snapshot does not replace retaining new run outputs.
 Automatic remote lookup, concurrent serving, multi-rank models and failure
 recovery remain outside the validated scope.
+
+## Synchronous request API validation
+
+Use the same environment as the ordinary Engine test, adding the mode flag:
+
+```bash
+bash test/manual/l1_transfer/run-peer-model.sh \
+  /absolute/output/request-model /absolute/models/Qwen2-1.5B --request-restore
+```
+
+The four cases now call `generate(l1_restore=...)` without driver-side target
+restore/finish calls. They compare tokens and cached prefix lengths, inspect
+restore-time pins, verify automatic release with live stats and flush the pool.
+Run without the flag to retain the explicit API regression, including flush
+rejection while a consumer reservation is active. These modes use separate output
+paths. CPU request tests also check validation-before-acquire and shutdown rather
+than premature finish on ambiguous generate/finish errors.
