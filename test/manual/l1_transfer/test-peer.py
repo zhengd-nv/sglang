@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Two-node socket control + NVLink READ + real FULL tree target ownership."""
 import argparse
+from array import array
 from dataclasses import replace
 import importlib.util
 import json
@@ -31,7 +32,7 @@ def run(root,rank):
     adapter=SGLangPoolAdapter(pool,engine)
     cache,allocator=make_cache(pool)
     tensors=pool.k_buffer+pool.v_buffer
-    tokens=list(range(115));key=RadixKey(tokens[:112])
+    tokens=list(range(115));key=RadixKey(array('q', tokens[:112]))
     identity=ModelIdentity('synthetic-weight-revision',digest({'mha':8}),digest({'rope':'test'}),
                            'none',digest({'context':'test-peer'}))
     expected=[((torch.arange(112*t[0].numel(),device=t.device).reshape(112,*t.shape[1:])*17+i*31)%2003).to(t.dtype)
