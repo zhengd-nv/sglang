@@ -29,8 +29,12 @@ if [[ "$rank" == 0 ]]; then
         "$pkg/build-native.sh" "$unit/l1_transfer/"*.py "$here/"*.py "$here/run-tests.sh" \
         "$repo/python/sglang/srt/mem_cache/source_lease.py" \
         "$repo/python/sglang/srt/mem_cache/target_reservation.py" > "$run/source-sha256.txt"
-    git -C "$repo" rev-parse HEAD > "$run/sglang-commit.txt"
-    git -C "$repo" diff > "$run/sglang-working.patch"
+    if [[ -f "$repo/.source-commit" ]]; then
+        cp "$repo/.source-commit" "$run/sglang-commit.txt"
+    else
+        git -C "$repo" rev-parse HEAD > "$run/sglang-commit.txt"
+        git -C "$repo" diff > "$run/sglang-working.patch"
+    fi
     bash "$pkg/build-native.sh"
     python3 -m unittest discover -s "$unit/l1_transfer" -v
     python3 "$unit/test_source_lease.py" -v

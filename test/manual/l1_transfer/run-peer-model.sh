@@ -19,7 +19,17 @@ export TORCHINDUCTOR_CACHE_DIR="$XDG_CACHE_HOME/torchinductor"
 export TMPDIR="/tmp/l1peer-${SLURM_JOB_ID:-local}-$$" MAX_JOBS=4
 ln -sr "$run/cache/tmp" "$TMPDIR"
 trap 'rm -f "$TMPDIR"' EXIT
-sha256sum "$repo/python/sglang/srt/mem_cache/l1_transfer/peer/"*.py "$here/test-peer-model.py" "$here/run-peer-model.sh" > "$run/source-sha256.txt"
+sha256sum "$repo/python/sglang/srt/mem_cache/l1_transfer/"*.py \
+    "$repo/python/sglang/srt/mem_cache/l1_transfer/peer/"*.py \
+    "$repo/python/sglang/srt/mem_cache/l1_transfer/transport/"*.* \
+    "$repo/python/sglang/srt/mem_cache/"{source_lease,target_reservation}.py \
+    "$here/test-peer-model.py" "$here/run-peer-model.sh" > "$run/source-sha256.txt"
+if [[ -f "$repo/.source-commit" ]]; then
+    cp "$repo/.source-commit" "$run/sglang-commit.txt"
+else
+    git -C "$repo" rev-parse HEAD > "$run/sglang-commit.txt"
+    git -C "$repo" diff > "$run/sglang-working.patch"
+fi
 # The 0.5.21 image has kernel 0.4.7; PyPI 0.4.9 requires torch 2.14.1.
 # This FlashInfer/Qwen smoke test validates the image's existing kernel at runtime.
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
