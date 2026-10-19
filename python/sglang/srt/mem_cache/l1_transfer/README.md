@@ -6,11 +6,16 @@ backend or its tests; `feat/nvlink-transfer-pd` remains an independent, unchange
 branch. Same-layout FULL/MHA/NHD, TP/PP/DP1 and trusted serial callers are required.
 Normal request admission does not automatically look up remote prefixes.
 
-- `transport/`: CUDA Driver backend, range/region API, planner and pool adapter.
-- `peer/`: control protocol, source/receiver, restore transaction and scheduler RPC.
-- `../source_lease.py`, `../target_reservation.py`: page ownership/lifecycle guards.
-- `test/registered/unit/mem_cache/l1_transfer/`: transport and Peer CPU contracts.
-- `test/manual/l1_transfer/`: GPU transport/safety, real pool/Peer and model tests.
+## Reading guide
+
+- [Implementation](IMPLEMENTATION.md): architecture and code map, complete restore
+  sequence, page ownership, failure handling and ordinary Engine usage.
+- [Testing](TESTING.md): standalone build/test commands, prerequisites, validated
+  results and remaining limitations.
+- The sections below describe native transport execution and license/provenance.
+
+These documents and the linked tests are self-contained within this branch;
+no separate research workspace is needed to understand or exercise the design.
 
 Build from the repository root in a CUDA development environment:
 
@@ -129,70 +134,3 @@ python/sglang/srt/disaggregation/common/utils.py::group_concurrent_contiguous
 at the same reference revision, under Apache-2.0. The new planner uses only
 the Python standard library and adds layout/capacity checks, byte ranges and
 region binding. Copyright contributors to SGLang project.
-
-## Peer ownership contract
-
-The caller supplies a finalized VMM pool, FULL cache, trusted model/context
-identity and a control connection. Source dispatch and receiver operations must
-run serially on the cache owner thread. `prepare(tokens)` returns a private target
-reservation and optional READ transaction. After successful `start()/wait()`, use
-`reservation.indices`; call `finish_consumer()` only when the consumer no longer
-accesses those pages. A full local hit needs no RPC or DMA.
-
-Known limitations: trusted fixed peers only, no authentication/discovery or
-reconnect recovery; contract fields are caller supplied. Unknown transfer or
-publication state requires fail-stop and retaining ownership. Non-page-aligned
-tails require local computation. No cross-layout conversion, fallback, multi-rank
-consensus, full-logit validation or automatic remote prefix lookup yet.
-
-
-## Explicit ordinary Engine prefix restoration
-
-`Engine.l1_peer(action, **payload)` executes on the idle scheduler's cache-owner
-thread. Initialize both Engines with `init(identity=...)`, where `identity` is a
-`ModelIdentity` dictionary covering the actual weights, model/position settings,
-adapter and context. The caller is responsible for truthful matching identities.
-Use trusted peers with identical FULL MHA/NHD layout and a finalized VMM pool,
-TP/PP/DP1, no LoRA/speculation, and `max_running_requests=1`.
-
-1. Generate the source prefix normally so that its full pages enter radix cache.
-2. Source: `address = source.l1_peer("listen")`; run
-   `source.l1_peer("serve")` in its owning process concurrently with step 3.
-   This blocks source scheduling until the one acquire/release exchange finishes.
-3. Target: `target.l1_peer("restore", tokens=prefix_ids, **address)`.
-   Only complete pages are restored. Existing local prefix pages are retained;
-   missing pages are read directly into private HBM, then published/rematched to
-   canonical radix indices. A fully local hit requires neither address nor RPC.
-4. Target: ordinary `generate(input_ids=request_ids, ...)` reuses the published
-   prefix and computes the remaining tail. Keep the restored prefix strictly
-   shorter than the request so the last input position is computed locally.
-5. After generation completes: `target.l1_peer("finish")` releases the consumer
-   pin. `stats` exposes leases, imports, batches, available tokens and page pins.
-
-Do not submit other control/generation requests concurrently on either Engine.
-The control connection transfers descriptors and token/page metadata, not KV bytes.
-Uncertain ownership or completion terminates the scheduler; there is no automatic
-retry/fallback. This is an explicit fixed-peer integration, not automatic remote
-prefix discovery. Cache salts, adapters and other cache-key namespaces are not
-supported by this interface. Do not update weights after peer initialization.
-
-`test/manual/l1_transfer/run-peer-model.sh OUTPUT MODEL` builds the transport and
-runs the combined transport/Peer CPU contracts plus a three-Engine Qwen2-1.5B comparison (source, restored
-target, independent reference). The tested configuration uses BF16, page size 16,
-FlashInfer and post-capture VMM sizing. Four cases cover cold, partial local,
-fully local and repeated cold restoration, generation token equality, observed
-output-token logprob differences, flush protection and pool reclamation. The
-runner contains a compatibility override for the older 0.5.21 test image; this is
-not a claim of compatibility with arbitrary model/runtime configurations.
-
-For component validation on two allocated NVLink-connected nodes with a shared
-output directory, run one task per node:
-
-```bash
-srun --nodes=2 --ntasks-per-node=1 \
-  bash test/manual/l1_transfer/run-tests.sh /shared/unique-output-directory
-```
-
-This covers source/target page protection, real pool/Peer transfers and same-/cross-node
-range transport. Safety tests above additionally exercise ABI 3 resource reuse,
-producer ordering and deterministic native failure cleanup.
