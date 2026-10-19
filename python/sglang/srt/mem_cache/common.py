@@ -378,6 +378,8 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if (release_consumer := getattr(req, '_l1_consumer_release', None)) is not None:
+        release_consumer()
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

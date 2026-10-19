@@ -104,6 +104,21 @@ class PeerReceiver:
         self.pending = None
 
     def prepare(self, tokens):
+        steps = self.prepare_steps(tokens)
+        try:
+            operation, payload = next(steps)
+            try:
+                answer = self.rpc.call(operation, **payload)
+            except BaseException as exc:
+                steps.throw(exc)
+                raise
+            steps.send(answer)
+        except StopIteration as done:
+            return done.value
+        raise RuntimeError('unexpected preparation step')
+
+    def prepare_steps(self, tokens):
+        """Yield network work; every cache/transport operation stays on the owner."""
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.target_reservation import TargetReservation
         if self.pending is not None:
@@ -120,7 +135,7 @@ class PeerReceiver:
             reservation.publish()
             return self.pending  # all-local hit: no RPC/data transfer
         try:
-            offer = self.rpc.call('acquire', tokens=complete, contract=self.contract)
+            offer = yield 'acquire', dict(tokens=complete, contract=self.contract)
         except RemoteRejected:
             reservation.discard(); self.pending = None
             raise
@@ -145,6 +160,8 @@ class PeerReceiver:
         requests = bind_regions(plan, bindings, self.adapter.bindings, Opcode.READ)
         def release():
             answer = self.rpc.call('release', receipt=offer['receipt'], unmapped=True)
+            if answer is None:  # asynchronous release ACK is still pending
+                return False
             if answer.get('released') is not True:
                 raise RuntimeError('source release not confirmed')
         self.pending['transaction'] = RestoreTransaction(self.adapter.engine, requests, imported,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Joint page/region lifetime checks using the real transport API and fault driver."""
 import unittest
+from unittest.mock import Mock
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -184,6 +185,27 @@ class RestoreTests(unittest.TestCase):
         self.owner.release_export(extra_export.lease_id)
         self.owner.release_export(self.descriptor.lease_id)
         self.owner.close(); self.receiver.close()
+
+    def test_poll_does_not_wait_or_repeat_publication(self):
+        self.receiver.wait = Mock(side_effect=AssertionError('blocking wait called'))
+        self.tx.start()
+        self.assertEqual(self.tx.poll(), RestoreState.IN_FLIGHT)
+        self.assertEqual(self.events, [])
+        release = Mock(return_value=False)
+        self.tx._release_source = release
+        self.driver.state = 1
+        self.assertEqual(self.tx.poll(), RestoreState.RELEASING)
+        self.assertEqual(self.events, ['publish'])
+        self.assertEqual(self.tx.unmapped_count, 1)
+        self.assertFalse(self.tx.source_released)
+        self.assertEqual(self.tx.poll(), RestoreState.RELEASING)
+        release.side_effect = self.release
+        self.assertEqual(self.tx.poll(), RestoreState.PUBLISHED)
+        self.assertEqual(self.tx.poll(), RestoreState.PUBLISHED)
+        self.assertEqual(self.events, ['publish', 'release'])
+        self.receiver.wait.assert_not_called()
+
+
 
     def test_plan_contract(self):
         for requests, imports in (([], []), ([replace(self.request, opcode=Opcode.WRITE)], [self.remote]),

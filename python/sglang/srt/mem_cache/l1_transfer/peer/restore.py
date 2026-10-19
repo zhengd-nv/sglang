@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.l1_transfer.transport.api import Opcode, TransferReque
 class RestoreState(str, Enum):
     PREPARED = 'PREPARED'
     IN_FLIGHT = 'IN_FLIGHT'
+    RELEASING = 'RELEASING'
     PUBLISHED = 'PUBLISHED'
     DISCARDED = 'DISCARDED'
     QUARANTINED = 'QUARANTINED'
@@ -101,23 +102,40 @@ class RestoreTransaction:
             else:
                 self._discard()
                 self.discarded = True
-            self._release_source()
-            self.source_released = True
-            self.state = RestoreState.PUBLISHED if success else RestoreState.DISCARDED
+            self.state = RestoreState.RELEASING
+            return self._poll_release()
         except BaseException as exc:
             self._quarantine(exc)
             raise
         return self.state
 
-    def wait(self, timeout=None):
+    def _poll_release(self):
+        try:
+            # False means ACK pending; None preserves the synchronous callback API.
+            if self._release_source() is not False:
+                self.source_released = True
+                self.state = RestoreState.PUBLISHED if self.published else RestoreState.DISCARDED
+        except BaseException as exc:
+            self._quarantine(exc)
+            raise
+        return self.state
+
+    def poll(self):
+        """Observe one device event / release ACK without waiting for either."""
+        return self.wait(_poll=True)
+
+    def wait(self, timeout=None, *, _poll=False):
         self._enter()
         try:
             if self.state in (RestoreState.PUBLISHED, RestoreState.DISCARDED):
                 return self.state  # duplicate completion performs no callbacks
+            if self.state == RestoreState.RELEASING:
+                return self._poll_release()
             if self.state != RestoreState.IN_FLIGHT:
                 raise RuntimeError('restore has not been submitted')
             try:
-                self.status = self.engine.wait(self.batch, timeout)
+                self.status = (self.engine.get_transfer_status(self.batch) if _poll
+                               else self.engine.wait(self.batch, timeout))
             except TimeoutError:
                 raise  # observation only; retry wait, never reclaim
             except BaseException as exc:

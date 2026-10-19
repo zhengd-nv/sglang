@@ -484,15 +484,23 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        # Narrow synchronous convenience API; async/HTTP and scheduler-level
-        # restore admission are deliberately not enabled by this argument.
-        if l1_restore is not None:
+        # Synchronous wrapper remains the default for existing callers.
+        if l1_restore is not None and not (
+            isinstance(l1_restore, dict) and l1_restore.get("mode") == "nonblocking"
+        ):
             arguments = dict(locals())
             arguments.pop("self")
             arguments.pop("l1_restore")
             from sglang.srt.mem_cache.l1_transfer.peer.request import generate_with_restore
 
             return generate_with_restore(self, arguments, l1_restore)
+
+        if l1_restore is not None:
+            from sglang.srt.mem_cache.l1_transfer.peer.request import restore_payload
+            import uuid
+
+            restore_payload(locals(), l1_restore, self.server_args.page_size)
+            rid = rid or uuid.uuid4().hex
 
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
@@ -525,6 +533,7 @@ class Engine(EngineScoreMixin, EngineBase):
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             kv_hints=kv_hints,
+            l1_restore=l1_restore,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -545,8 +554,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
             return generator_wrapper()
         else:
-            ret = self.loop.run_until_complete(generator.__anext__())
-            return ret
+            try:
+                ret = self.loop.run_until_complete(generator.__anext__())
+                if l1_restore is not None:
+                    ret['meta_info']['l1_restore'] = self.l1_peer('request_result', rid=rid)
+                return ret
+            except BaseException:
+                if l1_restore is not None:
+                    self.shutdown()
+                raise
 
     async def async_generate(
         self,

@@ -4,7 +4,9 @@
 
 def restore_payload(arguments, restore, page_size):
     """Validate the narrow demo API before acquiring any remote ownership."""
-    if not isinstance(restore, dict) or set(restore) != {'source', 'prefix_tokens'}:
+    if (not isinstance(restore, dict) or set(restore) not in (
+            {'source', 'prefix_tokens'}, {'source', 'prefix_tokens', 'mode'})
+            or restore.get('mode', 'synchronous') not in ('synchronous', 'nonblocking')):
         raise ValueError('l1_restore requires exactly source and prefix_tokens')
     source = restore['source']
     if (not isinstance(source, dict) or set(source) != {'host', 'port'}
@@ -34,6 +36,9 @@ def restore_payload(arguments, restore, page_size):
                                 or type(sampling.get('n', 1)) is not int
                                 or sampling.get('n', 1) != 1):
         raise ValueError('l1_restore requires one sampling configuration with n=1')
+    if restore.get('mode') == 'nonblocking' and sampling is not None:
+        if any(sampling.get(k) is not None for k in ('json_schema', 'regex', 'ebnf', 'structural_tag')):
+            raise ValueError('nonblocking L1 restore does not support grammar constraints')
     return dict(tokens=list(tokens[:prefix]), **source)
 
 

@@ -378,6 +378,9 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Prototype fixed-source request context; Python Engine only, single request.
+    l1_restore: Optional[Dict] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -442,6 +445,15 @@ class GenerateReqInput:
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        if self.l1_restore is not None:
+            from sglang.srt.mem_cache.l1_transfer.peer.request import restore_payload
+
+            if self.l1_restore.get('mode') != 'nonblocking':
+                raise ValueError('scheduler L1 context requires nonblocking mode')
+            restore_payload(dict(vars(self), prompt=self.text), self.l1_restore, 1)
+            if any(x is not None for x in (self.input_embeds, self.extra_key,
+                                           self.positional_embed_overrides)):
+                raise ValueError('L1 restore requires ordinary unmodified token input')
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -1175,6 +1187,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    l1_restore: Optional[Dict] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

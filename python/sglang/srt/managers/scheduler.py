@@ -1945,6 +1945,12 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            peer = getattr(self, '_l1_peer', None)
+            if peer is not None:
+                peer.pump()
+                if peer.blocks_compute:
+                    time.sleep(0.001)
+                    continue
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -3217,6 +3223,20 @@ class Scheduler(
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+
+        if recv_req.l1_restore is not None:
+            peer = getattr(self, '_l1_peer', None)
+            try:
+                if peer is None:
+                    raise ValueError('initialize L1 peer before request restore')
+                peer.start_request(req, recv_req.l1_restore)
+            except Exception as exc:
+                if peer is not None and peer.request is req:
+                    logger.exception('L1 request preparation failed after admission')
+                    os._exit(70)
+                req.set_finish_with_abort(str(exc))
+                self._add_request_to_queue(req)
+            return
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -5194,6 +5214,9 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
+        peer = getattr(self, '_l1_peer', None)
+        if peer is not None and (peer.source.active or peer.request is not None):
+            return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -5493,6 +5516,12 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
+        peer = getattr(self, '_l1_peer', None)
+        if peer is not None and peer.request is not None and (
+            recv_req.abort_all or peer.request.rid.startswith(recv_req.rid)
+        ):
+            logger.error('L1 shared request cancellation is unsupported; stopping scheduler')
+            os._exit(70)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

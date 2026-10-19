@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import socket
+from queue import Empty
 
 import torch
 
-from .control import ModelIdentity, SocketRPC, serve_once
+from .control import ModelIdentity, SocketRPC, serve_once, RemoteRejected
+from .nonblocking import AsyncRPC, SourceService
 from .peer import PeerReceiver, SourceEndpoint
 from .restore import RestoreState
 from ..transport import NvlinkEngine
@@ -32,10 +34,14 @@ class SchedulerPeer:
         self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
         self.receiver = None
         self.listener = None
+        self.service = None
+        self.request = None
+        self.phase = None
+        self.completed = None
 
     def stats(self):
         allocator = self.cache.token_to_kv_pool_allocator
-        return dict(source_leases=len(self.source.active), target_active=self.receiver is not None,
+        return dict(wait_state=getattr(self, "phase", None), source_leases=len(self.source.active), target_active=self.receiver is not None,
                     exports=len(self.engine._exports), imports=sum(m.public.remote for m in self.engine._memories.values()),
                     batches=len(self.engine._batches), available_tokens=allocator.available_size(),
                     pinned_pages=sum(getattr(allocator, '_l1_pinned_pages', {}).values()))
@@ -120,10 +126,138 @@ class SchedulerPeer:
         return self.stats()
 
 
+    @property
+    def blocks_compute(self):
+        return bool(self.source.active) or self.phase in ('WAIT_ACQUIRE', 'WAIT_TRANSFER', 'WAIT_RELEASE')
+
+    def start_service(self, host='127.0.0.1', port=0):
+        if not self.scheduler.server_args.disable_overlap_schedule:
+            raise ValueError('nonblocking peer requires disable_overlap_schedule')
+        address = self.listen(host, port)
+        self.service = SourceService(self.listener)
+        return address
+
+    def start_request(self, req, options):
+        from .request import restore_payload
+        if not self.scheduler.server_args.disable_overlap_schedule:
+            raise ValueError('nonblocking peer requires disable_overlap_schedule')
+        if self.receiver is not None or self.source.active or not self.scheduler.is_fully_idle():
+            raise ValueError('nonblocking peer requires one request on an idle Engine')
+        payload = restore_payload(dict(input_ids=list(req.origin_input_ids)), options,
+                                  self.scheduler.server_args.page_size)
+        self.rpc = AsyncRPC(payload['host'], payload['port'])
+        self.receiver = PeerReceiver(self.cache, self.adapter, self.identity, self.rpc)
+        self.request = req
+        self.completed = None
+        self.phase = 'WAIT_ACQUIRE'
+        self.poll_counts = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
+        self.steps = self.receiver.prepare_steps(payload['tokens'])
+        try:
+            operation, data = next(self.steps)
+        except StopIteration as done:
+            self._prepared(done.value)
+        else:
+            self.acquire_future = self.rpc.submit(operation, data)
+
+    def _prepared(self, session):
+        self.session = session
+        tx = session['transaction']
+        if tx is None:
+            self._ready()
+        else:
+            tx.start()
+            self.phase = 'WAIT_TRANSFER'
+
+    def _ready(self):
+        reservation, tx = self.session['reservation'], self.session['transaction']
+        self.restored = dict(restored_tokens=len(reservation.indices), local_tokens=reservation.prefix_len,
+                             transferred_bytes=sum(r.length for r in tx.requests) if tx else 0,
+                             wait_polls=dict(self.poll_counts), **self.stats())
+        self.rpc.close()
+        self.phase = 'READY'
+        self.request._l1_consumer_release = self.finish_request
+        self.scheduler._add_request_to_queue(self.request)
+
+    def finish_request(self):
+        # Called before ordinary request KV/page cleanup on the same owner thread.
+        if not self.request.finished():
+            raise RuntimeError('L1 consumer retraction is unsupported; stop Engine')
+        rid = self.request.rid
+        released = self.finish()
+        self.completed = (rid, dict(self.restored, consumer_released=(
+            not released['target_active'] and released['pinned_pages'] == 0)))
+        self.request._l1_consumer_release = None
+        self.request = None
+        self.phase = None
+
+    def request_result(self, rid):
+        if self.completed is None or self.completed[0] != rid:
+            raise RuntimeError('no completed L1 consumer for request')
+        return self.completed[1]
+
+    def pump(self):
+        try:
+            self._pump()
+        except BaseException:
+            logger.exception('L1_PEER ownership uncertain; stopping scheduler')
+            os._exit(70)
+
+    def _pump(self):
+        if self.service is not None:
+            # Bound each turn; network threads never touch cache or CUDA.
+            for _ in range(4):
+                try:
+                    kind, data, future = self.service.events.get_nowait()
+                except Empty:
+                    break
+                if kind != 'request':
+                    if self.source.active:
+                        raise RuntimeError('source connection ended with outstanding lease')
+                    continue
+                try:
+                    if data.get('operation') == 'acquire' and (
+                            self.source.active or self.receiver is not None or not self.scheduler.is_fully_idle()):
+                        raise RemoteRejected('source Engine is busy')
+                    answer = self.source.dispatch(data)
+                except RemoteRejected as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(answer)
+        if self.request is not None and self.phase in self.poll_counts:
+            self.poll_counts[self.phase] += 1
+        if self.phase == 'WAIT_ACQUIRE' and self.acquire_future.done():
+            try:
+                answer = self.acquire_future.result()
+            except RemoteRejected as exc:
+                try:
+                    self.steps.throw(exc)
+                except RemoteRejected:
+                    pass
+                self.rpc.close()
+                self.receiver = None
+                req = self.request
+                self.request = None
+                self.phase = None
+                req.set_finish_with_abort(str(exc))
+                self.scheduler._add_request_to_queue(req)
+                return
+            try:
+                self.steps.send(answer)
+            except StopIteration as done:
+                self._prepared(done.value)
+        if self.phase in ('WAIT_TRANSFER', 'WAIT_RELEASE'):
+            state = self.session['transaction'].poll()
+            if state == RestoreState.PUBLISHED:
+                self._ready()
+            elif state == RestoreState.RELEASING:
+                self.phase = 'WAIT_RELEASE'
+            elif state != RestoreState.IN_FLIGHT:
+                raise RuntimeError(f'restore did not publish: {state}')
+
+
 def scheduler_peer_rpc(scheduler, action, payload):
-    # Requests are intentionally explicit and serialized; callers must finish
-    # generate() before issuing a control operation on the same Engine.
-    if not scheduler.is_fully_idle():
+    # Observations remain available while the scheduler progresses a restore.
+    if action not in ('stats', 'request_result') and not scheduler.is_fully_idle():
         raise RuntimeError('Peer control requires an idle Engine')
     options = json.loads(payload)
     if action == 'init':
@@ -132,7 +266,10 @@ def scheduler_peer_rpc(scheduler, action, payload):
         scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'])
         result = scheduler._l1_peer.stats()
     else:
-        if action not in ('listen', 'serve', 'restore', 'finish', 'stats'):
+        if action not in ('listen', 'serve', 'restore', 'finish', 'stats', 'start_service', 'request_result'):
             raise ValueError('unknown Peer action')
-        result = getattr(scheduler._l1_peer, action)(**options)
+        peer = scheduler._l1_peer
+        if action in ('serve', 'restore', 'finish') and (peer.service is not None or peer.request is not None):
+            raise RuntimeError('cannot mix explicit ownership operations with nonblocking service/request')
+        result = getattr(peer, action)(**options)
     return json.dumps(result)
