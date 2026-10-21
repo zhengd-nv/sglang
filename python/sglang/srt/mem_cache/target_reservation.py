@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixPara
 
 
 class TargetReservation:
-    def __init__(self, cache, key, *, required_capacity=None):
+    def __init__(self, cache, key, *, required_capacity=None, headroom=0):
         self.cache = cache
         self.manager = cache.source_leases
         self.allocator, self.pool = self.manager.validate_cache()
@@ -23,6 +23,7 @@ class TargetReservation:
         self._pins = ()
         self._lock = None
         match = cache.match_prefix(MatchPrefixParams(key=self.key))
+        self._match = match
         self._lock = cache.lock(match.last_device_node)
         try:
             prefix = cache.path_device_indices(match.last_device_node).clone()
@@ -37,7 +38,9 @@ class TargetReservation:
                 if (type(required_capacity) is not int or required_capacity < len(key)
                         or required_capacity % page or required_capacity > self.allocator.size):
                     raise ValueError('invalid serialized request capacity')
-                needed = required_capacity - self.prefix_len
+                if type(headroom) is not int or headroom < 0:
+                    raise ValueError("invalid concurrent headroom")
+                needed = required_capacity - self.prefix_len + headroom
                 shortfall = needed - self.allocator.available_size()
                 if shortfall > 0:
                     cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
@@ -107,8 +110,40 @@ class TargetReservation:
             self.state = 'QUARANTINED'
             raise  # never free private after a possibly partial insert
 
+    def ready_private(self):
+        """Copy is drained; keep pages private until normal request allocation."""
+        self._check(('PRIVATE', 'READY_PRIVATE'))
+        self.state = 'READY_PRIVATE'
+
+    def request_match(self, max_prefix_len):
+        self._check(('READY_PRIVATE',))
+        if max_prefix_len is not None and max_prefix_len < len(self.indices):
+            raise ValueError('request cannot consume the entire restored prefix')
+        return self._match._replace(device_prefix_len=len(self.indices),
+                                    cache_protected_len=self.prefix_len)
+
+    def adopt(self, req):
+        """The normal KV row now owns the private suffix, with its own tree lock.
+
+        Called after writing the row, before any forward/checkpoint. The request
+        releases/deduplicates these pages via the ordinary cache lifecycle.
+        """
+        self._check(('READY_PRIVATE',))
+        if not req.kv.holds_kv or req.lock is None or req.prefix_len != len(self.indices):
+            raise RuntimeError('private prefix has no admitted request owner')
+        self._unpin()
+        self.cache.unlock(self._lock)
+        self._drop_guard()
+        self.state = 'ADOPTED'
+        req._l1_private_reservation = None
+
+    def _drop_guard(self):
+        self.manager._targets.remove(self)
+        self.pool._l1_transfer_lease_count -= 1
+        self.allocator._l1_target_count -= 1
+
     def discard(self):
-        self._check(('PRIVATE', 'DISCARDED'))
+        self._check(('PRIVATE', 'READY_PRIVATE', 'DISCARDED'))
         if self.state == 'DISCARDED':
             return
         try:
@@ -127,8 +162,6 @@ class TargetReservation:
             return
         self._unpin()
         self.cache.unlock(self._lock)
-        self.manager._targets.remove(self)
-        self.pool._l1_transfer_lease_count -= 1
-        self.allocator._l1_target_count -= 1
+        self._drop_guard()
         if self.state == 'PUBLISHED':
             self.state = 'RELEASED'

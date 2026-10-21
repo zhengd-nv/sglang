@@ -243,3 +243,46 @@ lost ACK, reservation rollback and GPU synchronization before consumer release.
 Actual hardware faults are not injected: uncertain ownership remains fail-stop.
 This validates the TP1 serialized policy, not a concurrent quota scheduler,
 private-prefix adoption, TP collectives or compute/transfer overlap.
+
+## Concurrent target validation
+
+Run `test/manual/l1_transfer/run-peer-model.sh OUTPUT MODEL --concurrent --deterministic --lifecycle`.
+The target uses max_running_requests=4 and private-prefix adoption; source and
+reference remain TP1 serial Engines. In addition to the original four prefix
+cases and five cancellation/failure cases, this checks distinct ordinary traffic,
+a competing local publication, capacity waiting under long generations, a
+chunked shared prompt, and acquire/running cancellation while ordinary requests
+continue. The deterministic flag uses FA4 attention and batch-invariant
+operations for exact token comparisons across cache hits and batch shapes. An
+independent fourth Engine probes FlashInfer cold/warm numerics without any L1
+initialization. The original serial regressions still use FlashInfer. Every generated token is compared with an independent
+reference and every case ends with lease/pin/import/batch cleanup and full-pool
+recovery. Acquire/release replies are deliberately delayed by 250 ms; do not
+report these elapsed times as production latency or throughput.
+
+The pure CPU capacity tests exercise full-output rounding, same-batch accounting,
+allocated-page credits, retraction entitlement, waiting-request fairness, target
+stream dependencies, and safe rejection without replacing active ownership.
+CUDA reservation tests exercise private handoff, competing publication/cancel,
+and headroom held for existing consumers. Run all old modes as regressions.
+
+
+Validation: 106 CPU tests and 17 CUDA source/target tests passed. Deterministic
+FA4 (page128, restore256, full prefill graph128) passed all six concurrent cases:
+7,224 compared tokens and their output-token logprobs matched exactly, with busy
+memory conservation enabled. The four basic private-prefix cases added 96 equal
+tokens. Five cancellation/failure cases passed. All three original FlashInfer
+page16 modes passed their four-case/288-token regression, with maximum output
+logprob delta 0.0023036450147628784; serial lifecycle cases also passed.
+
+The independent no-L1 FlashInfer cold/warm test reproduced the first token
+mismatch at index 25 (cached_tokens 0 versus 112). Consequently long cross-cache,
+cross-batch exact-token comparisons use deterministic FA4, not relaxed tolerances.
+Triton deterministic mode was rejected by the full-prefill CUDA graph EXTEND
+path and is not part of the accepted configuration. FA4 requires page128 here.
+
+After the model run, two entry guards reject beam expansion and non-generation
+Engines before ownership. Their two new tests plus the nine capacity tests passed
+in a CPU-only isolated import (torch synchronization stub; no tensor work).
+These guards do not change the admitted, tested model path. This validation does
+not establish production latency, throughput, or physical copy/compute overlap.

@@ -1965,12 +1965,18 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if peer is not None:
+                    peer.note_forward(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
+                if peer is not None and peer.request is not None:
+                    # No forward to hide network/device waits: yield the GIL
+                    # and avoid a tight spin while the async RPC worker runs.
+                    time.sleep(peer.poll_interval)
 
             # Update last_batch
             self.last_batch = batch
@@ -3234,10 +3240,21 @@ class Scheduler(
                 if peer is not None and peer.request is req:
                     logger.exception('L1 request preparation failed after admission')
                     os._exit(70)
-                req.set_finish_with_abort(str(exc))
-                self._add_request_to_queue(req)
+                if peer is not None:
+                    peer.reject_request(req, str(exc))
+                else:
+                    req.set_finish_with_abort(str(exc))
+                    self._add_request_to_queue(req)
             return
 
+        peer = getattr(self, '_l1_peer', None)
+        if peer is not None and peer.concurrent:
+            try:
+                if peer.capacity.bound(req) > self.token_to_kv_pool_allocator.size:
+                    raise ValueError('CAPACITY_EXCEEDED: prompt + maximum output exceeds pool')
+            except ValueError as exc:
+                self.finish_l1_waiting_request(req, str(exc))
+                return
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -4200,6 +4217,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
+            if peer is not None and adder.can_run_list and req is adder.can_run_list[-1]:
+                peer.note_admitted(req)
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 

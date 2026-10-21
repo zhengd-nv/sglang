@@ -359,6 +359,9 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
     if req.kv.holds_kv:
         row = batch.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
         return row[: req.prefix_len].to(torch.int64)
+    private = getattr(req, "_l1_private_reservation", None)
+    if private is not None:
+        return private.indices
     if req.prefix_len == 0:
         return _EMPTY_PREFIX
     return batch.tree_cache.prefix_device_indices(req)
@@ -477,6 +480,8 @@ def alloc_for_extend(
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
         batch.tree_cache.maybe_hand_to_session(req)
+        if (private := getattr(req, "_l1_private_reservation", None)) is not None:
+            private.adopt(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 

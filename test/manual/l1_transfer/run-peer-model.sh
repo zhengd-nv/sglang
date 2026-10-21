@@ -46,4 +46,8 @@ python -m unittest discover -s "$repo/test/registered/unit/mem_cache/l1_transfer
 hostname
 nvidia-smi --query-gpu=index,uuid,driver_version --format=csv
 bash "$repo/python/sglang/srt/mem_cache/l1_transfer/build-native.sh"
+if [[ " $* " == *" --concurrent "* ]]; then
+    python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_source_lease.py' -v
+    python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_target_reservation.py' -v
+fi
 python "$here/test-peer-model.py" --model "$model" --output "$run" "$@"

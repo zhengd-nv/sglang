@@ -630,11 +630,20 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        l1_restore: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
+        if l1_restore is not None:
+            from sglang.srt.mem_cache.l1_transfer.peer.request import restore_payload
+            if not isinstance(l1_restore, dict) or l1_restore.get('mode') != 'nonblocking':
+                raise ValueError('async_generate requires nonblocking l1_restore')
+            restore_payload(locals(), l1_restore, self.server_args.page_size)
+            if rid is None:
+                from uuid import uuid4
+                rid = uuid4().hex
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
         )
@@ -671,13 +680,29 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            l1_restore=l1_restore,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:
             return generator
         else:
-            return await generator.__anext__()
+            try:
+                result = await generator.__anext__()
+                if l1_restore is not None:
+                    result['meta_info']['l1_restore'] = self.l1_peer('request_result', rid=rid)
+                return result
+            except BaseException:
+                if l1_restore is not None:
+                    safe = False
+                    try:
+                        terminal = self.l1_peer('request_result', rid=rid)
+                        safe = terminal.get('consumer_released') is True and terminal.get('state') in ('FAILED', 'CANCELLED')
+                    except Exception:
+                        pass
+                    if not safe:
+                        self.shutdown()
+                raise
 
     def encode(
         self,

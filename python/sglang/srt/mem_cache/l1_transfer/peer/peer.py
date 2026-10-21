@@ -140,7 +140,7 @@ class PeerReceiver:
             return done.value
         raise RuntimeError('unexpected preparation step')
 
-    def prepare_steps(self, tokens, *, required_capacity=None):
+    def prepare_steps(self, tokens, *, required_capacity=None, headroom=0, private=False):
         """Yield network work; every cache/transport operation stays on the owner."""
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.target_reservation import TargetReservation
@@ -153,11 +153,12 @@ class PeerReceiver:
         if not complete:
             raise ValueError('no complete prefix page')
         reservation = TargetReservation(self.cache, RadixKey(array('q', complete)),
-                                        **({'required_capacity': required_capacity}
+                                        **({'required_capacity': required_capacity, 'headroom': headroom}
                                            if required_capacity is not None else {}))
         self.pending = {'reservation':reservation, 'imports':[], 'offer':None, 'transaction':None}
+        publish = reservation.ready_private if private else reservation.publish
         if reservation.prefix_len == len(complete):
-            reservation.publish()
+            publish()
             return self.pending  # all-local hit: no RPC/data transfer
         try:
             offer = yield 'acquire', dict(tokens=complete, contract=self.contract)
@@ -193,7 +194,7 @@ class PeerReceiver:
             if answer.get('released') is not True:
                 raise RuntimeError('source release not confirmed')
         self.pending['transaction'] = RestoreTransaction(self.adapter.engine, requests, imported,
-            publish=reservation.publish, discard=reservation.discard, release_source=release,
+            publish=publish, discard=reservation.discard, release_source=release,
             keepalive=(reservation, self.adapter, offer))
         return self.pending
 
@@ -204,6 +205,11 @@ class PeerReceiver:
         if tx is not None and not tx.source_released:
             raise RuntimeError('source not released; fail-stop or finish transfer first')
         reservation = self.pending['reservation']
+        if reservation.state == 'READY_PRIVATE':
+            reservation.discard()  # cancelled before normal request allocation
+        if reservation.state == 'ADOPTED':
+            self.pending = None  # normal request lifecycle owns every page
+            return
         if reservation.state not in ('PUBLISHED', 'DISCARDED', 'RELEASED'):
             raise RuntimeError('target not safely finished')
         reservation.release()

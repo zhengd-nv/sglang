@@ -322,3 +322,49 @@ wall time, thread CPU time, request-to-READY intervals and transfer geometry.
 Spans are inclusive and may nest or overlap. This mode adds observer overhead;
 use separate uninstrumented runs for performance claims. No CUDA sync is added
 by the recorder. Only clocks on the same host may be correlated directly.
+
+## Opt-in concurrent target
+
+`init(identity=..., concurrent=True)` permits TP1 normal scheduling with more
+than one running request. It still accepts only one shared request at a time,
+through consumption; the source retains its idle, serial lease service. Explicit
+restore/finish is disabled on a concurrent target. Priority preemption, overlap
+scheduler, speculation, LoRA and non-FULL/NHD pools remain excluded.
+
+The target keeps restored pages private through copy drain and source release
+ACK. A pending request uses the reservation's prefix indices; its protected
+length is only the original local cache prefix. After normal allocation writes
+the complete request row, the reservation drops its pins and extra tree lock.
+The request now owns the private suffix and the framework's ordinary checkpoint
+performs insertion, duplicate-page reclamation and row rebinding. Queue cancellation
+before adoption discards the reservation instead. No private page is published
+merely to make it schedulable.
+
+`RequestCapacity` charges page-rounded prompt + maximum output for every admitted
+request. Physical allocation already reduces available+evictable space, so the
+ledger tracks remaining growth. New cache hits are conservatively charged as
+full prompts. While a restore waits for capacity, existing consumers progress but
+new ordinary admissions wait; after reserve, ordinary admissions preserve its
+unallocated tail. This is a conservative full-output policy, not predictive
+oversubscription. A single request exceeding the whole pool is rejected.
+
+The transfer stream waits on an event recorded on the schedule stream to order
+reuse of destination pages. Successful drained completion precedes private
+handoff. Subsequent ordinary forwards use other pages and may progress during
+acquire/transfer/release waits. Consumer cleanup does not device-synchronize an
+unrelated stream: after adoption, normal request cleanup owns the row. Remote
+producer readiness still uses the source's existing idle/synchronize protocol.
+The `overlap_forwards` counters show scheduling progress, not proof of physical
+DMA/compute overlap. CUDA profiling is required for that claim.
+
+`async_generate(..., l1_restore={..., 'mode': 'nonblocking'})` supports concurrent
+ordinary callers on one event loop. Safe terminal failure leaves the Engine
+usable; unknown ownership retains fail-stop. Client task cancellation before a
+safe terminal result can still stop the Engine: use request abort and wait for
+its terminal cleanup when other clients must remain served. Completed metadata
+is bounded to the latest 128 request IDs; result retrieval should be prompt.
+
+The transaction's legacy `PUBLISHED` enum means its successful target callback
+and source release ACK completed. In concurrent mode that callback is
+`ready_private`, not a radix insertion; reservation state remains `READY_PRIVATE`
+until normal request allocation changes it to `ADOPTED`.

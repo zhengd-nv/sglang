@@ -212,13 +212,17 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
-            cow_mamba=cow_mamba,
-            req=req,
+    private = getattr(req, '_l1_private_reservation', None)
+    if private is not None:
+        match_result = private.request_match(max_prefix_len)
+    else:
+        match_result = tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
+                cow_mamba=cow_mamba,
+                req=req,
+            )
         )
-    )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key

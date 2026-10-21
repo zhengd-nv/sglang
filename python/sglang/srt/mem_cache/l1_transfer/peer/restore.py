@@ -74,7 +74,7 @@ class RestoreTransaction:
         self.error = str(exc)
         self.state = RestoreState.QUARANTINED
 
-    def start(self):
+    def start(self, *, producer_stream=None):
         self._enter()
         try:
             if self.state != RestoreState.PREPARED:
@@ -82,7 +82,8 @@ class RestoreTransaction:
             # An exception may occur after partial native submission. Even a
             # validation exception is conservatively fail-stop with this API.
             try:
-                self.batch = self.engine.submit_transfer(self.requests)
+                self.batch = self.engine.submit_transfer(self.requests,
+                    **({"producer_stream": producer_stream} if producer_stream is not None else {}))
                 self.state = RestoreState.IN_FLIGHT
             except BaseException as exc:
                 self._quarantine(exc)

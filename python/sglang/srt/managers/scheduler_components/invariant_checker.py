@@ -95,6 +95,10 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        leases = getattr(self.tree_cache, 'source_leases', None)
+        if leases is not None:
+            uncached += sum(len(r.private) for r in leases._targets
+                            if r.state in ('PRIVATE', 'READY_PRIVATE'))
         allocator = self.token_to_kv_pool_allocator
         if self.is_hybrid_swa and not ps.full_capacity:
             return False, ""

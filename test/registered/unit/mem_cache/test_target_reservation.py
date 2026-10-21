@@ -23,7 +23,7 @@ class TargetTests(unittest.TestCase):
 
     def tearDown(self):
         for r in list(self.cache.source_leases._targets):
-            if r.state == 'PRIVATE': r.discard()
+            if r.state in ('PRIVATE', 'READY_PRIVATE'): r.discard()
             else: r.release()
         self.cache.reset(); self.pool._clear_buffers()
 
@@ -127,6 +127,49 @@ class TargetTests(unittest.TestCase):
         r.discard()
         self.cache.evict(EvictParams(num_tokens=64))
         self.assertEqual(self.allocator.available_size(), 64)
+
+    def test_private_handoff_does_not_publish_and_request_owns_suffix(self):
+        prefix = self.seed(8)
+        r = TargetReservation(self.cache, self.key)
+        r.ready_private()
+        match = r.request_match(16)
+        self.assertEqual(match.device_prefix_len, 16)
+        self.assertEqual(match.cache_protected_len, 8)
+        self.assertEqual(len(self.cache.path_device_indices(match.last_device_node)), 8)
+        req = SimpleNamespace(kv=SimpleNamespace(holds_kv=True), prefix_len=16,
+                              lock=self.cache.lock(match.last_device_node),
+                              _l1_private_reservation=r)
+        r.adopt(req)
+        self.assertEqual(r.state, 'ADOPTED')
+        self.assertFalse(self.cache.source_leases.busy)
+        self.assertFalse(self.allocator._l1_pinned_pages)
+        self.assertIsNone(req._l1_private_reservation)
+        # Normal request cancellation owns this free, not reservation.release.
+        self.allocator.free(r.private)
+        self.cache.unlock(req.lock)
+        self.cache.evict(EvictParams(num_tokens=64))
+        self.assertEqual(self.allocator.available_size(), 64)
+
+    def test_private_ready_cancel_and_competing_prefix_do_not_publish(self):
+        r = TargetReservation(self.cache, self.key)
+        r.ready_private()
+        competing = self.seed(16)
+        self.assertFalse(torch.equal(competing, r.indices))
+        with self.assertRaises(ValueError): r.request_match(15)
+        r.discard(); r.discard()
+        self.assertEqual(self.allocator.available_size(), 48)
+        self.cache.evict(EvictParams(num_tokens=64))
+        self.assertEqual(self.allocator.available_size(), 64)
+        self.allocator._debug_check_no_duplicate_pages()
+
+    def test_concurrent_headroom_is_not_spent_on_restore(self):
+        with self.assertRaises(MemoryError):
+            TargetReservation(self.cache, self.key, required_capacity=32, headroom=48)
+        self.assertFalse(self.cache.source_leases.busy)
+        self.assertEqual(self.allocator.available_size(), 64)
+        r = TargetReservation(self.cache, self.key, required_capacity=32, headroom=32)
+        self.assertEqual(self.allocator.available_size(), 48)
+        r.discard()
 
 
 if __name__ == '__main__': unittest.main()
