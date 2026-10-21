@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import socket
+import math
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
 import torch
@@ -38,6 +40,13 @@ class SchedulerPeer:
         self.request = None
         self.phase = None
         self.completed = None
+        self.poll_interval = float(os.environ.get('SGLANG_L1_POLL_INTERVAL', '0.001'))
+        if not math.isfinite(self.poll_interval) or not 0 <= self.poll_interval <= 0.1:
+            raise ValueError('SGLANG_L1_POLL_INTERVAL must be finite and in [0, 0.1] seconds')
+        # One worker per Engine; connections and receipts remain per transaction.
+        self.rpc_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='l1-rpc')
+        from .timing import install
+        install(self)
 
     def stats(self):
         allocator = self.cache.token_to_kv_pool_allocator
@@ -145,7 +154,7 @@ class SchedulerPeer:
             raise ValueError('nonblocking peer requires one request on an idle Engine')
         payload = restore_payload(dict(input_ids=list(req.origin_input_ids)), options,
                                   self.scheduler.server_args.page_size)
-        self.rpc = AsyncRPC(payload['host'], payload['port'])
+        self.rpc = AsyncRPC(payload['host'], payload['port'], executor=self.rpc_executor)
         self.receiver = PeerReceiver(self.cache, self.adapter, self.identity, self.rpc)
         self.request = req
         self.completed = None

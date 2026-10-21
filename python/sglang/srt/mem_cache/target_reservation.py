@@ -33,8 +33,8 @@ class TargetReservation:
             if self.private is None:
                 raise MemoryError('insufficient private target pages')
             self.indices = torch.cat((prefix, self.private))
-            self.pages = tuple(int(x) for x in (self.private[::page] // page).tolist())
             self._set_pins(self.indices)
+            self.pages = self._pins[self.prefix_len // page:]
         except BaseException:
             # Allocation succeeded only if private is a tensor; no insert yet.
             if getattr(self, 'private', None) is not None:
@@ -68,6 +68,11 @@ class TargetReservation:
         if self.state == 'PUBLISHED':
             return self.indices
         try:
+            if self.prefix_len == len(self.key):
+                # The entire canonical path is already locked and pinned.
+                # No private pages exist to insert or reconcile.
+                self.state = 'PUBLISHED'
+                return self.indices
             # insert frees duplicate private slices itself. Keep the matched
             # path locked and pool reset guarded, but permit these exact frees.
             self._unpin()

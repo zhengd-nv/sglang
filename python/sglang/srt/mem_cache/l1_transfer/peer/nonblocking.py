@@ -9,9 +9,10 @@ from .control import SocketRPC, serve_once
 
 
 class AsyncRPC:
-    def __init__(self, host, port):
+    def __init__(self, host, port, *, executor=None):
         self.address = (host, port)
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='l1-rpc')
+        self.owns_executor = executor is None
+        self.executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix='l1-rpc')
         self.connection = None
         self.rpc = None
         self.release_future = None
@@ -39,7 +40,8 @@ class AsyncRPC:
         # Only after an acknowledged release or safe acquire rejection.
         if self.connection is not None:
             self.connection.close()
-        self.executor.shutdown(wait=False)
+        if self.owns_executor:
+            self.executor.shutdown(wait=False)
 
 
 class SourceService:

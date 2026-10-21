@@ -87,8 +87,8 @@ sequenceDiagram
 4. **Offer and copy.** The source exports the adapter's memory regions and returns
    buffer bindings, source page IDs and a receipt containing request ID, source
    incarnation, cache epoch, lease ID and contract/token fingerprint. The receiver
-   validates these, imports the regions, and plans READs only for the missing
-   suffix. Layout, dtype, page size and capacities must match. The planner combines
+   validates these, plans READs for the missing suffix, and imports only the
+   referenced regions. Layout, dtype, page size and capacities must match. The planner combines
    ranges only where source and destination are both contiguous, and splits at
    region boundaries. No KV bytes travel over the control socket.
 5. **Publish.** Successful completion must report the expected byte count. The
@@ -276,3 +276,31 @@ its listener lives with the Engine. Do not mix explicit ownership operations
 with an active nonblocking request/service. Only the synchronous Python Engine
 entry is covered by the model harness; HTTP/async/multi-rank integrations are not
 validated. Router metadata delivery remains separate follow-up work.
+
+## Request overhead and selective imports
+
+The receiver now validates and binds the READ plan against descriptor-only views
+before importing memory. Only regions referenced by that plan are imported.
+Every placeholder is replaced with the actual imported handle before submission;
+the normal engine's live-handle, range, alias and permission checks still run.
+Imports already completed remain in `pending` if a subsequent import fails.
+Unused source exports stay leased until the same exact release receipt is ACKed.
+There is no persistent mapping cache, early READY, or weaker unmap attestation.
+
+Target reservation derives private page IDs from the already-read pin snapshot.
+A full local hit keeps the existing canonical path lock and pins without another
+insert/match/readback. Partial publication retains canonical reconciliation.
+Network executors are reused per Engine, but connections, Futures and receipts
+remain per transaction. The worker exists only after the first remote request.
+
+`SGLANG_L1_POLL_INTERVAL` controls scheduler waiting in seconds (default 0.001,
+finite range [0, 0.1]); zero yields with `sleep(0)`. If idle sleeping is enabled,
+a running source service bypasses the unrelated ZMQ-only idle wait and uses the
+same bounded interval. This is a polling fallback, not a Queue/ZMQ event bridge.
+The ordinary-forward pause and producer/consumer synchronization remain intact.
+
+`SGLANG_L1_TRACE_DIR` enables diagnostic JSONL spans per scheduler PID. It records
+wall time, thread CPU time, request-to-READY intervals and transfer geometry.
+Spans are inclusive and may nest or overlap. This mode adds observer overhead;
+use separate uninstrumented runs for performance claims. No CUDA sync is added
+by the recorder. Only clocks on the same host may be correlated directly.

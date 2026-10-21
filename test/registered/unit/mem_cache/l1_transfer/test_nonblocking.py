@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import socket
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,6 +11,24 @@ from sglang.srt.mem_cache.l1_transfer.peer.restore import RestoreState
 
 
 class NonblockingTests(unittest.TestCase):
+    def test_shared_worker_survives_transaction_close(self):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first = AsyncRPC('localhost', 1, executor=executor)
+            second = AsyncRPC('localhost', 1, executor=executor)
+            first.close()
+            self.assertEqual(second.executor.submit(lambda: 42).result(timeout=2), 42)
+            second.close()
+
+    def test_idle_service_does_not_enter_unrelated_zmq_wait(self):
+        from unittest.mock import patch
+        from sglang.srt.managers.scheduler import Scheduler
+        scheduler = SimpleNamespace(_l1_peer=SimpleNamespace(service=object(), poll_interval=0.0001),
+                                    idle_sleeper=Mock())
+        with patch('sglang.srt.managers.scheduler.time.sleep') as sleep:
+            Scheduler.maybe_sleep_on_idle(scheduler)
+        sleep.assert_called_once_with(0.0001)
+        scheduler.idle_sleeper.maybe_sleep.assert_not_called()
+
     def peer(self):
         peer = object.__new__(SchedulerPeer)
         peer.service = None

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real Python tree + paged allocator + VMM pool lifecycle tests (CUDA)."""
 import unittest
+from array import array
 from dataclasses import replace
 import torch
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -29,7 +30,7 @@ class SourceLeaseTests(unittest.TestCase):
         self.pool._finalize_backing_tokens(64)
         self.cache, self.allocator = make_cache(self.pool)
         self.indices = self.allocator.alloc(16)
-        self.key = RadixKey(list(range(16)))
+        self.key = RadixKey(array('q', range(16)))
         self.cache.insert(InsertParams(key=self.key, value=self.indices))
 
     def acquire(self, key=None, ready=None):

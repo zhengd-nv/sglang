@@ -198,3 +198,29 @@ modes released consumer pins automatically; all modes recovered 4096 pool
 tokens after flush. Delayed replies exposed both target RPC waits and a live
 source lease while control queries continued returning. This demonstrates
 progress, not a control-latency SLA or forward/transfer overlap.
+
+## Selective-import and overhead changes (2026-10-21)
+
+The CPU suite now has 76 cases, including descriptor-only region selection,
+reads crossing region boundaries, destination alias rejection, invalid unused
+binding indices, worker reuse across transaction close, and the source-service
+idle-sleep guard. All passed. The 12 CUDA source/target lifecycle tests also
+passed; their RadixKey fixtures now use the production `array('q')` representation.
+The full-hit test asserts that publication does not insert again; competing
+partial/full canonical insertions retain their existing byte and reclaim checks.
+
+The final implementation passed explicit, synchronous request and nonblocking
+model regressions on one GB200 node with Qwen2-1.5B BF16, TP1, page16 and pool4096.
+All three modes passed four cases and 288 generated tokens in total matched the
+references. The maximum output-token logprob delta remained 0.0023036450147628784.
+Normal completion cleared pins/imports/exports/batches/leases and flush recovered
+the complete pool. These are token/lifecycle checks, not full-logit equivalence.
+The existing multiprocessing resource_tracker semaphore warning remains.
+
+Performance measurements use a separate driver without artificial ACK delays or
+stats polling. Cold, partial, all-local and ordinary-request controls are required;
+report exact range count, imported region count and mapped bytes in addition to
+payload bytes. Test contiguous and fragmented pages separately. Use fresh Engines
+and paired uninstrumented A/B/A runs; timing spans and Nsight samples are diagnostic,
+not replacements for uninstrumented latency. An output-length-one nonstreaming
+call still includes cleanup and metadata RPCs, so do not label it exact TTFT.

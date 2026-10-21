@@ -1949,7 +1949,7 @@ class Scheduler(
             if peer is not None:
                 peer.pump()
                 if peer.blocks_compute:
-                    time.sleep(0.001)
+                    time.sleep(peer.poll_interval)
                     continue
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
@@ -6003,6 +6003,12 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        peer = getattr(self, '_l1_peer', None)
+        if self.idle_sleeper is not None and peer is not None and peer.service is not None:
+            # The source Queue is not registered with the ZMQ idle poller.
+            # Bound idle service latency until Queue wakeups join that poller.
+            time.sleep(peer.poll_interval)
+            return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 

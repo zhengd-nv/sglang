@@ -4,9 +4,32 @@ from dataclasses import asdict
 from array import array
 
 from sglang.srt.mem_cache.l1_transfer.transport import Opcode, RegionDescriptor
+from sglang.srt.mem_cache.l1_transfer.transport.api import MemoryHandle, TransferRequest
 from sglang.srt.mem_cache.l1_transfer.transport.layout import RegionSpan, plan_transfer, bind_regions
 from .control import contract, digest, wire_copy, RemoteRejected
 from .restore import RestoreTransaction
+
+
+def plan_remote_regions(descriptors, bindings, plan, target_bindings):
+    """Plan using descriptor sizes only; placeholders must never reach transport.
+
+    Full bindings are still validated. Return only descriptors touched by READ,
+    in original order, and requests whose remote handles need materialization.
+    """
+    if len({d.region_id for d in descriptors}) != len(descriptors):
+        raise ValueError('duplicate source region identity')
+    views = [MemoryHandle(d.region_id, d.size, -1, True, 0) for d in descriptors]
+    spans = {}
+    for key, rows in bindings.items():
+        parsed = []
+        for a, n, i, off in rows:
+            if type(i) is not int or not 0 <= i < len(views):
+                raise ValueError('invalid source region index')
+            parsed.append(RegionSpan(a, n, views[i], off))
+        spans[key] = tuple(parsed)
+    requests = bind_regions(plan, spans, target_bindings, Opcode.READ)
+    needed = {r.remote.region_id for r in requests}
+    return [d for d in descriptors if d.region_id in needed], requests
 
 
 class SourceEndpoint:
@@ -149,15 +172,18 @@ class PeerReceiver:
         descriptors = [RegionDescriptor.from_dict(d) for d in offer['regions']]
         if not descriptors or len({d.owner_id for d in descriptors}) != 1 or any(d.access != 'read' for d in descriptors):
             raise ValueError('invalid source region ownership; fail-stop')
-        imported = self.pending['imports']
-        for d in descriptors:
-            imported.append(self.adapter.engine.import_memory(d))
-        bindings = {k:tuple(RegionSpan(a,n,imported[i],off) for a,n,i,off in spans)
-                    for k,spans in offer['bindings'].items()}
         plan = plan_transfer(self.adapter.layout, self.adapter.layout,
             pages[reservation.prefix_len//page:], reservation.pages,
             source_capacity=offer['capacity'], target_capacity=self.adapter.capacity)
-        requests = bind_regions(plan, bindings, self.adapter.bindings, Opcode.READ)
+        needed, planned = plan_remote_regions(descriptors, offer['bindings'], plan, self.adapter.bindings)
+        imported = self.pending['imports']
+        materialized = {}
+        for d in needed:
+            memory = self.adapter.engine.import_memory(d)
+            imported.append(memory)  # retain every successful import on any later failure
+            materialized[d.region_id] = memory
+        requests = tuple(TransferRequest(r.opcode, r.local, materialized[r.remote.region_id],
+                                         r.local_offset, r.remote_offset, r.length) for r in planned)
         def release():
             answer = self.rpc.call('release', receipt=offer['receipt'], unmapped=True)
             if answer is None:  # asynchronous release ACK is still pending

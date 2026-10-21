@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real FULL tree target ownership, including competing canonical insertions."""
 import unittest
+from array import array
+from unittest.mock import patch
 from types import SimpleNamespace
 import torch
 from test_source_lease import make_cache
@@ -17,7 +19,7 @@ class TargetTests(unittest.TestCase):
                                     kv_cache_layout='nhd',post_capture_active=True)
         self.pool._finalize_backing_tokens(64)
         self.cache,self.allocator = make_cache(self.pool)
-        self.key = RadixKey(list(range(16)))
+        self.key = RadixKey(array('q', range(16)))
 
     def tearDown(self):
         for r in list(self.cache.source_leases._targets):
@@ -69,7 +71,9 @@ class TargetTests(unittest.TestCase):
         canonical = self.seed(16)
         r = TargetReservation(self.cache,self.key)
         self.assertEqual(r.prefix_len,16); self.assertEqual(len(r.private),0)
-        self.assertTrue(torch.equal(r.publish(),canonical))
+        with patch.object(self.cache, 'insert', wraps=self.cache.insert) as insert:
+            self.assertTrue(torch.equal(r.publish(),canonical))
+            insert.assert_not_called()
         r.release(); self.assertEqual(self.allocator.available_size(),48)
 
     def test_guards_and_discard(self):
