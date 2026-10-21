@@ -4,10 +4,16 @@
 
 def restore_payload(arguments, restore, page_size):
     """Validate the narrow demo API before acquiring any remote ownership."""
-    if (not isinstance(restore, dict) or set(restore) not in (
-            {'source', 'prefix_tokens'}, {'source', 'prefix_tokens', 'mode'})
+    if (not isinstance(restore, dict)
+            or not {'source', 'prefix_tokens'} <= set(restore)
+            or set(restore) - {'source', 'prefix_tokens', 'mode', 'wait_timeout_ms'}
             or restore.get('mode', 'synchronous') not in ('synchronous', 'nonblocking')):
         raise ValueError('l1_restore requires exactly source and prefix_tokens')
+    if 'wait_timeout_ms' in restore:
+        timeout = restore['wait_timeout_ms']
+        if (restore.get('mode') != 'nonblocking' or type(timeout) is not int
+                or not 0 < timeout <= 3600000):
+            raise ValueError('wait_timeout_ms requires nonblocking mode and integer 1..3600000')
     source = restore['source']
     if (not isinstance(source, dict) or set(source) != {'host', 'port'}
             or not isinstance(source['host'], str) or not source['host']

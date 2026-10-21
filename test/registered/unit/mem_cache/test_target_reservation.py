@@ -101,5 +101,32 @@ class TargetTests(unittest.TestCase):
         self.assertFalse(self.cache.source_leases.busy)
         self.assertEqual(self.allocator.available_size(),64)
 
+    def test_request_headroom_wait_leaves_no_lock_pin_or_private_pages(self):
+        held = self.allocator.alloc(48)
+        self.seed(8)
+        with self.assertRaises(MemoryError):
+            TargetReservation(self.cache, self.key, required_capacity=32)
+        self.assertFalse(self.cache.source_leases.busy)
+        self.assertFalse(getattr(self.allocator, '_l1_pinned_pages', {}))
+        # The failed attempt's local-prefix lock was released.
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 8)
+        self.allocator.free(held)
+        r = TargetReservation(self.cache, self.key, required_capacity=32)
+        self.assertGreaterEqual(self.allocator.available_size(), 32 - len(self.key))
+        r.discard()
+        self.assertEqual(self.allocator.available_size(), 64)
+
+    def test_headroom_evicts_unrelated_cache_but_keeps_local_prefix(self):
+        prefix = self.seed(8)
+        other = self.allocator.alloc(48)
+        self.cache.insert(InsertParams(key=RadixKey(array('q', range(100,148))), value=other))
+        r = TargetReservation(self.cache, self.key, required_capacity=48)
+        self.assertEqual(r.prefix_len, 8)
+        self.assertTrue(torch.equal(r.indices[:8], prefix))
+        self.assertGreaterEqual(self.allocator.available_size(), 48 - len(self.key))
+        r.discard()
+        self.cache.evict(EvictParams(num_tokens=64))
+        self.assertEqual(self.allocator.available_size(), 64)
+
 
 if __name__ == '__main__': unittest.main()

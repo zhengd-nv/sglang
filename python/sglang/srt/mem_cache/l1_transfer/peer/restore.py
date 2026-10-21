@@ -58,6 +58,7 @@ class RestoreTransaction:
         self.published = False
         self.discarded = False
         self.source_released = False
+        self.cancel_requested = False
         self.unmapped_count = 0
         self._context = (os.getpid(), threading.get_ident())
         self._busy = False
@@ -151,18 +152,23 @@ class RestoreTransaction:
                 if self.status.requested_bytes != expected or self.status.completed_bytes != expected:
                     self._quarantine('inconsistent successful byte count')
                     return self.state
-            return self._finish(self.status.state == TransferState.SUCCESS)
+            return self._finish(self.status.state == TransferState.SUCCESS and not self.cancel_requested)
         finally:
             self._busy = False
 
     def cancel(self):
-        """Only pre-submit cancellation is safe without a transport drain."""
+        """Record intent; submitted copies retain all owners until proven drain.
+
+        Publication cannot be rolled back. A cancellation after publication
+        waits for the existing release ACK, then the caller releases its consumer.
+        """
         self._enter()
         try:
-            if self.state == RestoreState.DISCARDED:
+            self.cancel_requested = True
+            if self.state in (RestoreState.DISCARDED, RestoreState.PUBLISHED):
                 return self.state
-            if self.state != RestoreState.PREPARED:
-                raise RuntimeError('cannot cancel a submitted restore')
-            return self._finish(False)
+            if self.state == RestoreState.PREPARED:
+                return self._finish(False)
+            return self.state
         finally:
             self._busy = False

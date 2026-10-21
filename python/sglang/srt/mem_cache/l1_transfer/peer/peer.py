@@ -140,7 +140,7 @@ class PeerReceiver:
             return done.value
         raise RuntimeError('unexpected preparation step')
 
-    def prepare_steps(self, tokens):
+    def prepare_steps(self, tokens, *, required_capacity=None):
         """Yield network work; every cache/transport operation stays on the owner."""
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.target_reservation import TargetReservation
@@ -152,7 +152,9 @@ class PeerReceiver:
         complete = tokens[:len(tokens)//page*page]
         if not complete:
             raise ValueError('no complete prefix page')
-        reservation = TargetReservation(self.cache, RadixKey(array('q', complete)))
+        reservation = TargetReservation(self.cache, RadixKey(array('q', complete)),
+                                        **({'required_capacity': required_capacity}
+                                           if required_capacity is not None else {}))
         self.pending = {'reservation':reservation, 'imports':[], 'offer':None, 'transaction':None}
         if reservation.prefix_len == len(complete):
             reservation.publish()

@@ -224,3 +224,22 @@ payload bytes. Test contiguous and fragmented pages separately. Use fresh Engine
 and paired uninstrumented A/B/A runs; timing spans and Nsight samples are diagnostic,
 not replacements for uninstrumented latency. An output-length-one nonstreaming
 call still includes cleanup and metadata RPCs, so do not label it exact TTFT.
+
+
+## Serialized request lifecycle (2026-10-21)
+
+Run `test/manual/l1_transfer/run-peer-model.sh OUTPUT MODEL --nonblocking --lifecycle`
+inside an allocated GPU container. This adds acquire/release cancellation,
+acquire deadline, explicit source rejection and running-consumer abort cases.
+Each verifies released ownership, a full pool after flush, and successful reuse
+of the Engine by an ordinary request. Run synchronous request and explicit modes
+separately to cover their unchanged API behavior.
+
+The frozen runtime passed 96 CPU tests and 14 CUDA source/target tests. One
+additional diagnostic-only test checks READY tracing when queue admission clears
+the request; it passed separately in the same container runtime. The new capacity
+and failure tests include delayed offers, drained DMA failure, unknown completion,
+lost ACK, reservation rollback and GPU synchronization before consumer release.
+Actual hardware faults are not injected: uncertain ownership remains fail-stop.
+This validates the TP1 serialized policy, not a concurrent quota scheduler,
+private-prefix adoption, TP collectives or compute/transfer overlap.

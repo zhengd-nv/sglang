@@ -3458,6 +3458,12 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        if (release_consumer := getattr(req, '_l1_consumer_release', None)) is not None:
+            # READY but not yet assigned a normal KV row. Running requests use
+            # release_kv_cache instead; both release the extra pin exactly once.
+            if not req.finished():
+                req.finished_reason = FINISH_ABORT('L1 request aborted before execution')
+            release_consumer()
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
@@ -4121,6 +4127,9 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            peer = getattr(self, '_l1_peer', None)
+            if peer is not None and not peer.allows_request(req):
+                continue
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -5213,9 +5222,9 @@ class Scheduler(
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
 
-    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
+    def is_fully_idle(self, for_health_check=False, ignore_waiting=False, *, ignore_l1=False) -> bool:
         peer = getattr(self, '_l1_peer', None)
-        if peer is not None and (peer.source.active or peer.request is not None):
+        if not ignore_l1 and peer is not None and (peer.source.active or peer.request is not None):
             return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -5515,13 +5524,20 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
+    def finish_l1_waiting_request(self, req: Req, reason: str):
+        """A safe pre-forward L1 failure never enters a dummy model forward."""
+        req.finished_reason = FINISH_ABORT(reason)
+        self._release_aborted_request(req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(req, finished_reason=req.finished_reason.to_json()), req
+        )
+
     def abort_request(self, recv_req: AbortReq):
         peer = getattr(self, '_l1_peer', None)
         if peer is not None and peer.request is not None and (
             recv_req.abort_all or peer.request.rid.startswith(recv_req.rid)
         ):
-            logger.error('L1 shared request cancellation is unsupported; stopping scheduler')
-            os._exit(70)
+            peer.cancel_request()
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5669,6 +5685,12 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        peer = getattr(self, '_l1_peer', None)
+        if recv_req.mode == 'retract' and peer is not None and peer.request is not None:
+            # Retraction would free still-pinned consumer pages. Preserve all
+            # owners and use the existing resumable in-place pause instead.
+            logger.warning('L1 shared request uses in-place pause; retraction is disabled')
+            recv_req.mode = 'in_place'
         self._engine_paused = True
 
         if recv_req.mode == "in_place":

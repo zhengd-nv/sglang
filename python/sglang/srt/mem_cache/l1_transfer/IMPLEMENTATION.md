@@ -230,9 +230,16 @@ The request context travels through `GenerateReqInput`, tokenizer and
 keeps the request outside the ordinary waiting queue:
 
 ```text
-WAIT_ACQUIRE -> WAIT_TRANSFER -> WAIT_RELEASE -> READY -> ordinary forward -> finish
+WAIT_CAPACITY -> WAIT_ACQUIRE -> WAIT_TRANSFER -> WAIT_RELEASE -> READY -> ordinary forward -> finish
 ```
 
+- `WAIT_CAPACITY`: hold no source lease, private pages or long-lived tree lock.
+  Wait for ordinary work to drain. Budget the page-rounded full input plus maximum
+  output; permanently oversized requests fail immediately. Lock the local prefix,
+  evict unrelated cache and verify free headroom before reserving missing pages.
+  Transient shortages release the temporary lock and retry. Once reserved, other
+  requests cannot enter prefill until this consumer finishes. This is a conservative
+  serialized budget, not a general concurrent admission ledger.
 - `WAIT_ACQUIRE`: reserve/pin the target prefix and private missing pages on the
   scheduler thread; a network worker connects and requests a source lease.
 - Source's persistent `SourceService` only receives/sends bytes. It queues a
@@ -251,10 +258,10 @@ WAIT_ACQUIRE -> WAIT_TRANSFER -> WAIT_RELEASE -> READY -> ordinary forward -> fi
   request KV cleanup, synchronize outstanding local GPU work and release the
   consumer reservation before ordinary cache/page cleanup. The request result
   exposes restore counters, wait poll counts and `consumer_released`.
-- An all-local prefix skips all three wait phases and all source RPCs.
+- An all-local prefix still passes capacity admission, but skips network/transfer waits.
 
 Each normal scheduler turn ingests input, pumps peer progress, then considers
-forward. While the target is waiting or the source holds a lease, **ordinary
+forward. While the target waits for acquire/transfer/release or the source holds a lease, **ordinary
 GPU forward on that Engine is paused**. Control queries and peer messages still
 progress. `stats` reports `wait_state`; destructive idle-only operations cannot
 flush an owned request. Network workers never call CUDA or mutate the cache.
@@ -269,9 +276,20 @@ admission, and `mem_cache/common.py::release_kv_cache` (consumer release hook).
 
 Limits remain intentional: one shared transaction per Engine, fixed trusted
 source, no grammar/session/LoRA/multimodal/PD request context, no transfer/forward
-overlap, no tail/decode capacity admission policy, no retries or fallback.
-Cancellation/retraction and uncertain ownership fail-stop instead of reclaiming
-potentially live pages. There is no independently stoppable source service;
+overlap, no concurrent capacity ledger, no retries or fallback.
+Nonblocking requests accept `wait_timeout_ms` (default 30000, integer 1..3600000).
+The deadline records cancellation intent, not permission to free pages. Cancellation
+before acquire is local cleanup. After acquire is sent, retain the Future: clean
+a valid late offer without DMA; an unknown reply fail-stops. During DMA, wait for
+proven drain and discard instead of publishing. After publication, finish the ACK
+and release the consumer; never discard adopted pages. FAILED_DRAINED reports a
+safe request failure without a dummy forward. Safe failures leave the Engine usable.
+READY queue abort and running abort release the consumer after GPU synchronization.
+Retraction pause becomes in-place pause for an owned shared request; nonterminal
+consumer retraction remains unsupported. Unknown import/DMA/unmap/ACK still fail-stops.
+Terminal metadata includes `restore_id`, `state`, `reason`, `consumer_released`;
+failed restores use null transferred bytes rather than guessing partial progress.
+There is no independently stoppable source service;
 its listener lives with the Engine. Do not mix explicit ownership operations
 with an active nonblocking request/service. Only the synchronous Python Engine
 entry is covered by the model harness; HTTP/async/multi-rank integrations are not

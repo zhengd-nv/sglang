@@ -561,7 +561,17 @@ class Engine(EngineScoreMixin, EngineBase):
                 return ret
             except BaseException:
                 if l1_restore is not None:
-                    self.shutdown()
+                    # Safe terminal L1 rejections/cancellation can surface as
+                    # generator errors. They do not invalidate the Engine.
+                    safe = False
+                    try:
+                        terminal = self.l1_peer('request_result', rid=rid)
+                        safe = (terminal.get('state') in ('FAILED', 'CANCELLED')
+                                and terminal.get('consumer_released') is True)
+                    except Exception:
+                        pass
+                    if not safe:
+                        self.shutdown()
                 raise
 
     async def async_generate(

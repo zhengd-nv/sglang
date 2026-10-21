@@ -34,6 +34,8 @@ class NonblockingTests(unittest.TestCase):
         peer.service = None
         peer.source = SimpleNamespace(active={})
         peer.phase = 'WAIT_ACQUIRE'
+        peer.deadline = None
+        peer.cancel_reason = None
         peer.request = SimpleNamespace(rid='consumer')
         peer.poll_counts = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
         peer.acquire_future = Future()

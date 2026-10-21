@@ -35,6 +35,9 @@ def install(peer):
         @functools.wraps(original)
         def timed(*args, **kwargs):
             start, cpu = time.perf_counter_ns(), time.thread_time_ns()
+            # Queue rejection may release the consumer inside _ready().
+            ready_rid = peer.request.rid if label == 'target._ready' else None
+            ready_tx = peer.session['transaction'] if label == 'target._ready' else None
             if label == 'target.start_request':
                 peer._trace_request_start = (start, cpu)
             elif label == 'source.acquire':
@@ -48,8 +51,8 @@ def install(peer):
                 if label == 'target.start_request':
                     row['rid'] = args[0].rid
                 elif label == 'target._ready':
-                    row['rid'] = peer.request.rid
-                    tx = peer.session['transaction']
+                    row['rid'] = ready_rid
+                    tx = ready_tx
                     row['ranges'] = len(tx.requests) if tx else 0
                     row['regions'] = len(tx.imports) if tx else 0
                     row['bytes'] = sum(r.length for r in tx.requests) if tx else 0
@@ -63,7 +66,7 @@ def install(peer):
                                         start_ns=before, end_ns=end,
                                         cpu_ns=time.thread_time_ns()-before_cpu, tid=threading.get_ident())
                         if label == 'target._ready':
-                            interval['rid'] = peer.request.rid
+                            interval['rid'] = ready_rid
                         output.write(json.dumps(interval, separators=(',', ':')) + '\n')
                     if flush:
                         output.flush()

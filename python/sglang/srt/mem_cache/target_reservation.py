@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixPara
 
 
 class TargetReservation:
-    def __init__(self, cache, key):
+    def __init__(self, cache, key, *, required_capacity=None):
         self.cache = cache
         self.manager = cache.source_leases
         self.allocator, self.pool = self.manager.validate_cache()
@@ -29,6 +29,20 @@ class TargetReservation:
             self.prefix_len = len(prefix)
             if self.prefix_len > len(key) or self.prefix_len % page:
                 raise ValueError('unaligned local prefix')
+            if required_capacity is not None:
+                # The caller serializes admission until consumer completion.
+                # Protect the matched prefix while evicting unrelated cache;
+                # reserve budget for the entire prompt and maximum output.
+                from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                if (type(required_capacity) is not int or required_capacity < len(key)
+                        or required_capacity % page or required_capacity > self.allocator.size):
+                    raise ValueError('invalid serialized request capacity')
+                needed = required_capacity - self.prefix_len
+                shortfall = needed - self.allocator.available_size()
+                if shortfall > 0:
+                    cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+                if self.allocator.available_size() < needed:
+                    raise MemoryError('insufficient request headroom')
             self.private = self.allocator.alloc(len(key) - self.prefix_len) if self.prefix_len < len(key) else prefix[:0]
             if self.private is None:
                 raise MemoryError('insufficient private target pages')

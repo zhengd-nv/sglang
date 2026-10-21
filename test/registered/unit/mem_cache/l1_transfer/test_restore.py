@@ -81,7 +81,6 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(self.tx.state, RestoreState.IN_FLIGHT)
         self.assertEqual(self.events, [])
         self.assertTrue(self.source_pinned and self.target_private)
-        with self.assertRaises(RuntimeError): self.tx.cancel()
         with self.assertRaises(BusyError): self.receiver.unregister_memory(self.target)
         self.driver.state = 1
         self.assertEqual(self.tx.wait(), RestoreState.PUBLISHED)
@@ -100,6 +99,38 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(self.driver.submits, 0)
         self.assertEqual(self.events, ['discard', 'release'])
         self.owner.close(); self.receiver.close()
+
+    def test_inflight_cancel_retains_pages_until_drain_and_never_publishes(self):
+        self.tx.start()
+        for _ in range(2):
+            self.assertEqual(self.tx.cancel(), RestoreState.IN_FLIGHT)
+            self.assertEqual(self.tx.poll(), RestoreState.IN_FLIGHT)
+        self.assertEqual(self.events, [])
+        self.assertTrue(self.source_pinned and self.target_private)
+        self.driver.state = 1
+        self.assertEqual(self.tx.poll(), RestoreState.DISCARDED)
+        self.assertEqual(self.events, ['discard', 'release'])
+        self.tx.cancel(); self.tx.poll()
+        self.assertEqual(self.events, ['discard', 'release'])
+        self.owner.close(); self.receiver.close()
+
+    def test_cancel_after_publish_waits_for_ack_without_discard(self):
+        self.driver.state = 1
+        self.tx._release_source = Mock(return_value=False)
+        self.tx.start()
+        self.assertEqual(self.tx.poll(), RestoreState.RELEASING)
+        self.assertEqual(self.tx.cancel(), RestoreState.RELEASING)
+        self.assertEqual(self.events, ['publish'])
+        self.tx._release_source = self.release
+        self.assertEqual(self.tx.poll(), RestoreState.PUBLISHED)
+        self.assertEqual(self.events, ['publish', 'release'])
+        self.owner.close(); self.receiver.close()
+
+    def test_cancel_does_not_turn_uncertain_dma_into_safe_failure(self):
+        self.tx.start(); self.tx.cancel()
+        self.driver.state = 3
+        self.tx.poll()
+        self.assert_quarantined()
 
     def test_uncertain_retains_both_sides(self):
         self.driver.state = 3

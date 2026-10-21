@@ -47,12 +47,18 @@ def actor(pipe, gpu, model, output):
                 elif op == 'generate':
                     observations = []
                     done = threading.Event()
+                    rid = command.get('rid')
+                    cancelled = threading.Event()
                     def observe():
                         while not done.wait(0.01):
                             before = time.monotonic()
                             try:
                                 stats = engine.l1_peer('stats')
                                 observations.append(dict(stats, latency=time.monotonic()-before))
+                                if (command.get('cancel_state') == stats.get('wait_state')
+                                        and not cancelled.is_set()):
+                                    cancelled.set()
+                                    engine.loop.call_soon_threadsafe(engine.tokenizer_manager.abort_request, rid)
                             except Exception as exc:
                                 observations.append({'error': str(exc)})
                                 break
@@ -61,10 +67,17 @@ def actor(pipe, gpu, model, output):
                         monitor = threading.Thread(target=observe, daemon=True)
                         monitor.start()
                     try:
-                        answer = engine.generate(input_ids=command['tokens'],
+                        answer = engine.generate(input_ids=command['tokens'], rid=rid,
                         sampling_params={'temperature':0, 'max_new_tokens':command.get('new',24), 'ignore_eos':True},
                         return_logprob=True, logprob_start_len=-1,
                             l1_restore=command.get('l1_restore'))
+                    except Exception:
+                        if not command.get('terminal_reason'):
+                            raise
+                        terminal = engine.l1_peer('request_result', rid=rid)
+                        if terminal['reason'] != command['terminal_reason']:
+                            raise
+                        answer = {'meta_info': {'l1_restore': terminal}}
                     finally:
                         done.set()
                         if monitor is not None:
@@ -72,6 +85,10 @@ def actor(pipe, gpu, model, output):
                             assert not monitor.is_alive(), 'control query blocked scheduler'
                     if monitor is not None:
                         answer['control_observations'] = observations
+                    if command.get('terminal_reason'):
+                        assert answer['meta_info']['l1_restore']['reason'] == command['terminal_reason'], answer
+                        if command.get('cancel_state'):
+                            assert cancelled.is_set(), 'requested cancellation phase was not observed'
                 elif op == 'flush':
                     answer = engine.flush_cache().success
                 else:
@@ -118,8 +135,11 @@ def main():
     parser.add_argument('--request-restore', action='store_true',
                         help='Use generate(l1_restore=...) with automatic consumer release')
     parser.add_argument('--nonblocking', action='store_true')
+    parser.add_argument('--lifecycle', action='store_true', help='Also validate safe failures and cancellation')
     args=parser.parse_args()
     if args.nonblocking: args.request_restore = True
+    if args.lifecycle and not args.nonblocking:
+        parser.error('--lifecycle requires --nonblocking')
     out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
     from transformers import AutoTokenizer
     tokenizer=AutoTokenizer.from_pretrained(args.model)
@@ -223,6 +243,41 @@ def main():
             (out/f'{case}-restored.json').write_text(json.dumps(actual,indent=2))
             (out/'results.json').write_text(json.dumps(rows,indent=2))
             print(json.dumps(row),flush=True)
+        if args.lifecycle:
+            lifecycle = []
+            for case, cancel_state, timeout, reason in [
+                ('cancel_acquire', 'WAIT_ACQUIRE', 30000, 'CANCELLED'),
+                ('cancel_release', 'WAIT_RELEASE', 30000, 'CANCELLED'),
+                ('deadline_acquire', None, 50, 'WAIT_TIMEOUT'),
+                ('source_miss', None, 30000, 'SOURCE_REJECTED'),
+                ('cancel_running', 'READY', 30000, 'CANCELLED'),
+            ]:
+                assert call(1, 'flush')
+                address, proxy, errors = (service_address, None, [])
+                if case != 'source_miss':
+                    address, proxy, errors = delayed_peer(service_address)
+                request = list(tokens[:119])
+                if case == 'source_miss':
+                    request[0] = (request[0] + 1) % 10000
+                answer = call(1, 'generate', tokens=request, rid=case,
+                              new=512 if case == 'cancel_running' else 24,
+                              cancel_state=cancel_state, terminal_reason=reason,
+                              l1_restore=dict(source=address, prefix_tokens=112, mode='nonblocking',
+                                              wait_timeout_ms=timeout))
+                if proxy is not None:
+                    proxy.join(5)
+                    assert not proxy.is_alive() and not errors, errors
+                target, source = peer(1, 'stats'), peer(0, 'stats')
+                assert target['pinned_pages'] == target['imports'] == target['batches'] == 0, target
+                assert not target['target_active'] and target['wait_state'] is None, target
+                assert source['source_leases'] == source['exports'] == 0, source
+                assert call(1, 'flush')
+                assert peer(1, 'stats')['available_tokens'] == 4096
+                # A safe failure must leave both Engines usable.
+                call(1, 'generate', tokens=tokens[:23], new=1)
+                lifecycle.append(dict(case=case, result=answer, target=target, source=source))
+                (out/'lifecycle.json').write_text(json.dumps(lifecycle, indent=2))
+            print('PEER_LIFECYCLE_PASS cases=5', flush=True)
         assert call(0,'flush')
         assert peer(0,'stats')['available_tokens']==4096
         print('PEER_MODEL_PASS cases=4',flush=True)

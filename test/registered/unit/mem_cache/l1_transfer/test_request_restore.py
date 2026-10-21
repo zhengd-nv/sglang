@@ -79,6 +79,9 @@ class RequestRestoreTests(unittest.TestCase):
                  ({}, dict(self.restore, prefix_tokens=True)),
                  ({}, dict(self.restore, source={'host': 'a', 'port': 0})),
                  ({}, dict(self.restore, fallback=True))]
+        cases += [({}, dict(self.restore, mode='nonblocking', wait_timeout_ms=value))
+                  for value in (0, -1, True, 1.5, 3600001)]
+        cases.append(({}, dict(self.restore, wait_timeout_ms=1000)))
         for overrides, restore in cases:
             with self.subTest(overrides=overrides, restore=restore):
                 engine = FakeEngine()
