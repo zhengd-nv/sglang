@@ -48,6 +48,18 @@ class Driver:
             fn = getattr(self.lib, name); fn.argtypes = args; fn.restype = result
         if self.lib.nvt_fabric_size() != 64:
             raise TransferError("native ABI mismatch")
+        # Additive ABI3 capability: legacy libraries still work with the option off.
+        self._mapping_guard = getattr(self.lib, "nvt_create_mapping_guard", None)
+        if self._mapping_guard is not None:
+            self._mapping_guard.argtypes = [C.c_int, C.c_int, C.POINTER(C.c_void_p)]
+            self._mapping_guard.restype = C.c_int
+
+    def create_mapping_guard(self, device, peer):
+        if self._mapping_guard is None:
+            raise TransferError("mapping guard unavailable; rebuild the native library")
+        out = C.c_void_p()
+        self.check(self._mapping_guard(device, peer, C.byref(out)))
+        return out.value
 
     def check(self, code):
         if code != 0:

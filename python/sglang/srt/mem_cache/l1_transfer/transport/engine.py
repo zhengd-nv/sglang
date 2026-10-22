@@ -24,6 +24,8 @@ def locked(method):
         if os.getpid() != self._pid:
             raise TransferError("CUDA engine cannot be reused after fork; use spawn")
         with self._lock:
+            if self._mapping_guard_poisoned:
+                raise BusyError("engine mapping guard quarantined after failed cleanup")
             return method(self, *args, **kwargs)
     return call
 
@@ -48,8 +50,20 @@ class _Batch:
 
 
 class NvlinkEngine:
-    def __init__(self, device: int, library: str | None = None, *, _driver=None):
+    def __init__(self, device: int, library: str | None = None, *,
+                 mapping_peer_device: int | None = None, _driver=None):
+        """Optionally keep peer-mapping state alive using private backing memory.
+
+        mapping_peer_device must be a distinct, caller-authorized LOCAL CUDA device.
+        It consumes one allocation-granularity block there until close(). This is
+        NOT a remote data mapping cache: every imported KV lease still unmaps.
+        Default None preserves the zero-extra-device-allocation behavior.
+        """
         checked_int(device, "device")
+        if mapping_peer_device is not None:
+            checked_int(mapping_peer_device, "mapping_peer_device")
+            if mapping_peer_device == device:
+                raise ValueError("mapping_peer_device must differ from device")
         if _driver is None:
             from ._driver import Driver
             library = library or os.environ.get("NVLINK_TRANSFER_LIB")
@@ -68,6 +82,10 @@ class NvlinkEngine:
         self._batches = {}
         self._exports = {}
         self._imported_leases = set()
+        self._mapping_guard = None
+        self._mapping_guard_poisoned = False
+        if mapping_peer_device is not None:
+            self._mapping_guard = self._driver.create_mapping_guard(device, mapping_peer_device)
 
     def _memory(self, memory):
         if not isinstance(memory, MemoryHandle):
@@ -364,3 +382,10 @@ class NvlinkEngine:
                 raise BusyError("engine has busy/quarantined memory")
         for item in list(self._memories.values()):
             self.unregister_memory(item.public)
+        if self._mapping_guard is not None:
+            try:
+                self._driver.close(self._mapping_guard)
+            except Exception:
+                self._mapping_guard_poisoned = True
+                raise  # retain the handle; no retry or silent recreation after uncertainty
+            self._mapping_guard = None

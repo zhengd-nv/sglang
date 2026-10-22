@@ -39,6 +39,25 @@ shared output directory. Set PYTHONPATH and NVLINK_TRANSFER_LIB first.
 
 ## Transfer execution
 
+For repeated cold imports on GB200, an optional private mapping can avoid repeated
+first-peer `cuMemSetAccess` latency:
+
+```python
+engine = NvlinkEngine(receiver_device, mapping_peer_device=authorized_local_peer)
+```
+
+The peer must be a distinct, visible, P2P-accessible **local** CUDA device whose
+memory the caller is authorized to allocate. No device is selected automatically;
+the default is `None`. This owns one minimum VMM allocation-granularity block on
+the peer (2 MiB on the tested GB200), mapped into the receiving context until
+`close()`. It does not retain the peer primary context, any remote KV data, or any
+export lease. Normal per-request unmap and lease acknowledgement remain mandatory.
+Initialization pays the first mapping cost once. A native rebuild is needed to
+enable this additive ABI3 capability; old ABI3 libraries still work with it off.
+Busy close preserves the guard; failed guard cleanup quarantines the engine.
+Single-visible-GPU deployments cannot enable this option. Its latency benefit
+depends on driver/device behavior and must be measured for each deployment.
+
 The native ABI is version 3; rebuild the library after updating Python bindings.
 CUDA 13+ builds submit independent ranges with `cuMemcpyBatchAsync`, using
 stream-ordered source access. Older toolkit builds use per-range

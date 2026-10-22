@@ -195,6 +195,23 @@ int nvt_create(int device, size_t length, void** out) { BEGIN
     r->bytes = ((length+r->granularity-1)/r->granularity)*r->granularity;
     { Context scope(r->ctx); check(cuMemCreate(&r->allocation, r->bytes, &prop, 0)); }
     r->map(); *out = r.release(); END }
+// Optional engine-owned keepalive for the receiving device's peer-mapping state.
+// Allocate one minimum-granularity block on an EXPLICIT caller-owned local peer.
+// No remote KV allocation, export lease, peer primary context or user VA is kept.
+// The allocation has no producer or consumer; nvt_close unmaps and frees it.
+int nvt_create_mapping_guard(int device, int peer, void** out) { BEGIN
+    if (!out || device == peer) throw std::invalid_argument("mapping guard requires a distinct local peer");
+    auto r = std::make_unique<Region>(); r->init(device);
+    CUdevice backing = 0; check(cuDeviceGet(&backing, peer));
+    int accessible = 0; check(cuDeviceCanAccessPeer(&accessible, r->device, backing));
+    if (!accessible) throw std::invalid_argument("mapping guard peer is not accessible");
+    CUmemAllocationProp prop{}; prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = backing;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    check(cuMemGetAllocationGranularity(&r->granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    r->bytes = r->logical = r->granularity;
+    { Context scope(r->ctx); check(cuMemCreate(&r->allocation, r->bytes, &prop, 0)); }
+    r->map(); *out = r.release(); END }
 // Trusted allocator contract: address is the BASE of one full VMM mapping,
 // physical is that allocation's full size. Never accepts arbitrary tensor slices.
 int nvt_register_vmm(int device, uint64_t address, size_t physical, void** out) { BEGIN
