@@ -229,27 +229,44 @@ class NvlinkEngine:
             raise ValueError("empty transfer batch")
         ranges, touched, writes = [], set(), {}
         total = 0
+        # Cache only the immediately preceding identity pair/opcode while holding
+        # the engine lock. All requests remain alive in the tuple; identity (not
+        # dataclass equality or region_id) is required to reject forged handles.
+        # Nothing survives this call, so every later batch rechecks current state.
+        last_local = last_remote = None
+        last_opcode = object()
         # Validate the ENTIRE batch before entering CUDA: no partial writes on rejection.
         for req in requests:
-            if not isinstance(req, TransferRequest) or not isinstance(req.opcode, Opcode):
+            if not isinstance(req, TransferRequest):
                 raise ValueError("expected typed TransferRequest/Opcode")
-            local, remote = self._memory(req.local), self._memory(req.remote)
-            if req.local.remote or not req.remote.remote:
-                raise ValueError("expected local and imported remote memory")
-            if local.exports or local.active or remote.active:
-                raise BusyError("region exported or already used by another batch")
+            if (req.local is not last_local or req.remote is not last_remote
+                    or req.opcode is not last_opcode):
+                if not isinstance(req.opcode, Opcode):
+                    raise ValueError("expected typed TransferRequest/Opcode")
+                local, remote = self._memory(req.local), self._memory(req.remote)
+                if req.local.remote or not req.remote.remote:
+                    raise ValueError("expected local and imported remote memory")
+                if local.exports or local.active or remote.active:
+                    raise BusyError("region exported or already used by another batch")
+                read = req.opcode == Opcode.READ
+                required = "read" if read else "write"
+                if remote.descriptor.access != required:
+                    raise ValueError("remote lease does not permit this operation")
+                source, target = (remote, local) if read else (local, remote)
+                source_native, target_native = source.native, target.native
+                key = ((target.descriptor.owner_id, target.descriptor.region_id)
+                       if target.descriptor else (self.owner_id, target.public.region_id))
+                destinations = writes.setdefault(key, [])
+                touched.update((req.local.region_id, req.remote.region_id))
+                last_local, last_remote, last_opcode = req.local, req.remote, req.opcode
+            # Offsets and lengths are request-specific: never reuse their checks.
             self._range(req.local, req.local_offset, req.length)
             self._range(req.remote, req.remote_offset, req.length)
-            required = "read" if req.opcode == Opcode.READ else "write"
-            if remote.descriptor.access != required:
-                raise ValueError("remote lease does not permit this operation")
-            s, so, t, to = ((remote, req.remote_offset, local, req.local_offset)
-                            if req.opcode == Opcode.READ else
-                            (local, req.local_offset, remote, req.remote_offset))
-            key = (t.descriptor.owner_id, t.descriptor.region_id) if t.descriptor else (self.owner_id, t.public.region_id)
-            writes.setdefault(key, []).append((to, to+req.length))
-            ranges.append((s.native, so, t.native, to, req.length))
-            touched.update((req.local.region_id, req.remote.region_id)); total += req.length
+            so, to = ((req.remote_offset, req.local_offset) if read else
+                      (req.local_offset, req.remote_offset))
+            destinations.append((to, to + req.length))
+            ranges.append((source_native, so, target_native, to, req.length))
+            total += req.length
         for intervals in writes.values():
             intervals.sort()
             if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
