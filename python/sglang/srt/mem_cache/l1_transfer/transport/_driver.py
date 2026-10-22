@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Thin ctypes binding; only libcuda is linked by the native backend."""
+from array import array
+from itertools import chain
 import base64
 import ctypes as C
 from pathlib import Path
@@ -10,6 +12,14 @@ class _Range(C.Structure):
     _fields_ = [("source", C.c_void_p), ("source_offset", C.c_uint64),
                 ("target", C.c_void_p), ("target_offset", C.c_uint64),
                 ("length", C.c_uint64)]
+
+
+# A native-endian uint64 array matches the C range on supported 64-bit ABIs.
+# Keep the Structure constructor fallback for other pointer/layout conventions.
+_PACKED_RANGES = (C.sizeof(C.c_void_p) == 8 and array("Q").itemsize == 8
+                  and C.sizeof(_Range) == 40
+                  and all(getattr(_Range, name).offset == i * 8
+                          for i, (name, _) in enumerate(_Range._fields_)))
 
 
 class Driver:
@@ -77,7 +87,15 @@ class Driver:
         return raw.raw
 
     def submit(self, ranges, *, producer_stream=None):
-        rows = (_Range * len(ranges))(*[_Range(*r) for r in ranges])
+        # Fill contiguous native-endian storage without constructing a ctypes
+        # Structure (and its pointer ownership dictionary) per range. from_buffer
+        # retains the array until the synchronous nvt_submit call returns; native
+        # owns its submitted descriptors after return. No cross-batch cache.
+        if _PACKED_RANGES and len(ranges) >= 16:
+            storage = array("Q", chain.from_iterable(ranges))
+            rows = (_Range * len(ranges)).from_buffer(storage)
+        else:
+            rows = (_Range * len(ranges))(*ranges)
         out = C.c_void_p(); self.check(self.lib.nvt_submit(rows, len(rows), producer_stream, int(producer_stream is not None), C.byref(out)))
         return out.value
 
