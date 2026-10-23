@@ -24,6 +24,8 @@ def locked(method):
         if os.getpid() != self._pid:
             raise TransferError("CUDA engine cannot be reused after fork; use spawn")
         with self._lock:
+            if self._mapping_guard_poisoned:
+                raise BusyError("engine mapping guard quarantined after failed cleanup")
             return method(self, *args, **kwargs)
     return call
 
@@ -48,8 +50,20 @@ class _Batch:
 
 
 class NvlinkEngine:
-    def __init__(self, device: int, library: str | None = None, *, _driver=None):
+    def __init__(self, device: int, library: str | None = None, *,
+                 mapping_peer_device: int | None = None, _driver=None):
+        """Optionally keep peer-mapping state alive using private backing memory.
+
+        mapping_peer_device must be a distinct, caller-authorized LOCAL CUDA device.
+        It consumes one allocation-granularity block there until close(). This is
+        NOT a remote data mapping cache: every imported KV lease still unmaps.
+        Default None preserves the zero-extra-device-allocation behavior.
+        """
         checked_int(device, "device")
+        if mapping_peer_device is not None:
+            checked_int(mapping_peer_device, "mapping_peer_device")
+            if mapping_peer_device == device:
+                raise ValueError("mapping_peer_device must differ from device")
         if _driver is None:
             from ._driver import Driver
             library = library or os.environ.get("NVLINK_TRANSFER_LIB")
@@ -68,6 +82,10 @@ class NvlinkEngine:
         self._batches = {}
         self._exports = {}
         self._imported_leases = set()
+        self._mapping_guard = None
+        self._mapping_guard_poisoned = False
+        if mapping_peer_device is not None:
+            self._mapping_guard = self._driver.create_mapping_guard(device, mapping_peer_device)
 
     def _memory(self, memory):
         if not isinstance(memory, MemoryHandle):
@@ -229,27 +247,44 @@ class NvlinkEngine:
             raise ValueError("empty transfer batch")
         ranges, touched, writes = [], set(), {}
         total = 0
+        # Cache only the immediately preceding identity pair/opcode while holding
+        # the engine lock. All requests remain alive in the tuple; identity (not
+        # dataclass equality or region_id) is required to reject forged handles.
+        # Nothing survives this call, so every later batch rechecks current state.
+        last_local = last_remote = None
+        last_opcode = object()
         # Validate the ENTIRE batch before entering CUDA: no partial writes on rejection.
         for req in requests:
-            if not isinstance(req, TransferRequest) or not isinstance(req.opcode, Opcode):
+            if not isinstance(req, TransferRequest):
                 raise ValueError("expected typed TransferRequest/Opcode")
-            local, remote = self._memory(req.local), self._memory(req.remote)
-            if req.local.remote or not req.remote.remote:
-                raise ValueError("expected local and imported remote memory")
-            if local.exports or local.active or remote.active:
-                raise BusyError("region exported or already used by another batch")
+            if (req.local is not last_local or req.remote is not last_remote
+                    or req.opcode is not last_opcode):
+                if not isinstance(req.opcode, Opcode):
+                    raise ValueError("expected typed TransferRequest/Opcode")
+                local, remote = self._memory(req.local), self._memory(req.remote)
+                if req.local.remote or not req.remote.remote:
+                    raise ValueError("expected local and imported remote memory")
+                if local.exports or local.active or remote.active:
+                    raise BusyError("region exported or already used by another batch")
+                read = req.opcode == Opcode.READ
+                required = "read" if read else "write"
+                if remote.descriptor.access != required:
+                    raise ValueError("remote lease does not permit this operation")
+                source, target = (remote, local) if read else (local, remote)
+                source_native, target_native = source.native, target.native
+                key = ((target.descriptor.owner_id, target.descriptor.region_id)
+                       if target.descriptor else (self.owner_id, target.public.region_id))
+                destinations = writes.setdefault(key, [])
+                touched.update((req.local.region_id, req.remote.region_id))
+                last_local, last_remote, last_opcode = req.local, req.remote, req.opcode
+            # Offsets and lengths are request-specific: never reuse their checks.
             self._range(req.local, req.local_offset, req.length)
             self._range(req.remote, req.remote_offset, req.length)
-            required = "read" if req.opcode == Opcode.READ else "write"
-            if remote.descriptor.access != required:
-                raise ValueError("remote lease does not permit this operation")
-            s, so, t, to = ((remote, req.remote_offset, local, req.local_offset)
-                            if req.opcode == Opcode.READ else
-                            (local, req.local_offset, remote, req.remote_offset))
-            key = (t.descriptor.owner_id, t.descriptor.region_id) if t.descriptor else (self.owner_id, t.public.region_id)
-            writes.setdefault(key, []).append((to, to+req.length))
-            ranges.append((s.native, so, t.native, to, req.length))
-            touched.update((req.local.region_id, req.remote.region_id)); total += req.length
+            so, to = ((req.remote_offset, req.local_offset) if read else
+                      (req.local_offset, req.remote_offset))
+            destinations.append((to, to + req.length))
+            ranges.append((source_native, so, target_native, to, req.length))
+            total += req.length
         for intervals in writes.values():
             intervals.sort()
             if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
@@ -347,3 +382,10 @@ class NvlinkEngine:
                 raise BusyError("engine has busy/quarantined memory")
         for item in list(self._memories.values()):
             self.unregister_memory(item.public)
+        if self._mapping_guard is not None:
+            try:
+                self._driver.close(self._mapping_guard)
+            except Exception:
+                self._mapping_guard_poisoned = True
+                raise  # retain the handle; no retry or silent recreation after uncertainty
+            self._mapping_guard = None
