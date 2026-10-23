@@ -21,6 +21,19 @@ from ..transport.sglang_adapter import SGLangPoolAdapter
 logger = logging.getLogger(__name__)
 
 
+def _mapping_peer_device(device):
+    value = os.environ.get('SGLANG_L1_MAPPING_PEER_DEVICE')
+    if value is None:
+        return None
+    try:
+        peer = int(value)
+    except ValueError:
+        raise ValueError('SGLANG_L1_MAPPING_PEER_DEVICE must be a local CUDA ordinal') from None
+    if peer < 0 or peer == device:
+        raise ValueError('SGLANG_L1_MAPPING_PEER_DEVICE must be nonnegative and differ from the receiving device')
+    return peer
+
+
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False):
         args = scheduler.server_args
@@ -43,7 +56,9 @@ class SchedulerPeer:
         from .capacity import RequestCapacity
         self.capacity = RequestCapacity(self.cache) if concurrent else None
         self.overlap_forwards = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
-        self.engine = NvlinkEngine(scheduler.tp_worker.model_runner.gpu_id)
+        device = scheduler.tp_worker.model_runner.gpu_id
+        self.mapping_peer_device = _mapping_peer_device(device)
+        self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device)
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
@@ -71,7 +86,8 @@ class SchedulerPeer:
         result = dict(wait_state=getattr(self, "phase", None), source_leases=len(self.source.active), target_active=self.receiver is not None,
                     exports=len(self.engine._exports), imports=sum(m.public.remote for m in self.engine._memories.values()),
                     batches=len(self.engine._batches), available_tokens=allocator.available_size(),
-                    pinned_pages=sum(getattr(allocator, '_l1_pinned_pages', {}).values()))
+                    pinned_pages=sum(getattr(allocator, '_l1_pinned_pages', {}).values()),
+                    mapping_peer_device=getattr(self, 'mapping_peer_device', None))
         if getattr(self, 'concurrent', False):
             result.update(admitted_requests=len(self.capacity.active),
                           remaining_growth=self.capacity.remaining(),

@@ -13,9 +13,14 @@ from pathlib import Path
 import traceback
 
 
-def actor(pipe, gpu, model, output, concurrent=False, deterministic=False):
+def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mapping_peer_device=-1):
     os.setsid()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    if gpu == 1 and mapping_peer_device >= 0:
+        os.environ['CUDA_VISIBLE_DEVICES'] = f'{gpu},{mapping_peer_device}'
+        os.environ['SGLANG_L1_MAPPING_PEER_DEVICE'] = '1'  # ordinal within this process
+    else:
+        os.environ.pop('SGLANG_L1_MAPPING_PEER_DEVICE', None)
     log = open(Path(output) / f'engine-{gpu}.log', 'w', buffering=1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
@@ -174,7 +179,11 @@ def main():
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic FA4 for exact concurrent token comparisons')
     parser.add_argument('--concurrent', action='store_true', help='Enable target private handoff and concurrent ordinary requests')
     parser.add_argument('--lifecycle', action='store_true', help='Also validate safe failures and cancellation')
+    parser.add_argument('--mapping-peer-device', type=int, default=-1,
+                        help='Physical local peer exposed to the target process; -1 disables guard')
     args=parser.parse_args()
+    if args.mapping_peer_device < -1 or args.mapping_peer_device == 1:
+        parser.error('mapping peer must be -1 or a distinct nonnegative local device')
     if args.deterministic and not args.concurrent:
         parser.error("--deterministic requires --concurrent")
     if args.concurrent: args.nonblocking = True
@@ -210,7 +219,7 @@ def main():
     def peer(i,action,**payload):return call(i,'peer',action=action,payload=payload)
     try:
         for gpu in range(4 if args.deterministic else 3):
-            a,b=ctx.Pipe();p=ctx.Process(target=actor,args=(b,gpu,args.model,str(out),args.concurrent,args.deterministic and gpu<3))
+            a,b=ctx.Pipe();p=ctx.Process(target=actor,args=(b,gpu,args.model,str(out),args.concurrent,args.deterministic and gpu<3,args.mapping_peer_device))
             p.start();b.close();pipes.append(a);workers.append(p)
         for i in range(len(workers)):assert recv(i)['ready']
         if args.deterministic:
@@ -228,6 +237,9 @@ def main():
             (out/'flashinfer-no-l1-control.json').write_text(json.dumps(dict(cold=cold, warm=warm, first_mismatch=mismatch), indent=2))
             print('FLASHINFER_NO_L1_CONTROL first_mismatch=', mismatch, flush=True)
         for i in (0,1):peer(i,'init' ,identity=identity,concurrent=args.concurrent and i==1)
+        mapping_config = [peer(i, 'stats').get('mapping_peer_device') for i in (0, 1)]
+        assert mapping_config == [None, 1 if args.mapping_peer_device >= 0 else None]
+        (out/'mapping-config.json').write_text(json.dumps(mapping_config))
         call(0,'generate',tokens=tokens,new=1)
         service_address = peer(0,'start_service') if args.nonblocking else None
         rows=[]

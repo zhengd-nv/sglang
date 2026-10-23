@@ -45,6 +45,18 @@ shared output directory. Set PYTHONPATH and NVLINK_TRANSFER_LIB first.
 
 ## Transfer execution
 
+The L1 scheduler can opt into this guard with
+`SGLANG_L1_MAPPING_PEER_DEVICE=<local CUDA ordinal>`. The value is interpreted
+inside the scheduler's `CUDA_VISIBLE_DEVICES` mapping, must differ from its own
+device, and must name a caller-authorized P2P peer. Unset means disabled; invalid
+or same-device values fail explicitly. `l1_peer('stats')` reports the configured
+`mapping_peer_device`. Configure it per process, not indiscriminately across ranks.
+This does not alter source leases, target reservations, or per-request unmapping.
+
+The manual model test accepts `--mapping-peer-device` as a test-node physical
+ordinal and exposes/remaps it only for its target process. This is separate from
+the scheduler environment variable, which always uses process-local ordinals.
+
 For repeated cold imports on GB200, an optional private mapping can avoid repeated
 first-peer `cuMemSetAccess` latency:
 
