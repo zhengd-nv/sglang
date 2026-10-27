@@ -183,6 +183,20 @@ class NonblockingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'outstanding lease'):
             peer._serve_source_events()
 
+    def test_copy_into_leased_page_fail_stops_before_dma(self):
+        peer = self.peer()
+        peer.concurrent, peer.cancel_reason = True, None
+        peer.scheduler = SimpleNamespace(schedule_stream=SimpleNamespace(cuda_stream=1))
+        peer.source = SimpleNamespace(active={'r': {'lease': SimpleNamespace(page_indices=(3, 4))}}, pending={})
+        peer.receiver = SimpleNamespace(pending={'reservation': SimpleNamespace(pages=(4,))})
+        tx = Mock()
+        with self.assertRaisesRegex(RuntimeError, 'overlaps'):
+            peer._prepared({'transaction': tx})
+        tx.start.assert_not_called()
+        peer.receiver.pending['reservation'].pages = (5,)
+        peer._prepared({'transaction': tx})
+        tx.start.assert_called_once()
+
     def test_l1_config_accepts_file_and_rejects_unknown_keys(self):
         import json, tempfile
         with tempfile.NamedTemporaryFile('w', suffix='.json') as f:

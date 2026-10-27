@@ -92,6 +92,23 @@ class ContractTests(unittest.TestCase):
             with self.subTest(req=req), self.assertRaises(ValueError):
                 self.b.submit_transfer([req])
 
+    def test_shared_read_exports_only_admit_read_into_read_exported_region(self):
+        """A region readable by a remote peer may also receive local READs only in shared mode."""
+        self.b.export_memory(self.local, 'read')
+        with self.assertRaises(BusyError):
+            self.b.submit_transfer([self.request()])
+        shared = NvlinkEngine(1, shared_read_exports=True, _driver=self.driver)
+        remote = shared.import_memory(self.a.export_memory(self.source))
+        local = shared.allocate_memory(64)
+        shared.export_memory(local, 'read')
+        batch = shared.submit_transfer([self.request(local=local, remote=remote)])
+        shared.export_memory(local, 'read')  # a new read lease during the local READ
+        with self.assertRaises(BusyError):
+            shared.export_memory(local, 'write')
+        self.driver.state = 1
+        shared.wait(batch, 0)
+        shared.release_batch(batch)
+
     def test_write_requires_write_export(self):
         with self.assertRaises(ValueError):
             self.b.submit_transfer([self.request(opcode=Opcode.WRITE)])

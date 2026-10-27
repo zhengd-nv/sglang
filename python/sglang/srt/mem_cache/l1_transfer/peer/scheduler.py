@@ -71,7 +71,9 @@ class SchedulerPeer:
         self.forward_count = 0
         device = scheduler.tp_worker.model_runner.gpu_id
         self.mapping_peer_device = _mapping_peer_device(device)
-        self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device)
+        # A concurrent Engine may copy into its pool while peers read leased pages of it.
+        self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device,
+                                   shared_read_exports=concurrent)
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
@@ -402,6 +404,8 @@ class SchedulerPeer:
                 tx.cancel()
                 self.phase = 'WAIT_RELEASE'
             else:
+                if getattr(self, 'concurrent', False):
+                    self._check_roles_disjoint()
                 # Order reuse of target slots after prior schedule-stream work.
                 # Future ordinary forwards remain independent and use other pages.
                 tx.start(**({'producer_stream': self.scheduler.schedule_stream.cuda_stream}
@@ -590,8 +594,24 @@ class SchedulerPeer:
                     self.source_waiters[data['id']] = future
                 else:
                     future.set_result(answer)
-        for request_id, offer in self.source.poll_ready():
+        offers = self.source.poll_ready()
+        if offers:
+            self._check_roles_disjoint()
+        for request_id, offer in offers:
             self.source_waiters.pop(request_id).set_result(offer)
+
+    def _check_roles_disjoint(self):
+        """Shared read exports are safe only if no leased page is a local copy destination.
+
+        Leased pages are locked tree pages and copy destinations are newly allocated
+        private pages, so an overlap means the allocator invariant broke: fail-stop.
+        """
+        if self.receiver is None or self.receiver.pending is None:
+            return
+        leases = [e['lease'] for e in self.source.active.values()] + [p[0] for p in self.source.pending.values()]
+        leased = {page for lease in leases for page in lease.page_indices}
+        if leased & set(self.receiver.pending['reservation'].pages):
+            raise RuntimeError('source lease overlaps a target copy destination')
 
     def _pump(self):
         if getattr(self, 'concurrent', False):

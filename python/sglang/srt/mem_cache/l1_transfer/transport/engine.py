@@ -47,17 +47,23 @@ class _Batch:
     native: int
     memories: set
     status: TransferStatus
+    read_only: bool = False
 
 
 class NvlinkEngine:
     def __init__(self, device: int, library: str | None = None, *,
-                 mapping_peer_device: int | None = None, _driver=None):
+                 mapping_peer_device: int | None = None, shared_read_exports: bool = False,
+                 _driver=None):
         """Optionally keep peer-mapping state alive using private backing memory.
 
         mapping_peer_device must be a distinct, caller-authorized LOCAL CUDA device.
         It consumes one allocation-granularity block there until close(). This is
         NOT a remote data mapping cache: every imported KV lease still unmaps.
         Default None preserves the zero-extra-device-allocation behavior.
+
+        shared_read_exports lets a local region carry read-only exports while it is
+        the destination of local READ batches. The caller must guarantee that the
+        remotely readable byte ranges never overlap those destinations.
         """
         checked_int(device, "device")
         if mapping_peer_device is not None:
@@ -74,6 +80,7 @@ class NvlinkEngine:
                     raise ValueError("build l1_transfer/build-native.sh first, or set NVLINK_TRANSFER_LIB")
             _driver = Driver(library)
         self._driver = _driver
+        self._shared_read_exports = shared_read_exports
         self.device = device
         self.owner_id = uuid.uuid4().hex
         self._pid = os.getpid()
@@ -141,7 +148,9 @@ class NvlinkEngine:
     @locked
     def export_memory(self, memory, access="read"):
         item = self._memory(memory)
-        if memory.remote or item.active:
+        if memory.remote or (item.active and not (
+                self._shared_read_exports and access == "read"
+                and all(self._batches[b].read_only for b in item.active))):
             raise BusyError("cannot export imported/in-flight memory")
         if access not in ("read", "write"):
             raise ValueError("access must be read or write")
@@ -264,9 +273,11 @@ class NvlinkEngine:
                 local, remote = self._memory(req.local), self._memory(req.remote)
                 if req.local.remote or not req.remote.remote:
                     raise ValueError("expected local and imported remote memory")
-                if local.exports or local.active or remote.active:
-                    raise BusyError("region exported or already used by another batch")
                 read = req.opcode == Opcode.READ
+                shared = (self._shared_read_exports and read
+                          and all(self._exports[x][1] == "read" for x in local.exports))
+                if (local.exports and not shared) or local.active or remote.active:
+                    raise BusyError("region exported or already used by another batch")
                 required = "read" if read else "write"
                 if remote.descriptor.access != required:
                     raise ValueError("remote lease does not permit this operation")
@@ -299,7 +310,8 @@ class NvlinkEngine:
             raise
         public = BatchHandle(uuid.uuid4().hex)
         self._batches[public.batch_id] = _Batch(public, native, touched,
-                                              TransferStatus(TransferState.IN_FLIGHT, total, None))
+                                              TransferStatus(TransferState.IN_FLIGHT, total, None),
+                                              read_only=all(r.opcode is Opcode.READ for r in requests))
         for key in touched:
             self._memories[key].active.add(public.batch_id)
         return public
