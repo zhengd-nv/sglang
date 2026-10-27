@@ -40,7 +40,8 @@ def install(peer):
             ready_tx = peer.session['transaction'] if label == 'target._ready' else None
             if label == 'target.start_request':
                 peer._trace_request_start = (start, cpu)
-            elif label == 'source.acquire':
+            elif label in ('source.acquire', 'source.begin_acquire'):
+                # Online sources overlap leases; lease_total then pairs with the latest begin.
                 peer._trace_source_start = (start, cpu)
             try:
                 return original(*args, **kwargs)
