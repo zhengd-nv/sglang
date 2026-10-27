@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Queue
 import socket
 import threading
+import time
 
 from .control import RemoteRejected, SocketRPC, serve_once
 
@@ -74,6 +75,7 @@ class SourceService:
 
             def dispatch(self, request):
                 future = Future()
+                future.enqueued = time.time()  # wall clock, for source lease timing samples
                 service.events.put(('request', request, future))
                 result = future.result(timeout=120)
                 if request.get('operation') == 'acquire':

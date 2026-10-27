@@ -86,6 +86,9 @@ class SchedulerPeer:
         else:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
         self.source_waiters = {}  # request_id -> acquire Future awaiting the producer event
+        # Wall-clock lease timeline (enqueued, begin, offered, released) for online sources.
+        self.source_timing_open = {}
+        self.source_timing = deque(maxlen=8192)
         self.receiver = None
         self.listener = None
         self.service = None
@@ -270,7 +273,7 @@ class SchedulerPeer:
     def endpoint_info(self):
         """What a router or peer needs to address and check this source."""
         return dict(service=self.service_address, contract_digest=digest(self.source.contract),
-                    concurrent=self.concurrent, stats=self.stats())
+                    concurrent=self.concurrent, stats=self.stats(), source_timing=list(self.source_timing))
 
     def start_request(self, req, options):
         from .request import restore_payload
@@ -586,19 +589,32 @@ class SchedulerPeer:
                         raise RemoteRejected('source Engine is busy')
                     answer = self.source.dispatch(data)
                 else:
+                    begin = time.time()
                     answer = self.source.dispatch_deferred(data, record_producer=self._record_producer)
             except RemoteRejected as exc:
                 future.set_exception(exc)
             else:
                 if answer is None:
                     self.source_waiters[data['id']] = future
+                    self.source_timing_open[data['id']] = dict(
+                        enqueued=future.enqueued, begin=begin, pages=len(self.source.pending[data['id']][0].page_indices))
                 else:
+                    if concurrent and data.get('operation') == 'release':
+                        self._close_source_timing(data['receipt']['request_id'])
                     future.set_result(answer)
         offers = self.source.poll_ready()
         if offers:
             self._check_roles_disjoint()
         for request_id, offer in offers:
+            if request_id in self.source_timing_open:
+                self.source_timing_open[request_id]['offered'] = time.time()
             self.source_waiters.pop(request_id).set_result(offer)
+
+    def _close_source_timing(self, request_id):
+        entry = self.source_timing_open.pop(request_id, None)
+        if entry is not None:
+            entry['released'] = time.time()
+            self.source_timing.append(entry)
 
     def _check_roles_disjoint(self):
         """Shared read exports are safe only if no leased page is a local copy destination.

@@ -125,7 +125,9 @@ def smoke(servers, families, references, seconds, output):
             try:
                 ids, restore, _ = target.generate(families[f], sources=[source(s) for s in others],
                                                   rid=f'smoke-{seed}-{n}')
-                key = (restore['state'], restore['reason'] or '')
+                # Split FINISHED into real cross-GPU copies and target-local hits.
+                kind = 'remote' if restore['transferred_bytes'] else 'local'
+                key = (restore['state'], restore['reason'] or kind)
                 if ids != references[f]:
                     raise AssertionError(f'token mismatch family {f} target {target.index} {restore}')
             except BaseException as exc:
@@ -141,7 +143,7 @@ def smoke(servers, families, references, seconds, output):
     summary = dict(seconds=seconds, counts={f'{k[0]}:{k[1]}': v for k, v in counts.items()}, failures=failures)
     (Path(output) / 'smoke.json').write_text(json.dumps(summary, indent=2))
     assert not failures, failures
-    assert counts.get(('FINISHED', ''), 0) > 0, counts
+    assert counts.get(('FINISHED', 'remote'), 0) > 0, counts
     print('L1_HTTP_SMOKE_PASS', json.dumps(summary['counts']), flush=True)
 
 
@@ -156,8 +158,9 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     base = tokenizer.encode('The quick brown fox jumps over the lazy dog. ' * 80)
-    # Families share nothing; each has a 2-page prefix and a 7-token suffix.
-    families = [[(t + 997 * f) % 30000 for t in base[:PREFIX + 7]] for f in range(4)]
+    # Families share nothing; each has a 2-page prefix and a 7-token suffix. Sixteen
+    # families overflow the 4096-token pools, so caches churn and remote copies recur.
+    families = [[(t + 997 * f) % 30000 for t in base[:PREFIX + 7]] for f in range(16)]
     identity = identity_for(args.model)
     servers = [Server(i, args.model, identity, out) for i in range(3)]
     try:

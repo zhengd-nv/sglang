@@ -50,5 +50,7 @@ if [[ " $* " == *" --concurrent "* ]]; then
     python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_source_lease.py' -v
     python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_target_reservation.py' -v
 fi
-# L1_PEER_TEST selects another driver (e.g. test-http-multi.py) under the same environment.
-python "$here/${L1_PEER_TEST:-test-peer-model.py}" --model "$model" --output "$run" "$@"
+# L1_PEER_TEST selects another driver (a name here, or an absolute path) under the same environment.
+driver="${L1_PEER_TEST:-test-peer-model.py}"
+[[ "$driver" == /* ]] || driver="$here/$driver"
+python "$driver" --model "$model" --output "$run" "$@"
