@@ -47,7 +47,6 @@ class _Batch:
     native: int
     memories: set
     status: TransferStatus
-    read_only: bool = False
 
 
 class NvlinkEngine:
@@ -61,9 +60,10 @@ class NvlinkEngine:
         NOT a remote data mapping cache: every imported KV lease still unmaps.
         Default None preserves the zero-extra-device-allocation behavior.
 
-        shared_read_exports lets a local region carry read-only exports while it is
-        the destination of local READ batches. The caller must guarantee that the
-        remotely readable byte ranges never overlap those destinations.
+        shared_read_exports lets a local region with read-only exports be the
+        destination of local READ batches. The caller must guarantee that the
+        remotely readable byte ranges never overlap those destinations. Exporting
+        a region with a local batch in flight stays refused (the native layer too).
         """
         checked_int(device, "device")
         if mapping_peer_device is not None:
@@ -148,9 +148,7 @@ class NvlinkEngine:
     @locked
     def export_memory(self, memory, access="read"):
         item = self._memory(memory)
-        if memory.remote or (item.active and not (
-                self._shared_read_exports and access == "read"
-                and all(self._batches[b].read_only for b in item.active))):
+        if memory.remote or item.active:
             raise BusyError("cannot export imported/in-flight memory")
         if access not in ("read", "write"):
             raise ValueError("access must be read or write")
@@ -240,6 +238,11 @@ class NvlinkEngine:
             raise
 
     @locked
+    def any_in_flight(self, memories):
+        """Whether a local batch still uses any of these local regions."""
+        return any(self._memory(m).active for m in memories)
+
+    @locked
     def submit_transfer(self, requests, *, producer_stream=None):
         """Copy ready remote data; optionally order after a local producer stream.
 
@@ -310,8 +313,7 @@ class NvlinkEngine:
             raise
         public = BatchHandle(uuid.uuid4().hex)
         self._batches[public.batch_id] = _Batch(public, native, touched,
-                                              TransferStatus(TransferState.IN_FLIGHT, total, None),
-                                              read_only=all(r.opcode is Opcode.READ for r in requests))
+                                              TransferStatus(TransferState.IN_FLIGHT, total, None))
         for key in touched:
             self._memories[key].active.add(public.batch_id)
         return public

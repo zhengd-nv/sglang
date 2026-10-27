@@ -125,7 +125,13 @@ class SourceEndpoint:
         return request_id
 
     def poll_ready(self):
-        """Return [(request_id, offer)] whose producer work has completed."""
+        """Return [(request_id, offer)] whose producer work has completed.
+
+        Exports wait while a local copy batch is in flight: regions cannot be
+        exported then. That copy completes on its own, so waiting cannot deadlock.
+        """
+        if not self.pending or self.adapter.engine.any_in_flight(self.adapter.memories):
+            return []
         done = [rid for rid, (_, _, event) in self.pending.items() if event.query()]
         offers = []
         for rid in done:

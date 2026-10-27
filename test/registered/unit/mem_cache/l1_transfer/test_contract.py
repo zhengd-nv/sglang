@@ -93,7 +93,7 @@ class ContractTests(unittest.TestCase):
                 self.b.submit_transfer([req])
 
     def test_shared_read_exports_only_admit_read_into_read_exported_region(self):
-        """A region readable by a remote peer may also receive local READs only in shared mode."""
+        """A read-exported region may receive local READs only in shared mode; never export in flight."""
         self.b.export_memory(self.local, 'read')
         with self.assertRaises(BusyError):
             self.b.submit_transfer([self.request()])
@@ -102,9 +102,9 @@ class ContractTests(unittest.TestCase):
         local = shared.allocate_memory(64)
         shared.export_memory(local, 'read')
         batch = shared.submit_transfer([self.request(local=local, remote=remote)])
-        shared.export_memory(local, 'read')  # a new read lease during the local READ
-        with self.assertRaises(BusyError):
-            shared.export_memory(local, 'write')
+        self.assertTrue(shared.any_in_flight([local]))
+        with self.assertRaises(BusyError):  # the native layer refuses this as well
+            shared.export_memory(local, 'read')
         self.driver.state = 1
         shared.wait(batch, 0)
         shared.release_batch(batch)
