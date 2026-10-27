@@ -37,6 +37,7 @@ class NonblockingTests(unittest.TestCase):
         peer.deadline = None
         peer.cancel_reason = None
         peer.request = SimpleNamespace(rid='consumer')
+        peer.queue, peer.consumers = [], {}
         peer.poll_counts = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
         peer.acquire_future = Future()
         peer.scheduler = SimpleNamespace(_add_request_to_queue=Mock())

@@ -6,6 +6,7 @@ import socket
 import math
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
@@ -19,6 +20,9 @@ from ..transport import NvlinkEngine
 from ..transport.sglang_adapter import SGLangPoolAdapter
 
 logger = logging.getLogger(__name__)
+
+# Terminal reasons that end the request; every other safe failure recomputes it.
+ABORT_REASONS = ('CANCELLED', 'CAPACITY_EXCEEDED')
 
 
 def _mapping_peer_device(device):
@@ -35,7 +39,7 @@ def _mapping_peer_device(device):
 
 
 class SchedulerPeer:
-    def __init__(self, scheduler, identity, *, concurrent=False):
+    def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
@@ -43,6 +47,8 @@ class SchedulerPeer:
             raise ValueError('Peer restore requires ordinary TP/PP/DP1, no speculation/LoRA, max_running_requests=1')
         if type(concurrent) is not bool:
             raise ValueError('concurrent must be boolean')
+        if type(queue_limit) is not int or queue_limit < 0:
+            raise ValueError('queue_limit must be a nonnegative integer')
         if concurrent and not scheduler.is_generation:
             raise ValueError('concurrent L1 requires a generation Engine')
         if concurrent and (not args.disable_overlap_schedule or scheduler.enable_priority_preemption):
@@ -73,6 +79,16 @@ class SchedulerPeer:
         self.cancel_reason = None
         self.deadline = None
         self.required_capacity = 0
+        self.queue_limit = queue_limit
+        # (req, candidates, required_capacity, deadline); holds no ownership.
+        self.queue = deque()
+        # rid -> (req, unallocated headroom) for READY requests not yet admitted.
+        self.unadmitted = {}
+        # rid -> cancelled flag for detached READY consumers until their release.
+        self.consumers = {}
+        self.candidates = ()
+        self.candidate_index = 0
+        self.attempts = []
         self.poll_interval = float(os.environ.get('SGLANG_L1_POLL_INTERVAL', '0.001'))
         if not math.isfinite(self.poll_interval) or not 0 <= self.poll_interval <= 0.1:
             raise ValueError('SGLANG_L1_POLL_INTERVAL must be finite and in [0, 0.1] seconds')
@@ -91,6 +107,9 @@ class SchedulerPeer:
         if getattr(self, 'concurrent', False):
             result.update(admitted_requests=len(self.capacity.active),
                           remaining_growth=self.capacity.remaining(),
+                          queued_requests=len(self.queue),
+                          unadmitted_requests=len(self.unadmitted),
+                          ready_consumers=len(self.consumers),
                           restore_headroom=self.reserved_headroom(),
                           overlap_forwards=dict(self.overlap_forwards))
         return result
@@ -189,7 +208,7 @@ class SchedulerPeer:
         # may consume the full-request headroom before our consumer finishes.
         if not getattr(self, 'concurrent', False):
             return self.phase in (None, 'WAIT_CAPACITY') or req is self.request
-        if req is self.request or req.rid in self.capacity.active:
+        if req is self.request or req.rid in self.capacity.active or req.rid in self.unadmitted:
             return True
         # Drain existing consumers instead of starving a waiting restore with
         # an unbounded stream of newly admitted ordinary requests.
@@ -198,15 +217,20 @@ class SchedulerPeer:
         return self.capacity.can_admit(req, self.reserved_headroom())
 
     def reserved_headroom(self):
+        unadmitted = self._unadmitted_headroom()
         if self.request is None or self.request.rid in self.capacity.active:
-            return 0
+            return unadmitted
         if self.receiver is not None and self.receiver.pending is not None:
-            return max(0, self.required_capacity - len(self.receiver.pending['reservation'].indices))
-        return self.required_capacity
+            return unadmitted + max(0, self.required_capacity - len(self.receiver.pending['reservation'].indices))
+        return unadmitted + self.required_capacity
+
+    def _unadmitted_headroom(self):
+        return sum(headroom for _, headroom in self.unadmitted.values())
 
     def note_admitted(self, req):
         if getattr(self, 'concurrent', False):
             self.capacity.admit(req)
+            self.unadmitted.pop(req.rid, None)
 
     def note_forward(self, batch):
         if getattr(self, 'concurrent', False) and self.phase in self.overlap_forwards:
@@ -223,31 +247,89 @@ class SchedulerPeer:
         from .request import restore_payload
         if not self.scheduler.server_args.disable_overlap_schedule:
             raise ValueError('nonblocking peer requires disable_overlap_schedule')
-        if self.request is not None or self.receiver is not None or self.source.active:
-            raise ValueError('nonblocking peer permits one pending shared request')
         payload = restore_payload(dict(input_ids=list(req.origin_input_ids)), options,
                                   self.scheduler.server_args.page_size)
         if getattr(self, 'concurrent', False):
             self.capacity.bound(req)  # reject unbudgeted beam expansion before ownership
-            if req._compute_max_prefix_len(len(req.origin_input_ids)) < len(payload['tokens']):
+            if req._compute_max_prefix_len(len(req.origin_input_ids)) < max(
+                    len(c['tokens']) for c in payload['candidates']):
                 raise ValueError('requested logprobs require recomputing restored prefix')
         output = req.sampling_params.max_new_tokens
         if type(output) is not int or output < 0:
             raise ValueError('serialized sharing requires a bounded max_new_tokens')
         page = self.scheduler.server_args.page_size
         required = (len(req.origin_input_ids) + output + page - 1) // page * page
+        if required > self.cache.token_to_kv_pool_allocator.size:
+            self._end_unstarted(req, 'CAPACITY_EXCEEDED')
+            return
+        deadline = time.monotonic() + options.get('wait_timeout_ms', 30000) / 1000
+        if len(self.queue) >= self.queue_limit and not self._can_activate():
+            self._end_unstarted(req, 'QUEUE_FULL')
+            return
+        self.queue.append((req, payload['candidates'], required, deadline))
+        self._activate_next()
+
+    def _can_activate(self):
+        return self.request is None and self.receiver is None and not self.source.active
+
+    def _activate_next(self):
+        if not self.queue or not self._can_activate():
+            return
+        req, candidates, required, deadline = self.queue.popleft()
         self.request = req
-        self.payload = payload
+        self.candidates = candidates
+        self.candidate_index = 0
+        self.attempts = []
+        self.payload = candidates[0]
         self.completed = None
         self.cancel_reason = None
         self.restore_id = uuid.uuid4().hex
         self.required_capacity = required
-        self.deadline = time.monotonic() + options.get('wait_timeout_ms', 30000) / 1000
+        self.deadline = deadline
         self.phase = 'WAIT_CAPACITY'
         self.poll_counts = dict(WAIT_CAPACITY=0, WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
         self.overlap_forwards = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
-        if required > self.cache.token_to_kv_pool_allocator.size:
-            self._fail_request('CAPACITY_EXCEEDED')
+
+    def _expire_queued(self):
+        now = time.monotonic()
+        if not any(entry[3] <= now for entry in self.queue):
+            return
+        expired = [entry[0] for entry in self.queue if entry[3] <= now]
+        self.queue = deque(entry for entry in self.queue if entry[3] > now)
+        for req in expired:
+            self._end_unstarted(req, 'WAIT_TIMEOUT')
+
+    def _end_unstarted(self, req, reason):
+        """End a request that never owned a reservation or source lease."""
+        self._end(req, dict(state=None, reason=reason, consumer_released=True,
+                            transferred_bytes=0, attempts=[]))
+
+    def _end(self, req, result):
+        """Report a terminal outcome; safe non-cancel failures recompute the request."""
+        reason = result['reason']
+        if reason in ABORT_REASONS:
+            result['state'] = 'CANCELLED' if reason == 'CANCELLED' else 'FAILED'
+            self._record_result(req.rid, result)
+            self.scheduler.finish_l1_waiting_request(req, reason)
+        else:
+            result['state'] = 'FALLBACK'
+            self._record_result(req.rid, result)
+            self.scheduler._add_request_to_queue(req)
+
+    def abort_matching(self, rid, abort_all):
+        """Cancel the active shared request and drop queued ones; queued own nothing."""
+        if self.request is not None and (abort_all or self.request.rid.startswith(rid)):
+            self.cancel_request()
+        for consumer in self.consumers:
+            if abort_all or consumer.startswith(rid):
+                self.consumers[consumer] = True  # ordinary abort releases it
+        matched = [entry[0] for entry in self.queue if abort_all or entry[0].rid.startswith(rid)]
+        if not matched:
+            return
+        self.queue = deque(entry for entry in self.queue
+                           if not (abort_all or entry[0].rid.startswith(rid)))
+        for req in matched:
+            self._end_unstarted(req, 'CANCELLED')
 
     def _try_capacity(self):
         if self.scheduler._engine_paused:
@@ -259,7 +341,8 @@ class SchedulerPeer:
         self.rpc = AsyncRPC(payload['host'], payload['port'], executor=self.rpc_executor)
         self.receiver = PeerReceiver(self.cache, self.adapter, self.identity, self.rpc)
         self.steps = self.receiver.prepare_steps(payload['tokens'], required_capacity=self.required_capacity,
-            **({'headroom': self.capacity.remaining(), 'private': True} if concurrent else {}))
+            **({'headroom': self.capacity.remaining() + self._unadmitted_headroom(), 'private': True}
+               if concurrent else {}))
         try:
             operation, data = next(self.steps)
         except MemoryError:
@@ -303,13 +386,47 @@ class SchedulerPeer:
                              wait_polls=dict(self.poll_counts), **self.stats())
         self.restored.update(restore_id=self.restore_id, state='READY', reason=None,
                              overlap_forwards=dict(getattr(self, "overlap_forwards", {})))
+        self.restored['attempts'] = list(self.attempts)
         self.rpc.close()
-        self.phase = 'READY'
         self.deadline = None
+        req = self.request
         if getattr(self, 'concurrent', False):
-            self.request._l1_private_reservation = reservation
-        self.request._l1_consumer_release = self.finish_request
-        self.scheduler._add_request_to_queue(self.request)
+            self._detach_ready(req, reservation)
+        else:
+            self.phase = 'READY'
+            req._l1_consumer_release = self.finish_request
+        self.scheduler._add_request_to_queue(req)
+
+    def _detach_ready(self, req, reservation):
+        """Hand a READY private reservation to its request; the slot takes the next restore.
+
+        Private pages and the source ACK are settled, so the consumer owns nothing
+        that needs this peer; its unallocated growth stays reserved until admission.
+        """
+        receiver, restored = self.receiver, self.restored
+        req._l1_private_reservation = reservation
+        self.unadmitted[req.rid] = (req, max(0, self.required_capacity - len(reservation.indices)))
+        self.consumers[req.rid] = False
+        req._l1_consumer_release = lambda: self._release_detached(req, receiver, restored)
+        self.receiver = None
+        self.request = None
+        self.phase = None
+        self.required_capacity = 0
+
+    def _release_detached(self, req, receiver, restored):
+        # Same owner-thread contract as finish_request, scoped to one consumer.
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        aborted = isinstance(req.finished_reason, FINISH_ABORT) or isinstance(req.to_finish, FINISH_ABORT)
+        if not req.finished() and not aborted:
+            raise RuntimeError('L1 consumer retraction is unsupported; stop Engine')
+        receiver.finish_consumer()
+        self.unadmitted.pop(req.rid, None)
+        cancelled = self.consumers.pop(req.rid)
+        self._record_result(req.rid, dict(restored, consumer_released=receiver.pending is None,
+            state='CANCELLED' if cancelled else 'FAILED' if aborted else 'FINISHED',
+            reason='CANCELLED' if cancelled else 'GENERATION_ABORTED' if aborted else None))
+        req._l1_consumer_release = None
+        req._l1_private_reservation = None
 
     def cancel_request(self, reason='CANCELLED'):
         """No ownership is released merely because cancellation was requested."""
@@ -331,16 +448,29 @@ class SchedulerPeer:
         if self.receiver is not None:
             self.finish()
             self.rpc.close()
-        result = dict(restore_id=self.restore_id,
-                      state='CANCELLED' if reason == 'CANCELLED' else 'FAILED',
-                      reason=reason, consumer_released=True, transferred_bytes=None,
-                      wait_polls=dict(self.poll_counts))
-        self._record_result(req.rid, result)
+        result = dict(restore_id=self.restore_id, state=None, reason=reason,
+                      consumer_released=True, transferred_bytes=None,
+                      wait_polls=dict(self.poll_counts), attempts=list(self.attempts))
         self.request = None
         self.phase = None
         self.required_capacity = 0
         self.deadline = None
-        self.scheduler.finish_l1_waiting_request(req, reason)
+        self._end(req, result)
+
+    def _next_candidate(self, error):
+        """Acquire was safely rejected and the reservation discarded; try the next source."""
+        if self.receiver.pending is not None:
+            raise RuntimeError('rejected acquire retained a target reservation')
+        self.attempts.append(dict(host=self.payload['host'], port=self.payload['port'], error=error))
+        self.rpc.close()
+        self.receiver = None
+        self.candidate_index += 1
+        if self.cancel_reason or self.candidate_index == len(self.candidates):
+            self._fail_request(self.cancel_reason or 'SOURCE_REJECTED')
+            return
+        self.payload = self.candidates[self.candidate_index]
+        self.restore_id = uuid.uuid4().hex
+        self.phase = 'WAIT_CAPACITY'
 
     def finish_request(self):
         # Called before ordinary request KV/page cleanup on the same owner thread.
@@ -371,7 +501,7 @@ class SchedulerPeer:
             del self.completed_results[next(iter(self.completed_results))]
 
     def reject_request(self, req, reason):
-        # A second shared request acquires nothing and must not tear down the
+        # An invalid shared request acquires nothing and must not tear down the
         # Engine (or overwrite the active transaction's ownership).
         self._record_result(req.rid, dict(state='FAILED', reason=reason,
             consumer_released=True, transferred_bytes=0))
@@ -416,6 +546,8 @@ class SchedulerPeer:
                     future.set_result(answer)
         if self.request is not None and self.deadline is not None and time.monotonic() >= self.deadline:
             self.cancel_request('WAIT_TIMEOUT')
+        self._expire_queued()
+        self._activate_next()
         if self.phase == 'WAIT_CAPACITY':
             self._try_capacity()
         if self.request is not None and self.phase in self.poll_counts:
@@ -428,7 +560,7 @@ class SchedulerPeer:
                     self.steps.throw(exc)
                 except RemoteRejected:
                     pass
-                self._fail_request(self.cancel_reason or 'SOURCE_REJECTED')
+                self._next_candidate(str(exc))
                 return
             try:
                 self.steps.send(answer)
@@ -457,7 +589,8 @@ def scheduler_peer_rpc(scheduler, action, payload):
     if action == 'init':
         if hasattr(scheduler, '_l1_peer'):
             raise RuntimeError('Peer already initialized')
-        scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'], concurrent=options.get('concurrent', False))
+        scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'], concurrent=options.get('concurrent', False),
+                                           queue_limit=options.get('queue_limit', 16))
         result = scheduler._l1_peer.stats()
     else:
         if action not in ('listen', 'serve', 'restore', 'finish', 'stats', 'start_service', 'request_result'):

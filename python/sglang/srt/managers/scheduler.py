@@ -5251,7 +5251,7 @@ class Scheduler(
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False, *, ignore_l1=False) -> bool:
         peer = getattr(self, '_l1_peer', None)
-        if not ignore_l1 and peer is not None and (peer.source.active or peer.request is not None):
+        if not ignore_l1 and peer is not None and (peer.source.active or peer.request is not None or peer.queue):
             return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -5561,10 +5561,8 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         peer = getattr(self, '_l1_peer', None)
-        if peer is not None and peer.request is not None and (
-            recv_req.abort_all or peer.request.rid.startswith(recv_req.rid)
-        ):
-            peer.cancel_request()
+        if peer is not None:
+            peer.abort_matching(recv_req.rid, recv_req.abort_all)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

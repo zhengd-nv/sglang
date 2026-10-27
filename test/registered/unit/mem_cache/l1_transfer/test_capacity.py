@@ -49,7 +49,7 @@ class CapacityTests(unittest.TestCase):
         p = object.__new__(SchedulerPeer)
         p.concurrent = True
         p.source = NS(active={})
-        p.capacity = self.c
+        p.capacity, p.unadmitted = self.c, {}
         p.request, p.receiver, p.phase = req('shared'), None, 'WAIT_CAPACITY'
         running, fresh = req('running'), req('fresh')
         self.c.admit(running)
@@ -59,7 +59,7 @@ class CapacityTests(unittest.TestCase):
 
     def test_private_prefix_only_reserves_unallocated_tail(self):
         p = object.__new__(SchedulerPeer)
-        p.concurrent, p.capacity, p.phase = True, self.c, 'WAIT_TRANSFER'
+        p.concurrent, p.capacity, p.phase, p.unadmitted = True, self.c, 'WAIT_TRANSFER', {}
         p.source = NS(active={})
         p.request, p.required_capacity = req('shared'), 32
         p.receiver = NS(pending={'reservation': NS(indices=range(16))})
@@ -92,7 +92,7 @@ class CapacityTests(unittest.TestCase):
 
     def test_busy_target_can_reserve_without_waiting_for_engine_idle(self):
         p = object.__new__(SchedulerPeer)
-        p.concurrent, p.capacity, p.required_capacity = True, self.c, 32
+        p.concurrent, p.capacity, p.required_capacity, p.unadmitted = True, self.c, 32, {}
         p.scheduler = NS(_engine_paused=False, is_fully_idle=Mock(return_value=False))
         p.cache, p.adapter, p.identity, p.rpc_executor = self.cache, None, None, None
         p.payload = dict(host='source', port=1, tokens=list(range(16)))
@@ -107,6 +107,33 @@ class CapacityTests(unittest.TestCase):
         receiver.prepare_steps.assert_called_once_with(p.payload['tokens'], required_capacity=32,
                                                        headroom=0, private=True)
         self.assertEqual(p.phase, 'WAIT_ACQUIRE')
+
+    def test_ready_request_frees_slot_but_keeps_growth_reserved_until_admission(self):
+        p = object.__new__(SchedulerPeer)
+        p.concurrent, p.capacity, p.unadmitted, p.consumers = True, self.c, {}, {}
+        p.scheduler = NS(_add_request_to_queue=Mock())
+        p.stats = Mock(return_value={})
+        p.rpc, p.attempts, p.poll_counts, p.restore_id = Mock(), [], {}, 'id'
+        shared = p.request = req('shared')
+        p.required_capacity = 48
+        reservation = NS(indices=range(16), prefix_len=0)
+        receiver = p.receiver = Mock(pending=None)
+        p.session = {'reservation': reservation, 'transaction': None}
+        p._ready()
+        self.assertIsNone(p.request)
+        self.assertIsNone(p.receiver)
+        p.scheduler._add_request_to_queue.assert_called_once_with(shared)
+        self.assertEqual(p.reserved_headroom(), 32)
+        self.assertTrue(p.allows_request(shared))
+        self.assertFalse(p.allows_request(req('fresh', output=10)))  # 48 + 32 > 64
+        p.note_admitted(shared)
+        self.assertEqual(p.reserved_headroom(), 0)
+        shared.finished_reason, shared.to_finish = 'done', None
+        shared.finished = lambda: True
+        shared._l1_consumer_release()
+        receiver.finish_consumer.assert_called_once()
+        self.assertEqual(p.request_result('shared')['state'], 'FINISHED')
+        self.assertTrue(p.request_result('shared')['consumer_released'])
 
     def test_safe_rejection_preserves_active_request_and_prior_result(self):
         p = object.__new__(SchedulerPeer)

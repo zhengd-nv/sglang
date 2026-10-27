@@ -89,6 +89,22 @@ class RequestRestoreTests(unittest.TestCase):
                     request.generate_with_restore(engine, dict(self.arguments, **overrides), restore)
                 self.assertEqual(engine.calls, [])
 
+    def test_sources_keep_caller_order_and_each_prefix(self):
+        sources = [{'host': 'b', 'port': 2, 'prefix_tokens': 16},
+                   {'host': 'a', 'port': 1, 'prefix_tokens': 32}]
+        payload = request.restore_payload(dict(input_ids=list(range(40))),
+                                          dict(mode='nonblocking', sources=sources), 16)
+        self.assertEqual([(c['host'], len(c['tokens'])) for c in payload['candidates']],
+                         [('b', 16), ('a', 32)])
+        invalid = [dict(sources=sources),  # synchronous restore has one fixed source
+                   dict(mode='nonblocking', sources=[]),
+                   dict(mode='nonblocking', sources=sources[:1] * 2),
+                   dict(mode='nonblocking', sources=sources, prefix_tokens=16),
+                   dict(mode='nonblocking', sources=[dict(sources[0], prefix_tokens=40)])]
+        for restore in invalid:
+            with self.subTest(restore=restore), self.assertRaises(ValueError):
+                request.restore_payload(dict(input_ids=list(range(40))), restore, 16)
+
     def test_actual_generate_entry_forwards_arguments_without_recursive_restore(self):
         # Compile the real method without importing the GPU framework stack.
         tree = ast.parse((ROOT / 'python/sglang/srt/entrypoints/engine.py').read_text())

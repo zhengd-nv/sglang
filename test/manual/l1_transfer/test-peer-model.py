@@ -13,6 +13,12 @@ from pathlib import Path
 import traceback
 
 
+def cancel_phase_reached(cancel_state, stats):
+    # Concurrent targets detach READY requests from the restore slot.
+    return bool(cancel_state) and (cancel_state == stats.get('wait_state') or (
+        cancel_state == 'READY' and stats.get('ready_consumers', 0) > 0))
+
+
 def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mapping_peer_device=-1):
     os.setsid()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
@@ -62,7 +68,7 @@ def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mappi
                             try:
                                 stats = engine.l1_peer('stats')
                                 observations.append(dict(stats, latency=time.monotonic()-before))
-                                if (command.get('cancel_state') == stats.get('wait_state')
+                                if (cancel_phase_reached(command.get('cancel_state'), stats)
                                         and not cancelled.is_set()):
                                     cancelled.set()
                                     engine.loop.call_soon_threadsafe(engine.tokenizer_manager.abort_request, rid)
@@ -122,7 +128,7 @@ def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mappi
                             stats = engine.l1_peer('stats')
                             observations.append(dict(stats, elapsed=time.monotonic()-started))
                             for item in command['items']:
-                                if item.get('cancel_state') == stats['wait_state'] and not item.get('cancelled') and item.get('cancel_state'):
+                                if cancel_phase_reached(item.get('cancel_state'), stats) and not item.get('cancelled'):
                                     item['cancelled'] = True
                                     engine.tokenizer_manager.abort_request(item['rid'])
                         await asyncio.gather(*tasks)
@@ -398,6 +404,11 @@ def main():
                 if proxy is not None:
                     proxy.join(5)
                     assert not proxy.is_alive() and not errors, errors
+                # Timeouts and source misses recompute the request instead of aborting it.
+                expected = 'CANCELLED' if reason == 'CANCELLED' else 'FALLBACK'
+                assert answer['meta_info']['l1_restore']['state'] == expected, answer
+                if expected == 'FALLBACK':
+                    assert len(answer['meta_info']['output_token_logprobs']) == 24, answer['meta_info']
                 target, source = peer(1, 'stats'), peer(0, 'stats')
                 assert target['pinned_pages'] == target['imports'] == target['batches'] == 0, target
                 assert not target['target_active'] and target['wait_state'] is None, target
