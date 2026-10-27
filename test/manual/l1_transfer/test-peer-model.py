@@ -19,7 +19,7 @@ def cancel_phase_reached(cancel_state, stats):
         cancel_state == 'READY' and stats.get('ready_consumers', 0) > 0))
 
 
-def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mapping_peer_device=-1):
+def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mapping_peer_device=-1, online_source=False):
     os.setsid()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     if gpu == 1 and mapping_peer_device >= 0:
@@ -33,11 +33,12 @@ def actor(pipe, gpu, model, output, concurrent=False, deterministic=False, mappi
     engine = None
     try:
         from sglang import Engine
+        batched = concurrent and (gpu == 1 or (online_source and gpu == 0))
         engine = Engine(model_path=model, tp_size=1, dtype='bfloat16',
-                        max_running_requests=4 if concurrent and gpu == 1 else 1, max_total_tokens=4096, context_length=4096,
+                        max_running_requests=4 if batched else 1, max_total_tokens=4096, context_length=4096,
                         mem_fraction_static=0.15, page_size=128 if deterministic else 16, attention_backend='fa4' if deterministic else 'flashinfer',
                         enable_deterministic_inference=deterministic,
-                        chunked_prefill_size=128, cuda_graph_max_bs_decode=4 if concurrent and gpu == 1 else 1,
+                        chunked_prefill_size=128, cuda_graph_max_bs_decode=4 if batched else 1,
                         cuda_graph_backend_prefill='full', cuda_graph_bs_prefill=[128],
                         disable_overlap_schedule=True, port=32000+gpu, log_level='info')
         # Explicit lock permits socket migration to the observation thread;
@@ -185,6 +186,8 @@ def main():
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic FA4 for exact concurrent token comparisons')
     parser.add_argument('--concurrent', action='store_true', help='Enable target private handoff and concurrent ordinary requests')
     parser.add_argument('--lifecycle', action='store_true', help='Also validate safe failures and cancellation')
+    parser.add_argument('--online-source', action='store_true',
+                        help='Run the source as a concurrent Engine that keeps computing while leased')
     parser.add_argument('--mapping-peer-device', type=int, default=-1,
                         help='Physical local peer exposed to the target process; -1 disables guard')
     args=parser.parse_args()
@@ -192,6 +195,8 @@ def main():
         parser.error('mapping peer must be -1 or a distinct nonnegative local device')
     if args.deterministic and not args.concurrent:
         parser.error("--deterministic requires --concurrent")
+    if args.online_source and not args.deterministic:
+        parser.error('--online-source requires --concurrent --deterministic')
     if args.concurrent: args.nonblocking = True
     if args.nonblocking: args.request_restore = True
     if args.lifecycle and not args.nonblocking:
@@ -225,7 +230,7 @@ def main():
     def peer(i,action,**payload):return call(i,'peer',action=action,payload=payload)
     try:
         for gpu in range(4 if args.deterministic else 3):
-            a,b=ctx.Pipe();p=ctx.Process(target=actor,args=(b,gpu,args.model,str(out),args.concurrent,args.deterministic and gpu<3,args.mapping_peer_device))
+            a,b=ctx.Pipe();p=ctx.Process(target=actor,args=(b,gpu,args.model,str(out),args.concurrent,args.deterministic and gpu<3,args.mapping_peer_device,args.online_source))
             p.start();b.close();pipes.append(a);workers.append(p)
         for i in range(len(workers)):assert recv(i)['ready']
         if args.deterministic:
@@ -242,7 +247,7 @@ def main():
             mismatch = next((i for i, pair in enumerate(zip(cold_ids, warm_ids)) if pair[0] != pair[1]), None)
             (out/'flashinfer-no-l1-control.json').write_text(json.dumps(dict(cold=cold, warm=warm, first_mismatch=mismatch), indent=2))
             print('FLASHINFER_NO_L1_CONTROL first_mismatch=', mismatch, flush=True)
-        for i in (0,1):peer(i,'init' ,identity=identity,concurrent=args.concurrent and i==1)
+        for i in (0,1):peer(i,'init' ,identity=identity,concurrent=args.concurrent and (i==1 or args.online_source))
         mapping_config = [peer(i, 'stats').get('mapping_peer_device') for i in (0, 1)]
         assert mapping_config == [None, 1 if args.mapping_peer_device >= 0 else None]
         (out/'mapping-config.json').write_text(json.dumps(mapping_config))
@@ -380,6 +385,41 @@ def main():
                 (out/'concurrency.json').write_text(json.dumps(concurrency, indent=2))
                 print('PEER_CONCURRENT_CASE_PASS', scenario, restored.get('overlap_forwards'), flush=True)
             print('PEER_CONCURRENT_PASS cases=6', flush=True)
+        if args.online_source:
+            # The source decodes an ordinary request while the target restores its prefix.
+            background = list(tokens[:request_tokens]); background[0] = 2718
+            pipes[0].send(dict(op='concurrent_group', items=[dict(rid='online-source-decode', tokens=background, new=2048)]))
+            time.sleep(0.5)
+            online = []
+            for i in range(3):
+                assert call(1, 'flush')
+                address, proxy, errors = delayed_peer(service_address)
+                request = list(tokens[:request_tokens]) + [500 + i]
+                answer = call(1, 'generate', tokens=request, rid=f'online-shared-{i}',
+                              l1_restore=dict(source=address, prefix_tokens=prefix_tokens, mode='nonblocking'))
+                proxy.join(5)
+                assert not proxy.is_alive() and not errors, errors
+                restored = answer['meta_info']['l1_restore']
+                assert restored['state'] == 'FINISHED' and restored['transferred_bytes'] > 0, restored
+                online.append(dict(request=request, answer=answer))
+            source_actual = recv(0)
+            ids = lambda result: [x[1] for x in result['meta_info']['output_token_logprobs']]
+            observed = source_actual['observations']
+            is_leased = lambda o: o['source_leases'] + o['source_pending'] > 0
+            leased = [o for o in observed if is_leased(o)]
+            # The source kept running forwards within one held lease, not only between leases.
+            assert any(is_leased(a) and is_leased(b) and b['forward_count'] > a['forward_count']
+                       for a, b in zip(observed, observed[1:])), observed
+            assert call(2, 'flush')
+            reference = call(2, 'generate', tokens=background, new=2048)
+            assert ids(source_actual['answers'][0]['result']) == ids(reference), 'source decode changed while leased'
+            for row in online:
+                assert call(2, 'flush')
+                assert ids(row['answer']) == ids(call(2, 'generate', tokens=row['request'])), row['request'][-1]
+            source = peer(0, 'stats')
+            assert source['source_leases'] == source['source_pending'] == source['exports'] == 0, source
+            (out/'online-source.json').write_text(json.dumps(dict(source=source_actual, targets=online), indent=2))
+            print('PEER_ONLINE_SOURCE_PASS restores=3 leased_observations=', len(leased), flush=True)
         if args.lifecycle:
             lifecycle = []
             for case, cancel_state, timeout, reason in [

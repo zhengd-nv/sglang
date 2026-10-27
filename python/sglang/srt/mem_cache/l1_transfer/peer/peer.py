@@ -33,10 +33,19 @@ def plan_remote_regions(descriptors, bindings, plan, target_bindings):
 
 
 class SourceEndpoint:
-    def __init__(self, cache, adapter, identity, ready):
+    """Scheduler-thread source leases.
+
+    With ``ready`` the producer is finished synchronously inside acquire. Without
+    it, acquire is split: begin_acquire locks the tree and records the producer
+    event, and poll_ready exports and offers only after that event completes.
+    """
+    def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None):
         self.cache, self.adapter, self.ready = cache, adapter, ready
         self.contract = wire_copy(contract(identity, adapter.layout))
+        self.max_leases = max_leases
+        self.max_lease_pages = max_lease_pages
         self.active = {}
+        self.pending = {}  # request_id -> (lease, fingerprint, producer event); nothing exported
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
 
     def dispatch(self, request):
@@ -50,8 +59,17 @@ class SourceEndpoint:
             return self.release(request)
         raise RemoteRejected('unknown operation')
 
-    def acquire(self, request):
-        from sglang.srt.mem_cache.radix_cache import RadixKey
+    def dispatch_deferred(self, request, *, record_producer):
+        """Like dispatch, but acquire returns None and its offer comes from poll_ready."""
+        self.cache.source_leases._check_thread()
+        if request.get('version') != 1:
+            raise RemoteRejected('unsupported protocol version')
+        if request.get('operation') == 'acquire':
+            self.begin_acquire(request, record_producer=record_producer)
+            return None
+        return self.dispatch(request)
+
+    def _validate_acquire(self, request):
         if request.get('contract') != self.contract:
             raise RemoteRejected('incompatible model/context/layout')
         tokens = request.get('tokens')
@@ -62,18 +80,60 @@ class SourceEndpoint:
         request_id = request.get('id')
         if not isinstance(request_id, str) or len(request_id) != 32:
             raise RemoteRejected('invalid request ID')
-        fingerprint = digest({'contract': self.contract, 'tokens': tokens})
+        if request_id in self.released:
+            raise RemoteRejected('request already released')
+        if request_id in self.pending:
+            raise RemoteRejected('request ID already pending')
+        return tokens, request_id, digest({'contract': self.contract, 'tokens': tokens})
+
+    def _check_quota(self, tokens):
+        leases = list(self.active.values()) + [{'lease': p[0]} for p in self.pending.values()]
+        if self.max_leases is not None and len(leases) >= self.max_leases:
+            raise RemoteRejected('source busy: lease quota')
+        if self.max_lease_pages is not None:
+            pages = len(tokens) // self.adapter.layout.page_size
+            held = sum(len(item['lease'].page_indices) for item in leases)
+            if held + pages > self.max_lease_pages:
+                raise RemoteRejected('source busy: leased page quota')
+
+    def _lock(self, tokens, fingerprint, ready):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        try:
+            return self.cache.acquire_source_lease(RadixKey(array('q', tokens)), fingerprint=fingerprint, ready=ready)
+        except ValueError as exc:
+            raise RemoteRejected(str(exc)) from exc
+
+    def acquire(self, request):
+        tokens, request_id, fingerprint = self._validate_acquire(request)
         if request_id in self.active:
             entry = self.active[request_id]
             if entry['receipt']['fingerprint'] != fingerprint:
                 raise RemoteRejected('request ID reused with different prefix')
             return entry['offer']
-        if request_id in self.released:
-            raise RemoteRejected('request already released')
-        try:
-            lease = self.cache.acquire_source_lease(RadixKey(array('q', tokens)), fingerprint=fingerprint, ready=self.ready)
-        except ValueError as exc:
-            raise RemoteRejected(str(exc)) from exc
+        self._check_quota(tokens)
+        return self._offer(request_id, self._lock(tokens, fingerprint, self.ready), fingerprint)
+
+    def begin_acquire(self, request, *, record_producer):
+        """Lock the prefix and record the producer event; the offer follows in poll_ready."""
+        tokens, request_id, fingerprint = self._validate_acquire(request)
+        if request_id in self.active:
+            raise RemoteRejected('request ID already acquired')
+        self._check_quota(tokens)
+        events = []
+        lease = self._lock(tokens, fingerprint, lambda: events.append(record_producer()))
+        self.pending[request_id] = (lease, fingerprint, events[0])
+        return request_id
+
+    def poll_ready(self):
+        """Return [(request_id, offer)] whose producer work has completed."""
+        done = [rid for rid, (_, _, event) in self.pending.items() if event.query()]
+        offers = []
+        for rid in done:
+            lease, fingerprint, _ = self.pending.pop(rid)
+            offers.append((rid, self._offer(rid, lease, fingerprint)))
+        return offers
+
+    def _offer(self, request_id, lease, fingerprint):
         exports = []
         try:
             for h in self.adapter.memories:

@@ -45,7 +45,7 @@ class AsyncRPC:
 
 
 class SourceService:
-    """One connection / lease at a time, persistent across request consumers.
+    """One thread per connection; each connection carries one acquire/release exchange.
 
     Each dispatch is handed to the cache owner via a bounded queue. A worker
     timeout is an error report, never permission to reclaim the source lease.
@@ -53,33 +53,39 @@ class SourceService:
     """
     def __init__(self, listener):
         self.listener = listener
-        self.events = Queue(maxsize=4)
+        self.events = Queue(maxsize=64)
         listener.settimeout(None)
         threading.Thread(target=self._run, name='l1-source', daemon=True).start()
 
     def _run(self):
         while True:
             conn, _ = self.listener.accept()
-            service = self
+            threading.Thread(target=self._serve, args=(conn,), name='l1-source-conn', daemon=True).start()
 
-            class Dispatch:
-                acquired = False
+    def _serve(self, conn):
+        service = self
 
-                def dispatch(self, request):
-                    future = Future()
-                    service.events.put(('request', request, future))
-                    result = future.result(timeout=120)
-                    self.acquired = request.get('operation') == 'acquire'
-                    return result
+        class Dispatch:
+            lease_id = None
 
-            endpoint = Dispatch()
-            try:
-                with conn:
-                    conn.settimeout(120)
+            def dispatch(self, request):
+                future = Future()
+                service.events.put(('request', request, future))
+                result = future.result(timeout=120)
+                if request.get('operation') == 'acquire':
+                    # The RPC id of an acquire is the lease request id.
+                    self.lease_id = request.get('id')
+                return result
+
+        endpoint = Dispatch()
+        try:
+            with conn:
+                conn.settimeout(120)
+                serve_once(conn, endpoint)
+                if endpoint.lease_id is not None:
                     serve_once(conn, endpoint)
-                    if endpoint.acquired:
-                        serve_once(conn, endpoint)
-            except BaseException as exc:
-                self.events.put(('error', exc, None))
-            finally:
-                self.events.put(('closed', None, None))
+        except BaseException as exc:
+            self.events.put(('error', exc, None))
+        finally:
+            # The owner checks that this connection's lease was released.
+            self.events.put(('closed', endpoint.lease_id, None))

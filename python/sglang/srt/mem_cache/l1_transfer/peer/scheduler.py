@@ -39,7 +39,8 @@ def _mapping_peer_device(device):
 
 
 class SchedulerPeer:
-    def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16):
+    def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
+                 source_max_leases=4, source_max_lease_fraction=0.5):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
@@ -49,6 +50,11 @@ class SchedulerPeer:
             raise ValueError('concurrent must be boolean')
         if type(queue_limit) is not int or queue_limit < 0:
             raise ValueError('queue_limit must be a nonnegative integer')
+        if type(source_max_leases) is not int or source_max_leases < 1:
+            raise ValueError('source_max_leases must be a positive integer')
+        if (type(source_max_lease_fraction) not in (int, float)
+                or not 0 < source_max_lease_fraction <= 1):
+            raise ValueError('source_max_lease_fraction must be in (0, 1]')
         if concurrent and not scheduler.is_generation:
             raise ValueError('concurrent L1 requires a generation Engine')
         if concurrent and (not args.disable_overlap_schedule or scheduler.enable_priority_preemption):
@@ -62,13 +68,22 @@ class SchedulerPeer:
         from .capacity import RequestCapacity
         self.capacity = RequestCapacity(self.cache) if concurrent else None
         self.overlap_forwards = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
+        self.forward_count = 0
         device = scheduler.tp_worker.model_runner.gpu_id
         self.mapping_peer_device = _mapping_peer_device(device)
         self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device)
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
-        self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
+        if concurrent:
+            # Online source: lock and record the producer event, offer once it completes.
+            allocator = self.cache.token_to_kv_pool_allocator
+            self.source = SourceEndpoint(self.cache, self.adapter, self.identity, None,
+                max_leases=source_max_leases,
+                max_lease_pages=int(allocator.size // allocator.page_size * source_max_lease_fraction))
+        else:
+            self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
+        self.source_waiters = {}  # request_id -> acquire Future awaiting the producer event
         self.receiver = None
         self.listener = None
         self.service = None
@@ -99,7 +114,9 @@ class SchedulerPeer:
 
     def stats(self):
         allocator = self.cache.token_to_kv_pool_allocator
-        result = dict(wait_state=getattr(self, "phase", None), source_leases=len(self.source.active), target_active=self.receiver is not None,
+        result = dict(wait_state=getattr(self, "phase", None), source_leases=len(self.source.active),
+                    source_pending=len(self.source.pending), target_active=self.receiver is not None,
+                    forward_count=self.forward_count,
                     exports=len(self.engine._exports), imports=sum(m.public.remote for m in self.engine._memories.values()),
                     batches=len(self.engine._batches), available_tokens=allocator.available_size(),
                     pinned_pages=sum(getattr(allocator, '_l1_pinned_pages', {}).values()),
@@ -119,7 +136,7 @@ class SchedulerPeer:
             raise RuntimeError('listener already open')
         self.listener = socket.socket()
         self.listener.bind((host, port))
-        self.listener.listen(1)
+        self.listener.listen(16)
         self.listener.settimeout(120)
         return dict(host=host, port=self.listener.getsockname()[1])
 
@@ -200,8 +217,10 @@ class SchedulerPeer:
 
     @property
     def blocks_compute(self):
-        return bool(self.source.active) or (not getattr(self, 'concurrent', False) and
-            self.phase in ('WAIT_ACQUIRE', 'WAIT_TRANSFER', 'WAIT_RELEASE'))
+        # Leased pages are complete tree pages; concurrent forwards only write other pages.
+        if getattr(self, 'concurrent', False):
+            return False
+        return bool(self.source.active) or self.phase in ('WAIT_ACQUIRE', 'WAIT_TRANSFER', 'WAIT_RELEASE')
 
     def allows_request(self, req):
         # Capacity waiting owns no pages. Once reserved, no unrelated request
@@ -233,6 +252,7 @@ class SchedulerPeer:
             self.unadmitted.pop(req.rid, None)
 
     def note_forward(self, batch):
+        self.forward_count += 1
         if getattr(self, 'concurrent', False) and self.phase in self.overlap_forwards:
             self.overlap_forwards[self.phase] += 1
 
@@ -270,7 +290,9 @@ class SchedulerPeer:
         self._activate_next()
 
     def _can_activate(self):
-        return self.request is None and self.receiver is None and not self.source.active
+        # The serial entry never overlaps target and source ownership.
+        return self.request is None and self.receiver is None and (
+            getattr(self, 'concurrent', False) or not self.source.active)
 
     def _activate_next(self):
         if not self.queue or not self._can_activate():
@@ -521,29 +543,50 @@ class SchedulerPeer:
             logger.exception('L1_PEER ownership uncertain; stopping scheduler')
             os._exit(70)
 
-    def _pump(self):
-        if getattr(self, 'concurrent', False):
-            self.capacity.prune()
-        if self.service is not None:
-            # Bound each turn; network threads never touch cache or CUDA.
-            for _ in range(4):
-                try:
-                    kind, data, future = self.service.events.get_nowait()
-                except Empty:
-                    break
-                if kind != 'request':
-                    if self.source.active:
-                        raise RuntimeError('source connection ended with outstanding lease')
-                    continue
-                try:
+    def _record_producer(self):
+        # Without overlap, forwards that wrote tree KV ran on schedule_stream.
+        event = torch.cuda.Event()
+        event.record(self.scheduler.schedule_stream)
+        return event
+
+    def _serve_source_events(self):
+        concurrent = getattr(self, 'concurrent', False)
+        # Bound each turn; network threads never touch cache or CUDA.
+        for _ in range(16):
+            try:
+                kind, data, future = self.service.events.get_nowait()
+            except Empty:
+                break
+            if kind == 'error':
+                logger.warning('L1 source connection error: %r', data)
+                continue
+            if kind == 'closed':
+                if data is not None and (data in self.source.active or data in self.source.pending):
+                    raise RuntimeError('source connection ended with outstanding lease')
+                continue
+            try:
+                if not concurrent:
                     if data.get('operation') == 'acquire' and (
                             self.source.active or self.receiver is not None or not self.scheduler.is_fully_idle()):
                         raise RemoteRejected('source Engine is busy')
                     answer = self.source.dispatch(data)
-                except RemoteRejected as exc:
-                    future.set_exception(exc)
+                else:
+                    answer = self.source.dispatch_deferred(data, record_producer=self._record_producer)
+            except RemoteRejected as exc:
+                future.set_exception(exc)
+            else:
+                if answer is None:
+                    self.source_waiters[data['id']] = future
                 else:
                     future.set_result(answer)
+        for request_id, offer in self.source.poll_ready():
+            self.source_waiters.pop(request_id).set_result(offer)
+
+    def _pump(self):
+        if getattr(self, 'concurrent', False):
+            self.capacity.prune()
+        if self.service is not None:
+            self._serve_source_events()
         if self.request is not None and self.deadline is not None and time.monotonic() >= self.deadline:
             self.cancel_request('WAIT_TIMEOUT')
         self._expire_queued()
@@ -590,7 +633,8 @@ def scheduler_peer_rpc(scheduler, action, payload):
         if hasattr(scheduler, '_l1_peer'):
             raise RuntimeError('Peer already initialized')
         scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'], concurrent=options.get('concurrent', False),
-                                           queue_limit=options.get('queue_limit', 16))
+                                           **{k: options[k] for k in ('queue_limit', 'source_max_leases',
+                                                                      'source_max_lease_fraction') if k in options})
         result = scheduler._l1_peer.stats()
     else:
         if action not in ('listen', 'serve', 'restore', 'finish', 'stats', 'start_service', 'request_result'):

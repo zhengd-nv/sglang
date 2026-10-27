@@ -5251,7 +5251,7 @@ class Scheduler(
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False, *, ignore_l1=False) -> bool:
         peer = getattr(self, '_l1_peer', None)
-        if not ignore_l1 and peer is not None and (peer.source.active or peer.request is not None or peer.queue):
+        if not ignore_l1 and peer is not None and (peer.source.active or peer.source.pending or peer.request is not None or peer.queue):
             return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;

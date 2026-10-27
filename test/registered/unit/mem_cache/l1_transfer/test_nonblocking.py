@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import socket
+from queue import Queue
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
@@ -8,6 +9,8 @@ from unittest.mock import Mock
 from sglang.srt.mem_cache.l1_transfer.peer.nonblocking import AsyncRPC, SourceService
 from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, scheduler_peer_rpc
 from sglang.srt.mem_cache.l1_transfer.peer.restore import RestoreState
+from sglang.srt.mem_cache.l1_transfer.peer.control import RemoteRejected
+from sglang.srt.mem_cache.l1_transfer.peer.peer import SourceEndpoint
 
 
 class NonblockingTests(unittest.TestCase):
@@ -94,6 +97,81 @@ class NonblockingTests(unittest.TestCase):
             rpc.close()
         # Listener belongs to the process-lifetime daemon; avoid closing a live
         # accept from another thread. It is reclaimed when the test process exits.
+
+    def test_service_accepts_overlapping_connections(self):
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0)); listener.listen(4)
+        service = SourceService(listener)
+        rpcs = [AsyncRPC(*listener.getsockname()) for _ in range(2)]
+        futures = [rpc.submit('acquire', {'tokens': [i]}) for i, rpc in enumerate(rpcs)]
+        # Both acquires reach the owner before either is answered.
+        pending = [service.events.get(timeout=2) for _ in rpcs]
+        self.assertEqual(sorted(e[1]['tokens'] for e in pending), [[0], [1]])
+        for _, request, result in pending:
+            result.set_exception(RemoteRejected('miss'))
+        for future in futures:
+            with self.assertRaises(RemoteRejected):
+                future.result(timeout=2)
+        closed = [service.events.get(timeout=2) for _ in rpcs]
+        self.assertEqual([(kind, lease) for kind, lease, _ in closed], [('closed', None)] * 2)
+        for rpc in rpcs:
+            rpc.close()
+
+    def online_source(self, *, max_leases=2, max_lease_pages=3):
+        source = object.__new__(SourceEndpoint)
+        source.contract = {'model': 'm'}
+        source.ready, source.max_leases, source.max_lease_pages = None, max_leases, max_lease_pages
+        source.active, source.pending, source.released = {}, {}, {}
+        source.adapter = SimpleNamespace(layout=SimpleNamespace(page_size=2), memories=[SimpleNamespace(region_id='r')],
+                                         capacity=8, bindings={}, engine=Mock())
+        source.adapter.engine.export_memory.return_value = SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')
+        def acquire_source_lease(key, *, fingerprint, ready):
+            ready()
+            return SimpleNamespace(page_indices=tuple(range(len(key) // 2)), incarnation='i', epoch=0, lease_id='l')
+        source.cache = SimpleNamespace(source_leases=SimpleNamespace(_check_thread=lambda: None),
+                                       acquire_source_lease=Mock(side_effect=acquire_source_lease))
+        return source
+
+    @staticmethod
+    def acquire(rid, tokens=4):
+        return dict(version=1, operation='acquire', id=rid * 32, contract={'model': 'm'}, tokens=list(range(tokens)))
+
+    def test_online_source_offers_only_after_producer_event(self):
+        source = self.online_source()
+        event = Mock()
+        event.query.return_value = False
+        self.assertIsNone(source.dispatch_deferred(self.acquire('a'), record_producer=lambda: event))
+        self.assertEqual(source.poll_ready(), [])
+        source.adapter.engine.export_memory.assert_not_called()  # no descriptor before KV is written
+        event.query.return_value = True
+        [(rid, offer)] = source.poll_ready()
+        self.assertEqual((rid, offer['pages']), ('a' * 32, [0, 1]))
+        self.assertIn(rid, source.active)
+        self.assertFalse(source.pending)
+
+    def test_source_quota_rejects_before_locking(self):
+        source = self.online_source()
+        done = Mock(query=Mock(return_value=False))
+        source.dispatch_deferred(self.acquire('a'), record_producer=lambda: done)
+        with self.assertRaisesRegex(RemoteRejected, 'page quota'):
+            source.dispatch_deferred(self.acquire('b'), record_producer=lambda: done)
+        source.dispatch_deferred(self.acquire('c', tokens=2), record_producer=lambda: done)
+        with self.assertRaisesRegex(RemoteRejected, 'lease quota'):
+            source.dispatch_deferred(self.acquire('d', tokens=2), record_producer=lambda: done)
+        self.assertEqual(source.cache.acquire_source_lease.call_count, 2)
+
+    def test_closed_connection_checks_only_its_own_lease(self):
+        peer = self.peer()
+        peer.concurrent, peer.source_waiters = True, {}
+        peer.source = SimpleNamespace(active={'live': 1}, pending={}, poll_ready=lambda: [])
+        peer.service = SimpleNamespace(events=Queue())
+        self.assertFalse(peer.blocks_compute)  # an online source keeps computing
+        peer.service.events.put(('closed', 'released-earlier', None))
+        peer.service.events.put(('closed', None, None))
+        peer._serve_source_events()
+        peer.service.events.put(('closed', 'live', None))
+        with self.assertRaisesRegex(RuntimeError, 'outstanding lease'):
+            peer._serve_source_events()
 
 
 if __name__ == '__main__':

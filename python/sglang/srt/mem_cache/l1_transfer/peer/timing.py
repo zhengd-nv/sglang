@@ -75,8 +75,9 @@ def install(peer):
 
     for name in ('start_request', '_ready', 'finish', 'finish_request'):
         wrap(peer, name, 'target.' + name, name == 'finish_request')
-    for name in ('acquire', 'release', 'ready'):
-        wrap(peer.source, name, 'source.' + name, name == 'release')
+    for name in ('acquire', 'release', 'ready', 'begin_acquire', 'poll_ready'):
+        if getattr(peer.source, name) is not None:  # ready is None for an online source
+            wrap(peer.source, name, 'source.' + name, name == 'release')
     wrap(peer.cache.source_leases, 'acquire', 'source.lease')
     for name in ('__init__', 'publish', 'release', '_set_pins'):
         wrap(TargetReservation, name, 'reservation.' + name)
