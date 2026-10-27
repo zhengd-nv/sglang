@@ -279,8 +279,9 @@ class SchedulerPeer:
         from .request import restore_payload
         if not self.scheduler.server_args.disable_overlap_schedule:
             raise ValueError('nonblocking peer requires disable_overlap_schedule')
-        payload = restore_payload(dict(input_ids=list(req.origin_input_ids)), options,
-                                  self.scheduler.server_args.page_size)
+        # Raw server_args.page_size is None unless set explicitly; the allocator holds the resolved size.
+        page = self.cache.token_to_kv_pool_allocator.page_size
+        payload = restore_payload(dict(input_ids=list(req.origin_input_ids)), options, page)
         if getattr(self, 'concurrent', False):
             self.capacity.bound(req)  # reject unbudgeted beam expansion before ownership
             if req._compute_max_prefix_len(len(req.origin_input_ids)) < max(
@@ -289,7 +290,6 @@ class SchedulerPeer:
         output = req.sampling_params.max_new_tokens
         if type(output) is not int or output < 0:
             raise ValueError('serialized sharing requires a bounded max_new_tokens')
-        page = self.scheduler.server_args.page_size
         required = (len(req.origin_input_ids) + output + page - 1) // page * page
         if required > self.cache.token_to_kv_pool_allocator.size:
             self._end_unstarted(req, 'CAPACITY_EXCEEDED')

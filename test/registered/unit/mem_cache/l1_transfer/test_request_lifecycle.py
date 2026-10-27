@@ -16,10 +16,10 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.peer = p = object.__new__(SchedulerPeer)
         p.scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(disable_overlap_schedule=True, page_size=16),
+            server_args=SimpleNamespace(disable_overlap_schedule=True, page_size=None),  # unset: resolved later
             _engine_paused=False, is_fully_idle=Mock(return_value=True),
             _add_request_to_queue=Mock(), finish_l1_waiting_request=Mock())
-        p.cache = SimpleNamespace(token_to_kv_pool_allocator=SimpleNamespace(size=128))
+        p.cache = SimpleNamespace(token_to_kv_pool_allocator=SimpleNamespace(size=128, page_size=16))
         p.adapter = p.identity = p.rpc_executor = None
         p.engine = SimpleNamespace(device=0)
         p.source = SimpleNamespace(active={})
