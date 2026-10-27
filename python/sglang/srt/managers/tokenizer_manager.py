@@ -2839,6 +2839,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """Accumulate metadata; subclasses may use finish_reason for terminal data."""
         for key, values in customized_info.items():
+            # Mixed batches pad a request that has no request-level value with [];
+            # that padding must not surface as an empty field in its meta_info.
+            if not values[index] and key not in state.customized_info_accumulated:
+                continue
             self._accumulate_request_meta_info(
                 meta_info,
                 state,

@@ -263,6 +263,24 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             {key: [[], [386.25]]},
         )
 
+    def test_padded_request_level_value_does_not_reach_other_requests_meta_info(self):
+        """A request batched with one that has a request-level value must not get an empty field."""
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        manager = SimpleNamespace(
+            _accumulate_request_meta_info=TokenizerManager._accumulate_request_meta_info
+        )
+        info = {"l1_restore": [[], [{"state": "FINISHED"}]]}
+        metas = []
+        for index in range(2):
+            meta, state = {}, SimpleNamespace(customized_info_accumulated={})
+            TokenizerManager.update_request_meta_info(
+                manager, meta, state, info, index, None
+            )
+            metas.append(meta)
+        self.assertNotIn("l1_restore", metas[0])
+        self.assertEqual(metas[1]["l1_restore"], [{"state": "FINISHED"}])
+
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
