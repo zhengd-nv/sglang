@@ -175,6 +175,14 @@ class Memory(msgspec.Struct):
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    l1_config: A[
+        Optional[str],
+        "Experimental L1 peer KV sharing for TP1 Engines with --disable-overlap-schedule. "
+        "A JSON object, or '@' followed by a JSON file path, with keys: identity (required), "
+        "concurrent, service_host, service_port, queue_limit, source_max_leases, "
+        "source_max_lease_fraction. The scheduler initializes the peer and starts its "
+        "source service before serving.",
+    ] = None
     hicache_storage_prefetch_retry_poll_interval: A[
         int,
         Arg(

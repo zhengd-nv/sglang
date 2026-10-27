@@ -1920,8 +1920,16 @@ class Scheduler(
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
+            self.maybe_init_l1_peer()
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
+
+    def maybe_init_l1_peer(self):
+        """Start the experimental L1 peer from --l1-config on the event-loop thread."""
+        if self.server_args.l1_config is not None:
+            from sglang.srt.mem_cache.l1_transfer.peer.scheduler import init_scheduler_peer_from_config
+
+            self._l1_peer = init_scheduler_peer_from_config(self, self.server_args.l1_config)
 
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.

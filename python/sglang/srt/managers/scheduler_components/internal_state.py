@@ -55,12 +55,19 @@ class SchedulerInternalStateController:
             self._add_step_times,
             self._add_rust_server,
             self._add_env_vars,
+            self._add_l1_peer,
         ):
             contribute(state)
         # A bound signal handler is not msgpack-serializable, and no reader
         # consumes it.
         state.pop("custom_sigquit_handler", None)
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
+
+    def _add_l1_peer(self, state: Dict[str, Any]) -> None:
+        # Like the other L1 hooks, _l1_peer exists only once the peer is initialized.
+        peer = getattr(self.scheduler, "_l1_peer", None)
+        if peer is not None:
+            state["l1_peer"] = peer.endpoint_info()
 
     def _add_topology(self, state: Dict[str, Any]) -> None:
         scheduler = self.scheduler

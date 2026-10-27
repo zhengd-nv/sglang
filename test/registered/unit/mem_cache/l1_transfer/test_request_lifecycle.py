@@ -28,7 +28,7 @@ class LifecycleTests(unittest.TestCase):
         p.required_capacity = 0
         p.queue, p.queue_limit, p.unadmitted, p.consumers = deque(), 1, {}, {}
         p.stats = Mock(return_value={'target_active': False, 'pinned_pages': 0})
-        self.req = SimpleNamespace(rid='r1', origin_input_ids=list(range(23)),
+        self.req = SimpleNamespace(rid='r1', origin_input_ids=list(range(23)), customized_info=None,
                                    sampling_params=SimpleNamespace(max_new_tokens=8))
         self.options = dict(source={'host':'source', 'port':1234}, prefix_tokens=16,
                             mode='nonblocking', wait_timeout_ms=30000)
@@ -71,6 +71,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(p.request_result(req.rid)['state'], 'FALLBACK')
         self.assertEqual(p.request_result(req.rid)['reason'], reason)
         self.assertTrue(p.request_result(req.rid)['consumer_released'])
+        # HTTP callers only see the outcome through the request's own output.
+        self.assertEqual(req.customized_info['l1_restore'][0]['reason'], reason)
         p.scheduler._add_request_to_queue.assert_called_once_with(req)
         p.scheduler.finish_l1_waiting_request.assert_not_called()
 
@@ -101,7 +103,7 @@ class LifecycleTests(unittest.TestCase):
         self.assert_terminal('CAPACITY_EXCEEDED')
 
     def other(self, rid):
-        return SimpleNamespace(rid=rid, origin_input_ids=list(range(23)),
+        return SimpleNamespace(rid=rid, origin_input_ids=list(range(23)), customized_info=None,
                                sampling_params=SimpleNamespace(max_new_tokens=8))
 
     def test_second_request_queues_in_fifo_order_without_replacing_first(self):

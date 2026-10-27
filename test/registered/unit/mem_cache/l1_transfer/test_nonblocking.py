@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.srt.mem_cache.l1_transfer.peer.nonblocking import AsyncRPC, SourceService
-from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, scheduler_peer_rpc
+from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, parse_l1_config, scheduler_peer_rpc
 from sglang.srt.mem_cache.l1_transfer.peer.restore import RestoreState
 from sglang.srt.mem_cache.l1_transfer.peer.control import RemoteRejected
 from sglang.srt.mem_cache.l1_transfer.peer.peer import SourceEndpoint
@@ -98,6 +98,16 @@ class NonblockingTests(unittest.TestCase):
         # Listener belongs to the process-lifetime daemon; avoid closing a live
         # accept from another thread. It is reclaimed when the test process exits.
 
+    def test_unreachable_source_is_a_safe_rejection(self):
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        address = listener.getsockname()
+        listener.close()  # nothing listens: connect is refused before any request is sent
+        rpc = AsyncRPC(*address)
+        with self.assertRaises(RemoteRejected):
+            rpc.submit('acquire', {'tokens': [1]}).result(timeout=5)
+        rpc.close()
+
     def test_service_accepts_overlapping_connections(self):
         listener = socket.socket()
         listener.bind(('127.0.0.1', 0)); listener.listen(4)
@@ -172,6 +182,15 @@ class NonblockingTests(unittest.TestCase):
         peer.service.events.put(('closed', 'live', None))
         with self.assertRaisesRegex(RuntimeError, 'outstanding lease'):
             peer._serve_source_events()
+
+    def test_l1_config_accepts_file_and_rejects_unknown_keys(self):
+        import json, tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+            json.dump({'identity': {}, 'concurrent': True, 'service_port': 31000}, f); f.flush()
+            self.assertEqual(parse_l1_config('@' + f.name)['service_port'], 31000)
+        for text in ('{"concurrent": true}', '{"identity": {}, "source_max_lease": 2}', '[]'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_l1_config(text)
 
 
 if __name__ == '__main__':

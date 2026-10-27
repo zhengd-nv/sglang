@@ -12,7 +12,7 @@ from queue import Empty
 
 import torch
 
-from .control import ModelIdentity, SocketRPC, serve_once, RemoteRejected
+from .control import ModelIdentity, SocketRPC, digest, serve_once, RemoteRejected
 from .nonblocking import AsyncRPC, SourceService
 from .peer import PeerReceiver, SourceEndpoint
 from .restore import RestoreState
@@ -87,6 +87,7 @@ class SchedulerPeer:
         self.receiver = None
         self.listener = None
         self.service = None
+        self.service_address = None
         self.request = None
         self.phase = None
         self.completed = None
@@ -261,7 +262,13 @@ class SchedulerPeer:
             raise ValueError('nonblocking peer requires disable_overlap_schedule')
         address = self.listen(host, port)
         self.service = SourceService(self.listener)
+        self.service_address = address
         return address
+
+    def endpoint_info(self):
+        """What a router or peer needs to address and check this source."""
+        return dict(service=self.service_address, contract_digest=digest(self.source.contract),
+                    concurrent=self.concurrent, stats=self.stats())
 
     def start_request(self, req, options):
         from .request import restore_payload
@@ -335,7 +342,7 @@ class SchedulerPeer:
             self.scheduler.finish_l1_waiting_request(req, reason)
         else:
             result['state'] = 'FALLBACK'
-            self._record_result(req.rid, result)
+            self._publish_result(req, result)
             self.scheduler._add_request_to_queue(req)
 
     def abort_matching(self, rid, abort_all):
@@ -444,7 +451,7 @@ class SchedulerPeer:
         receiver.finish_consumer()
         self.unadmitted.pop(req.rid, None)
         cancelled = self.consumers.pop(req.rid)
-        self._record_result(req.rid, dict(restored, consumer_released=receiver.pending is None,
+        self._publish_result(req, dict(restored, consumer_released=receiver.pending is None,
             state='CANCELLED' if cancelled else 'FAILED' if aborted else 'FINISHED',
             reason='CANCELLED' if cancelled else 'GENERATION_ABORTED' if aborted else None))
         req._l1_consumer_release = None
@@ -500,9 +507,8 @@ class SchedulerPeer:
         aborted = isinstance(self.request.finished_reason, FINISH_ABORT) or isinstance(self.request.to_finish, FINISH_ABORT)
         if not self.request.finished() and not aborted:
             raise RuntimeError('L1 consumer retraction is unsupported; stop Engine')
-        rid = self.request.rid
         released = self.finish()
-        self._record_result(rid, dict(self.restored, consumer_released=(
+        self._publish_result(self.request, dict(self.restored, consumer_released=(
             not released['target_active'] and released['pinned_pages'] == 0),
             state=('CANCELLED' if self.cancel_reason == 'CANCELLED' else
                    'FAILED' if aborted or self.cancel_reason else 'FINISHED'),
@@ -513,6 +519,11 @@ class SchedulerPeer:
         self.phase = None
         self.required_capacity = 0
         self.deadline = None
+
+    def _publish_result(self, req, result):
+        # Request-level customized_info reaches meta_info['l1_restore'] of the final output.
+        self._record_result(req.rid, result)
+        req.customized_info = {**(req.customized_info or {}), 'l1_restore': [result]}
 
     def _record_result(self, rid, result):
         self.completed = (rid, result)
@@ -622,6 +633,32 @@ class SchedulerPeer:
                 self.phase = 'WAIT_RELEASE'
             elif state != RestoreState.IN_FLIGHT:
                 raise RuntimeError(f'restore did not publish: {state}')
+
+
+L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
+                  'source_max_leases', 'source_max_lease_fraction'}
+
+
+def parse_l1_config(text):
+    """--l1-config: a JSON object, or '@' followed by a JSON file path."""
+    if text.startswith('@'):
+        with open(text[1:]) as f:
+            text = f.read()
+    config = json.loads(text)
+    if not isinstance(config, dict) or 'identity' not in config or set(config) - L1_CONFIG_KEYS:
+        raise ValueError(f'--l1-config requires identity and only keys {sorted(L1_CONFIG_KEYS)}')
+    return config
+
+
+def init_scheduler_peer_from_config(scheduler, text):
+    """Build the peer on the scheduler thread and start its source service."""
+    config = parse_l1_config(text)
+    peer = SchedulerPeer(scheduler, config['identity'], concurrent=config.get('concurrent', False),
+                         **{k: config[k] for k in ('queue_limit', 'source_max_leases',
+                                                   'source_max_lease_fraction') if k in config})
+    address = peer.start_service(config.get('service_host', '127.0.0.1'), config.get('service_port', 0))
+    logger.info('L1_PEER_SERVICE %s', address)
+    return peer
 
 
 def scheduler_peer_rpc(scheduler, action, payload):

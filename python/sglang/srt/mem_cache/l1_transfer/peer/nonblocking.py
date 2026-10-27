@@ -5,7 +5,7 @@ from queue import Queue
 import socket
 import threading
 
-from .control import SocketRPC, serve_once
+from .control import RemoteRejected, SocketRPC, serve_once
 
 
 class AsyncRPC:
@@ -19,7 +19,11 @@ class AsyncRPC:
 
     def _call(self, operation, payload):
         if self.connection is None:
-            self.connection = socket.create_connection(self.address, timeout=120)
+            try:
+                self.connection = socket.create_connection(self.address, timeout=120)
+            except OSError as exc:
+                # Nothing was sent, so the source cannot hold a lease for this request.
+                raise RemoteRejected(f'source unreachable: {exc}') from exc
             self.rpc = SocketRPC(self.connection)
         return self.rpc.call(operation, **payload)
 

@@ -24,7 +24,7 @@ sha256sum "$repo/python/sglang/srt/mem_cache/l1_transfer/"*.py \
     "$repo/python/sglang/srt/mem_cache/l1_transfer/peer/"*.py \
     "$repo/python/sglang/srt/mem_cache/l1_transfer/transport/"*.* \
     "$repo/python/sglang/srt/mem_cache/"{source_lease,target_reservation}.py \
-    "$here/test-peer-model.py" "$here/run-peer-model.sh" > "$run/source-sha256.txt"
+    "$here/test-peer-model.py" "$here/test-http-multi.py" "$here/run-peer-model.sh" > "$run/source-sha256.txt"
 if [[ -f "$repo/.source-commit" ]]; then
     cp "$repo/.source-commit" "$run/sglang-commit.txt"
 else
@@ -50,4 +50,5 @@ if [[ " $* " == *" --concurrent "* ]]; then
     python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_source_lease.py' -v
     python -m unittest discover -s "$repo/test/registered/unit/mem_cache" -p 'test_target_reservation.py' -v
 fi
-python "$here/test-peer-model.py" --model "$model" --output "$run" "$@"
+# L1_PEER_TEST selects another driver (e.g. test-http-multi.py) under the same environment.
+python "$here/${L1_PEER_TEST:-test-peer-model.py}" --model "$model" --output "$run" "$@"

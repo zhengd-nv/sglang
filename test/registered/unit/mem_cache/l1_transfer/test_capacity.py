@@ -7,7 +7,7 @@ from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer
 
 
 def req(rid, prompt=23, output=9, allocated=0):
-    return NS(rid=rid, origin_input_ids=list(range(prompt)),
+    return NS(rid=rid, origin_input_ids=list(range(prompt)), customized_info=None,
               sampling_params=NS(max_new_tokens=output),
               kv=NS(kv_allocated_len=allocated), finished=lambda: False)
 
