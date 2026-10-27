@@ -83,7 +83,7 @@ class CapacityTests(unittest.TestCase):
     def test_copy_waits_for_prior_schedule_stream_before_concurrent_forward(self):
         p = object.__new__(SchedulerPeer)
         p.concurrent = True
-        p.cancel_reason = None
+        p.cancel_reason, p.receiver = None, None
         p.scheduler = NS(schedule_stream=NS(cuda_stream=123))
         tx = Mock()
         p._prepared({'transaction': tx})
