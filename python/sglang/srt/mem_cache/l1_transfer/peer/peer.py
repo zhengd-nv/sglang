@@ -46,6 +46,9 @@ class SourceEndpoint:
         self.max_lease_pages = max_lease_pages
         self.active = {}
         self.pending = {}  # request_id -> (lease, fingerprint, producer event); nothing exported
+        # Per-endpoint constant offer fields, built on first use; regions vary only by lease_id.
+        self._static_offer = None
+        self._region_templates = None
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
 
     def dispatch(self, request):
@@ -142,22 +145,24 @@ class SourceEndpoint:
     def _offer(self, request_id, lease, fingerprint):
         exports = []
         try:
-            for h in self.adapter.memories:
-                exports.append(self.adapter.engine.export_memory(h, 'read'))
+            exports = self.adapter.engine.export_memories(self.adapter.memories, 'read')
+            if self._static_offer is None:
+                ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
+                self._static_offer = wire_copy({
+                    'contract': self.contract, 'capacity': self.adapter.capacity,
+                    'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
+                                    for s in spans] for k,spans in self.adapter.bindings.items()}})
+                self._region_templates = [d.to_dict() for d in exports]
             receipt = {'request_id': request_id, 'incarnation': lease.incarnation,
                        'epoch': lease.epoch, 'lease_id': lease.lease_id, 'fingerprint': fingerprint}
-            ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
-            offer = {'receipt':receipt, 'contract':self.contract,
-                     'pages': list(lease.page_indices), 'capacity': self.adapter.capacity,
-                     'regions':[d.to_dict() for d in exports],
-                     'bindings':{k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
-                                    for s in spans] for k,spans in self.adapter.bindings.items()}}
-            offer = wire_copy(offer)
+            # Every field is already a JSON value (str/int), so no deep copy is needed.
+            offer = dict(self._static_offer, receipt=receipt, pages=[int(p) for p in lease.page_indices],
+                         regions=[dict(t, lease_id=d.lease_id) for t, d in zip(self._region_templates, exports)])
             self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
             return offer
         except BaseException:
             # No descriptor escaped this synchronous operation.
-            for d in exports: self.adapter.engine.release_export(d.lease_id)
+            self.adapter.engine.release_exports([d.lease_id for d in exports])
             self.cache.release_source_lease(lease, drained=True)
             raise
 
@@ -173,7 +178,7 @@ class SourceEndpoint:
         entry = self.active.get(rid)
         if entry is None or entry['receipt'] != receipt:
             raise RemoteRejected('stale or altered source receipt')
-        for d in entry['exports']: self.adapter.engine.release_export(d.lease_id)
+        self.adapter.engine.release_exports([d.lease_id for d in entry['exports']])
         self.cache.release_source_lease(entry['lease'], drained=True)
         self.released[rid] = receipt
         del self.active[rid]

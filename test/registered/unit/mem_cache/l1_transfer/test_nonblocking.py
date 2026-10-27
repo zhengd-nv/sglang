@@ -135,7 +135,7 @@ class NonblockingTests(unittest.TestCase):
         source.adapter = SimpleNamespace(layout=SimpleNamespace(page_size=2), memories=[SimpleNamespace(region_id='r')],
                                          capacity=8, bindings={}, engine=Mock())
         source.adapter.engine.any_in_flight.return_value = False
-        source.adapter.engine.export_memory.return_value = SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')
+        source.adapter.engine.export_memories.return_value = [SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')]
         def acquire_source_lease(key, *, fingerprint, ready):
             ready()
             return SimpleNamespace(page_indices=tuple(range(len(key) // 2)), incarnation='i', epoch=0, lease_id='l')
@@ -153,7 +153,7 @@ class NonblockingTests(unittest.TestCase):
         event.query.return_value = False
         self.assertIsNone(source.dispatch_deferred(self.acquire('a'), record_producer=lambda: event))
         self.assertEqual(source.poll_ready(), [])
-        source.adapter.engine.export_memory.assert_not_called()  # no descriptor before KV is written
+        source.adapter.engine.export_memories.assert_not_called()  # no descriptor before KV is written
         event.query.return_value = True
         source.adapter.engine.any_in_flight.return_value = True  # local copy still in flight
         self.assertEqual(source.poll_ready(), [])

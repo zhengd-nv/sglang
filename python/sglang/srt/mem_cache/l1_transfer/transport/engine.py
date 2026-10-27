@@ -39,6 +39,8 @@ class _Memory:
     active: set = field(default_factory=set)
     poisoned: bool = False
     owner: object = None
+    # (physical size, granularity, Fabric handle) from the first export.
+    export_info: tuple | None = None
 
 
 @dataclass
@@ -155,14 +157,35 @@ class NvlinkEngine:
         # One peer per export, many readers allowed; remote writes are exclusive.
         if item.exports and (access == "write" or any(self._exports[x][1] == "write" for x in item.exports)):
             raise BusyError("write export requires exclusive ownership")
-        _, physical, granularity = self._driver.info(item.native)
+        if item.export_info is None:
+            # CUDA has no un-export: a Fabric handle stays valid for the allocation's
+            # lifetime, so later exports only mint a new lease around the same handle.
+            _, physical, granularity = self._driver.info(item.native)
+            item.export_info = (physical, granularity, self._driver.export(item.native))
+        physical, granularity, handle = item.export_info
         lease = uuid.uuid4().hex
         desc = RegionDescriptor(1, "nvlink-fabric", self.owner_id, memory.region_id,
-                                lease, memory.size, physical, granularity, access,
-                                self._driver.export(item.native))
+                                lease, memory.size, physical, granularity, access, handle)
         desc.validate()
         item.exports.add(lease); self._exports[lease] = (memory.region_id, access)
         return desc
+
+    @locked
+    def export_memories(self, memories, access="read"):
+        """Export several regions atomically: on any failure none stay exported."""
+        exported = []
+        try:
+            for memory in memories:
+                exported.append(self.export_memory(memory, access))
+        except BaseException:
+            self.release_exports([d.lease_id for d in exported])
+            raise
+        return exported
+
+    @locked
+    def release_exports(self, lease_ids):
+        for lease_id in lease_ids:
+            self.release_export(lease_id)
 
     @locked
     def release_export(self, lease_id):

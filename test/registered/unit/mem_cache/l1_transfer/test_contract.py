@@ -92,6 +92,22 @@ class ContractTests(unittest.TestCase):
             with self.subTest(req=req), self.assertRaises(ValueError):
                 self.b.submit_transfer([req])
 
+    def test_reexport_mints_a_fresh_importable_lease_around_one_handle(self):
+        """Peers tombstone imported leases, so each export needs a new lease; the driver exports once."""
+        calls, export = [], self.driver.export
+        self.driver.export = lambda h: calls.append(h) or export(h)
+        region = self.a.allocate_memory(64)
+        first, second = self.a.export_memories([region, region])
+        self.assertNotEqual(first.lease_id, second.lease_id)
+        self.assertEqual(first.transport_handle, second.transport_handle)
+        self.assertEqual(len(calls), 1)
+        self.b.unregister_memory(self.b.import_memory(first))
+        with self.assertRaises(ValueError):
+            self.b.import_memory(first)
+        self.b.unregister_memory(self.b.import_memory(second))
+        self.a.release_exports([first.lease_id, second.lease_id])
+        self.a.unregister_memory(region)
+
     def test_shared_read_exports_only_admit_read_into_read_exported_region(self):
         """A read-exported region may receive local READs only in shared mode; never export in flight."""
         self.b.export_memory(self.local, 'read')
