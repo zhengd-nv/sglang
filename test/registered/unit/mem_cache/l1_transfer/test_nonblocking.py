@@ -132,6 +132,7 @@ class NonblockingTests(unittest.TestCase):
         source.contract = {'model': 'm'}
         source.ready, source.max_leases, source.max_lease_pages = None, max_leases, max_lease_pages
         source.active, source.pending, source.released = {}, {}, {}
+        source._static_offer = source._region_templates = None
         source.adapter = SimpleNamespace(layout=SimpleNamespace(page_size=2), memories=[SimpleNamespace(region_id='r')],
                                          capacity=8, bindings={}, engine=Mock())
         source.adapter.engine.any_in_flight.return_value = False
