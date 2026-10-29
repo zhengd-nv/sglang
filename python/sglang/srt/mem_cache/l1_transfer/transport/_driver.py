@@ -53,6 +53,18 @@ class Driver:
         if self._mapping_guard is not None:
             self._mapping_guard.argtypes = [C.c_int, C.c_int, C.POINTER(C.c_void_p)]
             self._mapping_guard.restype = C.c_int
+        self._host_numa = getattr(self.lib, "nvt_create_host_numa", None)
+        if self._host_numa is not None:
+            self._host_numa.argtypes = [C.c_int, C.c_int, C.c_size_t, C.POINTER(C.c_void_p)]
+            self._host_numa.restype = C.c_int
+
+    def create_host_numa(self, device, numa, size):
+        """Exportable EGM allocation mapped for ``device`` and the CPU."""
+        if self._host_numa is None:
+            raise TransferError("EGM allocation unavailable; rebuild the native library")
+        out = C.c_void_p()
+        self.check(self._host_numa(device, numa, size, C.byref(out)))
+        return out.value
 
     def create_mapping_guard(self, device, peer):
         if self._mapping_guard is None:

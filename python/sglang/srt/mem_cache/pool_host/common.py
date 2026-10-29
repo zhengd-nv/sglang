@@ -76,6 +76,10 @@ class ShmHostTensorAllocator(HostTensorAllocator):
 
 
 def get_allocator_from_storage(allocator_type):
+    if allocator_type == "egm":
+        from sglang.srt.mem_cache.l1_transfer.egm_host import EGMHostTensorAllocator
+
+        return EGMHostTensorAllocator()
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -124,7 +128,10 @@ def get_allocator_from_storage(allocator_type):
 
 def get_allocator_type() -> str:
     """The host-allocator kind the published HiCache configuration asks for."""
+    from sglang.srt.mem_cache.l1_transfer.egm_host import egm_host_pool_enabled
 
+    if egm_host_pool_enabled():
+        return "egm"
     backend = get_memory().hicache_storage_backend
     if backend == "shm":
         return "shm"

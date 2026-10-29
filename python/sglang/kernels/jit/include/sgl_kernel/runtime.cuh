@@ -131,6 +131,14 @@ inline void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
 #ifdef USE_ROCM
   CHECK_CUDA(::hipHostGetDevicePointer(&device_ptr, ptr, 0));
 #else
+  // Identity-mapped host memory (Grace pinned, VMM HOST_NUMA/EGM): the VA is the
+  // device address. cudaHostGetDevicePointer misresolves interior VMM pointers.
+  cudaPointerAttributes attr{};
+  if (::cudaPointerGetAttributes(&attr, ptr) == cudaSuccess && attr.devicePointer != nullptr &&
+      attr.devicePointer == attr.hostPointer) {
+    return ptr;
+  }
+  (void)::cudaGetLastError();
   CHECK_CUDA(::cudaHostGetDevicePointer(&device_ptr, ptr, 0));
 #endif
   return device_ptr;

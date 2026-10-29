@@ -94,6 +94,8 @@ struct Region {
     CUdeviceptr ptr = 0;
     size_t bytes = 0, logical = 0, granularity = 0;
     bool mapped = false, poisoned = false, imported = false;
+    // Grace NUMA node of an owned HOST_NUMA (EGM) allocation; the CPU may access it too.
+    int host_numa = -1;
     unsigned active = 0;
     void init(int ordinal) {
         check(cuInit(0));
@@ -105,11 +107,18 @@ struct Region {
         check(cuMemAddressReserve(&ptr, bytes, granularity, 0, 0));
         check(cuMemMap(ptr, bytes, 0, allocation, 0));
         mapped = true;
-        CUmemAccessDesc access{};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id = device;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        check(cuMemSetAccess(ptr, bytes, &access, 1));
+        CUmemAccessDesc access[2]{};
+        access[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access[0].location.id = device;
+        access[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        size_t count = 1;
+        if (host_numa >= 0) {
+            access[1].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            access[1].location.id = host_numa;
+            access[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            count = 2;
+        }
+        check(cuMemSetAccess(ptr, bytes, access, count));
     }
     void close() {
         if (active || poisoned) throw std::runtime_error("region busy or quarantined");
@@ -195,6 +204,19 @@ int nvt_create(int device, size_t length, void** out) { BEGIN
     r->bytes = ((length+r->granularity-1)/r->granularity)*r->granularity;
     { Context scope(r->ctx); check(cuMemCreate(&r->allocation, r->bytes, &prop, 0)); }
     r->map(); *out = r.release(); END }
+// Exportable Grace DRAM (EGM): HOST_NUMA + FABRIC, mapped for this GPU and the CPU,
+// so one VA serves CPU tensors and GPU kernels alike. Never staged through HBM.
+int nvt_create_host_numa(int device, int numa, size_t length, void** out) { BEGIN
+    if (!length || !out || numa < 0) throw std::invalid_argument("invalid EGM allocation");
+    auto r = std::make_unique<Region>(); r->init(device); r->logical = length; r->host_numa = numa;
+    CUmemAllocationProp prop{}; prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA; prop.location.id = numa;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    check(cuMemGetAllocationGranularity(&r->granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    if (length > SIZE_MAX - r->granularity) throw std::invalid_argument("allocation overflow");
+    r->bytes = ((length+r->granularity-1)/r->granularity)*r->granularity;
+    { Context scope(r->ctx); check(cuMemCreate(&r->allocation, r->bytes, &prop, 0)); }
+    r->map(); *out = r.release(); END }
 // Optional engine-owned keepalive for the receiving device's peer-mapping state.
 // Allocate one minimum-granularity block on an EXPLICIT caller-owned local peer.
 // No remote KV allocation, export lease, peer primary context or user VA is kept.
@@ -220,9 +242,10 @@ int nvt_register_vmm(int device, uint64_t address, size_t physical, void** out) 
     { Context scope(r->ctx);
       check(cuMemRetainAllocationHandle(&r->allocation, reinterpret_cast<void*>(address)));
       CUmemAllocationProp prop{}; check(cuMemGetAllocationPropertiesFromHandle(&prop,r->allocation));
-      if (prop.location.type!=CU_MEM_LOCATION_TYPE_DEVICE || prop.location.id!=r->device ||
-          !(prop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC))
-          throw std::invalid_argument("requires local DEVICE/FABRIC allocation");
+      bool local_hbm = prop.location.type==CU_MEM_LOCATION_TYPE_DEVICE && prop.location.id==r->device;
+      bool egm = prop.location.type==CU_MEM_LOCATION_TYPE_HOST_NUMA;
+      if (!(local_hbm || egm) || !(prop.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC))
+          throw std::invalid_argument("requires local DEVICE or HOST_NUMA FABRIC allocation");
       check(cuMemGetAllocationGranularity(&r->granularity,&prop,CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     }
     if (physical%r->granularity) throw std::invalid_argument("unaligned VMM extent");
@@ -237,7 +260,8 @@ int nvt_import(int device, const void* fabric, size_t length, size_t physical, s
     { Context scope(r->ctx);
       check(cuMemImportFromShareableHandle(&r->allocation, const_cast<void*>(fabric), CU_MEM_HANDLE_TYPE_FABRIC));
       CUmemAllocationProp prop{}; check(cuMemGetAllocationPropertiesFromHandle(&prop, r->allocation));
-      if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE) throw std::invalid_argument("only HBM DEVICE allocations supported");
+      if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE && prop.location.type != CU_MEM_LOCATION_TYPE_HOST_NUMA)
+          throw std::invalid_argument("only HBM DEVICE or EGM HOST_NUMA allocations supported");
     }
     r->map(); *out=r.release(); END }
 int nvt_export(void* handle, void* fabric) { BEGIN

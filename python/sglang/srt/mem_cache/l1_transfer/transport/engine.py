@@ -18,6 +18,16 @@ from .api import (BatchHandle, BusyError, MemoryHandle, Opcode, RegionDescriptor
                   TransferError, TransferRequest, TransferState, TransferStatus, checked_int)
 
 
+def default_library():
+    library = os.environ.get("NVLINK_TRANSFER_LIB")
+    if not library:
+        cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        library = str(cache / "sglang/l1_transfer/libnvlink_transfer.so")
+        if not Path(library).is_file():
+            raise ValueError("build l1_transfer/build-native.sh first, or set NVLINK_TRANSFER_LIB")
+    return library
+
+
 def locked(method):
     @wraps(method)
     def call(self, *args, **kwargs):
@@ -74,13 +84,7 @@ class NvlinkEngine:
                 raise ValueError("mapping_peer_device must differ from device")
         if _driver is None:
             from ._driver import Driver
-            library = library or os.environ.get("NVLINK_TRANSFER_LIB")
-            if not library:
-                cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-                library = str(cache / "sglang/l1_transfer/libnvlink_transfer.so")
-                if not Path(library).is_file():
-                    raise ValueError("build l1_transfer/build-native.sh first, or set NVLINK_TRANSFER_LIB")
-            _driver = Driver(library)
+            _driver = Driver(library or default_library())
         self._driver = _driver
         self._shared_read_exports = shared_read_exports
         self.device = device
