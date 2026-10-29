@@ -115,3 +115,12 @@ class SourceKeyIndex:
         if depth + (offset + 1) * self.page_size != end:
             raise ValueError('prefix key at a different depth')
         return node
+
+    def touch(self, node):
+        """Refresh the path's recency as a token match would; a leased prefix is hot."""
+        from sglang.srt.mem_cache.unified_cache.unified_tree_core import get_and_increase_time_counter
+        now = get_and_increase_time_counter()
+        while node is not None:
+            node.last_access_time = now
+            now -= 0.00001
+            node = node.parent

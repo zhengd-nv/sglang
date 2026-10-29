@@ -110,6 +110,23 @@ class SourceLeaseTests(unittest.TestCase):
         with self.assertRaises(ValueError): by_key(keys[-1], 16, 8)
         self.assertFalse(self.cache.source_leases.busy)
 
+    def test_page_key_lease_keeps_the_prefix_recent(self):
+        """A prefix leased by page key counts as used, as a token match would make it;
+        otherwise a hot shared prefix ages out under unrelated traffic and every
+        restore of it falls back."""
+        from sglang.srt.mem_cache.source_index import prefix_page_keys
+        index = self.cache.source_leases.enable_key_index()
+        other = RadixKey(array('q', range(100, 116)))
+        self.cache.insert(InsertParams(key=other, value=self.allocator.alloc(16)))
+        key = prefix_page_keys(list(range(16)), 4)[-1]
+        lease = self.cache.acquire_source_lease_by_key(key, end=16, start=0,
+            fingerprint='test-model:fp16:nhd:tp1', ready=torch.cuda.synchronize)
+        self.cache.release_source_lease(lease, drained=True)
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=16)).num_tokens_evicted, 16)
+        index.find(key, 16)  # the leased prefix survived; the newer, unused one went
+        with self.assertRaises(ValueError):
+            index.find(prefix_page_keys(list(range(100, 116)), 4)[-1], 16)
+
     def test_tree_lock_serializes_worker_leases_with_scheduler_calls(self):
         """A network worker leases between scheduler cache calls: it waits while the
         scheduler holds the tree access lock, and bypassing the lock is refused."""

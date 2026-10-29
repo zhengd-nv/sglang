@@ -143,6 +143,7 @@ class SourceLeaseManager:
                 or not isinstance(fingerprint, str) or not fingerprint or not callable(ready)):
             raise ValueError('page key, page-aligned 0 <= start < end, fingerprint and ready required')
         node = self.key_index.find(page_key, end)
+        self.key_index.touch(node)
         return self._lease(node.id, start, end, fingerprint, ready, allocator, pool,
                            events=self.key_index.ready_events(node))
 
