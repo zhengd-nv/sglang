@@ -133,15 +133,16 @@ class NonblockingTests(unittest.TestCase):
         source.contract = {'model': 'm'}
         source.ready, source.max_leases, source.max_lease_pages = None, max_leases, max_lease_pages
         source.active, source.pending, source.released = {}, {}, {}
-        source._static_offer = source._region_templates = None
+        source._static_offers = {}
         source.adapter = SimpleNamespace(layout=SimpleNamespace(page_size=2), memories=[SimpleNamespace(region_id='r')],
                                          capacity=8, bindings={}, engine=Mock())
+        source.adapters = {'hbm': source.adapter}
         source.adapter.engine.any_in_flight.return_value = False
         source.adapter.engine.export_memories.return_value = [SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')]
-        def acquire_source_lease_by_key(key, *, end, start, fingerprint, ready):
+        def acquire_source_lease_by_key(key, *, end, start, fingerprint, ready, tier):
             ready()
             return SimpleNamespace(page_indices=tuple(range(start // 2, end // 2)), incarnation='i', epoch=0,
-                                   lease_id='l', ready_events=())
+                                   lease_id='l', ready_events=(), tier='hbm')
         source.cache = SimpleNamespace(source_leases=SimpleNamespace(_check_thread=lambda: None),
                                        acquire_source_lease_by_key=Mock(side_effect=acquire_source_lease_by_key))
         return source

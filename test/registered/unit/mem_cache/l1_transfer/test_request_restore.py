@@ -105,6 +105,19 @@ class RequestRestoreTests(unittest.TestCase):
             with self.subTest(restore=restore), self.assertRaises(ValueError):
                 request.restore_payload(dict(input_ids=list(range(40))), restore, 16)
 
+    def test_sources_may_name_one_endpoint_once_per_tier(self):
+        """An L2 (egm) then L1 (hbm) failover on the same source is one endpoint twice;
+        the same endpoint and tier twice, or an unknown tier, is refused."""
+        egm = {'host': 'a', 'port': 1, 'prefix_tokens': 16, 'tier': 'egm'}
+        hbm = {'host': 'a', 'port': 1, 'prefix_tokens': 16}
+        payload = request.restore_payload(dict(input_ids=list(range(40))),
+                                          dict(mode='nonblocking', sources=[egm, hbm]), 16)
+        self.assertEqual([c['tier'] for c in payload['candidates']], ['egm', 'hbm'])
+        for sources in ([egm, egm], [dict(egm, tier='ssd')]):
+            with self.subTest(sources=sources), self.assertRaises(ValueError):
+                request.restore_payload(dict(input_ids=list(range(40))),
+                                        dict(mode='nonblocking', sources=sources), 16)
+
     def test_actual_generate_entry_forwards_arguments_without_recursive_restore(self):
         # Compile the real method without importing the GPU framework stack.
         tree = ast.parse((ROOT / 'python/sglang/srt/entrypoints/engine.py').read_text())

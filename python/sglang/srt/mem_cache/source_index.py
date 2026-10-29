@@ -92,8 +92,9 @@ class SourceKeyIndex:
             node = node.parent
         return tuple(events)
 
-    def find(self, key, end):
-        """Node holding the page that ends at token ``end``; ValueError on any miss."""
+    def find(self, key, end, tier='hbm'):
+        """Node holding the page that ends at token ``end``, resident in ``tier``
+        (``hbm`` device value, ``egm`` host value) along the whole path; ValueError on any miss."""
         node = self._nodes.get(key)
         if node is None:
             raise ValueError('prefix key not in tree')
@@ -107,8 +108,9 @@ class SourceKeyIndex:
             parent = child.parent
             if parent is None or parent.children.get(child.key.child_key(self.page_size)) is not child:
                 raise ValueError('prefix key node is detached')
-            if child.component_data[ComponentType.FULL].value is None:
-                raise ValueError('prefix not device resident')
+            data = child.component_data[ComponentType.FULL]
+            if (data.value if tier == 'hbm' else data.host_value) is None:
+                raise ValueError(f'prefix not resident in {tier}')
             if child is not node:
                 depth += len(child.key)
             child = parent

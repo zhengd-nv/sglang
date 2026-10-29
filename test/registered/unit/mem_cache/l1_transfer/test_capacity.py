@@ -104,7 +104,7 @@ class CapacityTests(unittest.TestCase):
                 'sglang.srt.mem_cache.l1_transfer.peer.scheduler.PeerReceiver', return_value=receiver):
             p._try_capacity()
         p.scheduler.is_fully_idle.assert_not_called()
-        receiver.prepare_steps.assert_called_once_with(p.payload['tokens'], required_capacity=32,
+        receiver.prepare_steps.assert_called_once_with(p.payload['tokens'], required_capacity=32, tier='hbm',
                                                        headroom=0, private=True)
         self.assertEqual(p.phase, 'WAIT_ACQUIRE')
 

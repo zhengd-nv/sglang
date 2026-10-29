@@ -42,17 +42,19 @@ class SourceEndpoint:
     it, acquire is split: begin_acquire locks the tree and records the producer
     event, and poll_ready exports and offers only after that event completes.
     """
-    def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None):
+    def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None,
+                 host_adapter=None):
         self.cache, self.adapter, self.ready = cache, adapter, ready
+        # tier -> pool adapter whose pages a lease of that tier names (egm: the L2 host pool).
+        self.adapters = {'hbm': adapter, **({'egm': host_adapter} if host_adapter is not None else {})}
         cache.source_leases.enable_key_index()  # targets name prefixes by page key
         self.contract = wire_copy(contract(identity, adapter.layout))
         self.max_leases = max_leases
         self.max_lease_pages = max_lease_pages
         self.active = {}
         self.pending = {}  # request_id -> (lease, fingerprint, producer event); nothing exported
-        # Per-endpoint constant offer fields, built on first use; regions vary only by lease_id.
-        self._static_offer = None
-        self._region_templates = None
+        # Per-tier constant offer fields, built on first use; regions vary only by lease_id.
+        self._static_offers = {}
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
 
     def dispatch(self, request):
@@ -80,10 +82,13 @@ class SourceEndpoint:
         if request.get('contract') != self.contract:
             raise RemoteRejected('incompatible model/context/layout')
         key, end, start = request.get('key'), request.get('end'), request.get('start')
+        tier = request.get('tier', 'hbm')
         page = self.adapter.layout.page_size
         if (not isinstance(key, str) or len(key) != 64 or type(end) is not int or type(start) is not int
                 or not 0 <= start < end or end % page or start % page):
             raise RemoteRejected('page key and page-aligned 0 <= start < end required')
+        if tier not in self.adapters:
+            raise RemoteRejected(f'tier {tier!r} not served by this source')
         request_id = request.get('id')
         if not isinstance(request_id, str) or len(request_id) != 32:
             raise RemoteRejected('invalid request ID')
@@ -91,8 +96,9 @@ class SourceEndpoint:
             raise RemoteRejected('request already released')
         if request_id in self.pending:
             raise RemoteRejected('request ID already pending')
-        span = (key, end, start)
-        return span, request_id, digest({'contract': self.contract, 'key': key, 'end': end, 'start': start})
+        span = (key, end, start, tier)
+        return span, request_id, digest({'contract': self.contract, 'key': key, 'end': end, 'start': start,
+                                         'tier': tier})
 
     def _check_quota(self, span):
         leases = list(self.active.values()) + [{'lease': p[0]} for p in self.pending.values()]
@@ -105,10 +111,10 @@ class SourceEndpoint:
                 raise RemoteRejected('source busy: leased page quota')
 
     def _lock(self, span, fingerprint, ready):
-        key, end, start = span
+        key, end, start, tier = span
         try:
             return self.cache.acquire_source_lease_by_key(key, end=end, start=start,
-                                                          fingerprint=fingerprint, ready=ready)
+                                                          fingerprint=fingerprint, ready=ready, tier=tier)
         except ValueError as exc:
             raise RemoteRejected(str(exc)) from exc
 
@@ -168,7 +174,7 @@ class SourceEndpoint:
         try:
             for event in lease.ready_events:
                 event.synchronize()
-            exports = self._export_when_idle(export_timeout)
+            exports = self._export_when_idle(self.adapters[lease.tier], export_timeout)
             with lock:
                 offer = self._offer_from(request_id, lease, fingerprint, exports)
                 del self.pending[request_id]
@@ -186,11 +192,11 @@ class SourceEndpoint:
         with lock:
             return self.release(request)
 
-    def _export_when_idle(self, timeout):
+    def _export_when_idle(self, adapter, timeout):
         deadline = time.monotonic() + timeout
         while True:
             try:
-                return self.adapter.engine.export_memories(self.adapter.memories, 'read')
+                return adapter.engine.export_memories(adapter.memories, 'read')
             except BusyError:
                 # A local copy batch into this pool is in flight; it completes on its own.
                 if time.monotonic() >= deadline:
@@ -200,7 +206,8 @@ class SourceEndpoint:
     def _offer(self, request_id, lease, fingerprint):
         exports = []
         try:
-            exports = self.adapter.engine.export_memories(self.adapter.memories, 'read')
+            adapter = self.adapters[lease.tier]
+            exports = adapter.engine.export_memories(adapter.memories, 'read')
             return self._offer_from(request_id, lease, fingerprint, exports)
         except BaseException:
             # No descriptor escaped this synchronous operation.
@@ -209,20 +216,22 @@ class SourceEndpoint:
             raise
 
     def _offer_from(self, request_id, lease, fingerprint, exports):
-        if self._static_offer is None:
-            ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
-            # tier/protection: an EGM (L2) region may be owned and protected differently.
-            self._static_offer = wire_copy({
-                'contract': self.contract, 'capacity': self.adapter.capacity,
-                'tier': 'hbm', 'protection': 'tree-pin',
+        if lease.tier not in self._static_offers:
+            adapter = self.adapters[lease.tier]
+            ids = {h.region_id:i for i,h in enumerate(adapter.memories)}
+            # hbm pages are radix-locked; egm (L2 host) pages are held by host_lock_ref.
+            self._static_offers[lease.tier] = (wire_copy({
+                'contract': self.contract, 'capacity': adapter.capacity, 'tier': lease.tier,
+                'protection': 'tree-pin' if lease.tier == 'hbm' else 'host-tree-pin',
                 'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
-                                for s in spans] for k,spans in self.adapter.bindings.items()}})
-            self._region_templates = [d.to_dict() for d in exports]
+                                for s in spans] for k,spans in adapter.bindings.items()}}),
+                [d.to_dict() for d in exports])
+        static_offer, region_templates = self._static_offers[lease.tier]
         receipt = {'request_id': request_id, 'incarnation': lease.incarnation,
                    'epoch': lease.epoch, 'lease_id': lease.lease_id, 'fingerprint': fingerprint}
         # Every field is already a JSON value (str/int), so no deep copy is needed.
-        offer = dict(self._static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
-                     regions=[dict(t, lease_id=d.lease_id) for t, d in zip(self._region_templates, exports)])
+        offer = dict(static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
+                     regions=[dict(t, lease_id=d.lease_id) for t, d in zip(region_templates, exports)])
         self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
         return offer
 
@@ -271,7 +280,7 @@ class PeerReceiver:
             return done.value
         raise RuntimeError('unexpected preparation step')
 
-    def prepare_steps(self, tokens, *, required_capacity=None, headroom=0, private=False):
+    def prepare_steps(self, tokens, *, required_capacity=None, headroom=0, private=False, tier='hbm'):
         """Yield network work; every cache/transport operation stays on the owner."""
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.target_reservation import TargetReservation
@@ -294,17 +303,19 @@ class PeerReceiver:
         try:
             key = prefix_page_keys(complete, page)[-1]
             start, end = reservation.prefix_len, len(complete)
-            offer = yield 'acquire', dict(key=key, end=end, start=start, contract=self.contract)
+            offer = yield 'acquire', dict(key=key, end=end, start=start, tier=tier, contract=self.contract)
         except RemoteRejected:
             reservation.discard(); self.pending = None
             raise
         self.pending['offer'] = offer
-        expected = digest({'contract': self.contract, 'key': key, 'end': end, 'start': start})
-        if offer['contract'] != self.contract or offer['receipt']['fingerprint'] != expected:
+        expected = digest({'contract': self.contract, 'key': key, 'end': end, 'start': start, 'tier': tier})
+        if (offer['contract'] != self.contract or offer['receipt']['fingerprint'] != expected
+                or offer.get('tier') != tier):
             raise ValueError('offer identity mismatch; fail-stop')
         runs = offer['page_runs']
+        first_page = 1 if tier == 'hbm' else 0  # device page 0 is padding; host page 0 is real
         if not isinstance(runs, list) or any(not isinstance(r, list) or len(r) != 2
-                or any(type(x) is not int for x in r) or r[0] <= 0 or r[1] <= 0 for r in runs):
+                or any(type(x) is not int for x in r) or r[0] < first_page or r[1] <= 0 for r in runs):
             raise ValueError('invalid source page runs; fail-stop')
         pages = [first + i for first, count in runs for i in range(count)]
         if len(pages)*page != end - start or len(set(pages)) != len(pages):

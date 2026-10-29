@@ -6,7 +6,11 @@ MAX_SOURCES = 8  # Arbitrary bound on one request's failover chain.
 
 
 def _parse_sources(restore):
-    """Return [(host, port, prefix_tokens)] in caller preference order."""
+    """Return [(host, port, prefix_tokens, tier)] in caller preference order.
+
+    ``tier`` (sources only, default ``hbm``): ``egm`` reads the source's L2 host pool.
+    One endpoint may appear once per tier, e.g. its L2 then its L1.
+    """
     if 'sources' in restore:
         if 'source' in restore or 'prefix_tokens' in restore:
             raise ValueError('l1_restore takes either sources or source with prefix_tokens')
@@ -15,22 +19,24 @@ def _parse_sources(restore):
         sources = restore['sources']
         if not isinstance(sources, list) or not 0 < len(sources) <= MAX_SOURCES:
             raise ValueError(f'sources must be a list of 1..{MAX_SOURCES} candidates')
-        if any(not isinstance(s, dict) or set(s) != {'host', 'port', 'prefix_tokens'} for s in sources):
-            raise ValueError('each source requires exactly host, port and prefix_tokens')
-        parsed = [(s['host'], s['port'], s['prefix_tokens']) for s in sources]
+        if any(not isinstance(s, dict) or not {'host', 'port', 'prefix_tokens'} <= set(s)
+               or set(s) - {'host', 'port', 'prefix_tokens', 'tier'}
+               or s.get('tier', 'hbm') not in ('hbm', 'egm') for s in sources):
+            raise ValueError('each source requires host, port and prefix_tokens, and optionally tier hbm|egm')
+        parsed = [(s['host'], s['port'], s['prefix_tokens'], s.get('tier', 'hbm')) for s in sources]
     else:
         if not {'source', 'prefix_tokens'} <= set(restore):
             raise ValueError('l1_restore requires exactly source and prefix_tokens')
         source = restore['source']
         if not isinstance(source, dict) or set(source) != {'host', 'port'}:
             raise ValueError('source requires a nonempty host and integer port in 1..65535')
-        parsed = [(source['host'], source['port'], restore['prefix_tokens'])]
-    for host, port, _ in parsed:
+        parsed = [(source['host'], source['port'], restore['prefix_tokens'], 'hbm')]
+    for host, port, _, _ in parsed:
         if (not isinstance(host, str) or not host
                 or type(port) is not int or not 1 <= port <= 65535):
             raise ValueError('source requires a nonempty host and integer port in 1..65535')
-    if len({(host, port) for host, port, _ in parsed}) != len(parsed):
-        raise ValueError('sources must not repeat an endpoint')
+    if len({(host, port, tier) for host, port, _, tier in parsed}) != len(parsed):
+        raise ValueError('sources must not repeat an endpoint and tier')
     return parsed
 
 
@@ -50,7 +56,7 @@ def restore_payload(arguments, restore, page_size):
     if (not isinstance(tokens, list) or not tokens
             or any(type(t) is not int or not 0 <= t < 2**31 for t in tokens)):
         raise ValueError('l1_restore requires one nonempty list of token IDs')
-    for _, _, prefix in sources:
+    for _, _, prefix, _ in sources:
         if (type(page_size) is not int or page_size <= 0 or type(prefix) is not int
                 or not 0 < prefix < len(tokens) or prefix % page_size):
             raise ValueError('prefix_tokens must contain complete pages and be shorter than input_ids')
@@ -72,8 +78,8 @@ def restore_payload(arguments, restore, page_size):
     if restore.get('mode') == 'nonblocking' and sampling is not None:
         if any(sampling.get(k) is not None for k in ('json_schema', 'regex', 'ebnf', 'structural_tag')):
             raise ValueError('nonblocking L1 restore does not support grammar constraints')
-    return dict(candidates=[dict(host=host, port=port, tokens=list(tokens[:prefix]))
-                            for host, port, prefix in sources])
+    return dict(candidates=[dict(host=host, port=port, tokens=list(tokens[:prefix]), tier=tier)
+                            for host, port, prefix, tier in sources])
 
 
 def generate_with_restore(engine, arguments, restore):
@@ -84,6 +90,7 @@ def generate_with_restore(engine, arguments, restore):
     request/GPU consumption ended. There is no automatic retry or fallback.
     """
     candidate, = restore_payload(arguments, restore, engine.server_args.page_size)['candidates']
+    candidate.pop('tier')  # the synchronous path restores from L1 only
     restored = engine.l1_peer('restore', **candidate)
     try:
         result = engine.generate(**arguments)

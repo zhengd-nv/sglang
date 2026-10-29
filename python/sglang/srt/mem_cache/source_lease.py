@@ -47,6 +47,8 @@ class SourceLease:
     page_indices: tuple[int, ...]
     # Insert-time events of the leased path; wait on them before exporting.
     ready_events: tuple = field(default=(), compare=False)
+    # hbm: device pages under the radix lock; egm: host pages under host_lock_ref.
+    tier: str = 'hbm'
 
 
 def page_runs(pages):
@@ -71,6 +73,8 @@ class SourceLeaseManager:
         self._targets = set()
         self.key_index = None
         self.tree_lock = None
+        # Set by an L2 (HiCache) source; such an Engine never restores as a target.
+        self.allow_host_pool = False
 
     def _check_thread(self):
         if threading.get_ident() == self._thread:
@@ -103,7 +107,10 @@ class SourceLeaseManager:
         self.epoch += 1
         self._released.clear()
 
-    def validate_cache(self):
+    def validate_cache(self, *, allow_host_pool=None):
+        """``allow_host_pool``: a HiCache (L2, no L3 storage) source may lease host pages."""
+        if allow_host_pool is None:
+            allow_host_pool = self.allow_host_pool
         cache = self.cache
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         self._check_thread()
@@ -111,7 +118,7 @@ class SourceLeaseManager:
         pool = allocator.get_kvcache()
         if (cache.disable or cache.tree_components != (ComponentType.FULL,)
                 or cache.enable_session_radix_cache or cache.linker is not None
-                or cache.enable_storage or cache.cache_controller is not None
+                or cache.enable_storage or (cache.cache_controller is not None and not allow_host_pool)
                 or type(allocator).__name__ != 'PagedTokenToKVPoolAllocator'
                 or type(pool).__name__ != 'MHATokenToKVPool'
                 or pool.kv_cache_layout != 'nhd' or pool._post_capture_owner is None
@@ -131,7 +138,7 @@ class SourceLeaseManager:
         match = self.cache.match_prefix(MatchPrefixParams(key=key))
         return self._lease(match.last_device_node, 0, len(key), fingerprint, ready, allocator, pool)
 
-    def acquire_by_key(self, page_key, *, end, start, fingerprint, ready):
+    def acquire_by_key(self, page_key, *, end, start, fingerprint, ready, tier='hbm'):
         """Lease [start, end) of the prefix whose last page key is ``page_key``."""
         self._check_thread()
         allocator, pool = self.validate_cache()
@@ -142,8 +149,12 @@ class SourceLeaseManager:
                 or not 0 <= start < end or end % page_size or start % page_size
                 or not isinstance(fingerprint, str) or not fingerprint or not callable(ready)):
             raise ValueError('page key, page-aligned 0 <= start < end, fingerprint and ready required')
-        node = self.key_index.find(page_key, end)
+        if tier not in ('hbm', 'egm'):
+            raise ValueError('tier must be hbm or egm')
+        node = self.key_index.find(page_key, end, tier)
         self.key_index.touch(node)
+        if tier == 'egm':
+            return self._lease_host(node, start, end, fingerprint, ready, page_size)
         return self._lease(node.id, start, end, fingerprint, ready, allocator, pool,
                            events=self.key_index.ready_events(node))
 
@@ -179,6 +190,41 @@ class SourceLeaseManager:
             raise
         return lease
 
+    def _lease_host(self, node, start, end, fingerprint, ready, page_size):
+        """Host pages [start, end): host eviction is leaf-only, so locking the last
+        node protects the whole path (as load-back anchors do)."""
+        import torch
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        cache = self.cache
+        params = cache.inc_host_lock_ref(node.id).to_dec_params()
+        try:
+            values, cur = [], node
+            while cur is not None and cur is not cache.tree_core.root_node:
+                values.append(cur.component_data[ComponentType.FULL].host_value)
+                cur = cur.parent
+            path = torch.cat(values[::-1])
+            if len(path) < end:
+                raise ValueError('requested prefix is not fully host resident')
+            indices = tuple(int(x) for x in path[start:end].tolist())
+            pages = []
+            for first in range(0, len(indices), page_size):
+                row = indices[first:first + page_size]
+                if row[0] % page_size or row != tuple(range(row[0], row[0] + page_size)):
+                    raise ValueError('host page is not contiguous/aligned')
+                pages.append(row[0] // page_size)
+            lease = SourceLease(self.incarnation, self.epoch, uuid.uuid4().hex,
+                                fingerprint, indices, tuple(pages), (), 'egm')
+        except BaseException:
+            cache.dec_host_lock_ref(node.id, params)
+            raise
+        self._active[lease.lease_id] = (lease, ('host', node.id, params), None, None)
+        try:
+            ready()  # host pages are committed only after their backup completed
+        except BaseException:
+            self.release(lease, drained=True)
+            raise
+        return lease
+
     def release(self, lease, *, drained):
         self._check_thread()
         if not isinstance(lease, SourceLease) or (lease.incarnation, lease.epoch) != (self.incarnation, self.epoch):
@@ -191,9 +237,12 @@ class SourceLeaseManager:
         if item is None or item[0] != lease:
             raise ValueError('unknown or altered source lease')
         _, lock, allocator, pool = item
-        self.cache.unlock(lock)
-        unpin_pages(allocator, lease.page_indices)
-        count_pool_lease(pool, -1)
+        if isinstance(lock, tuple) and lock[0] == 'host':
+            self.cache.dec_host_lock_ref(lock[1], lock[2])
+        else:
+            self.cache.unlock(lock)
+            unpin_pages(allocator, lease.page_indices)
+            count_pool_lease(pool, -1)
         del self._active[lease.lease_id]
         self._released.add(lease)
         return True

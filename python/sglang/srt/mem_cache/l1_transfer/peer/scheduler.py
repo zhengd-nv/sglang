@@ -65,6 +65,11 @@ class SchedulerPeer:
         self.concurrent = concurrent
         self.scheduler = scheduler
         self.cache = scheduler.tree_cache
+        # A HiCache Engine serves its L2 (EGM host pool) as a source only (route A).
+        self.l2_source = self.cache.cache_controller is not None
+        if self.l2_source and not concurrent:
+            raise ValueError('an L2 (HiCache) source requires concurrent mode')
+        self.cache.source_leases.allow_host_pool = self.l2_source
         _, pool = self.cache.source_leases.validate_cache()
         from .capacity import RequestCapacity
         self.capacity = RequestCapacity(self.cache) if concurrent else None
@@ -86,12 +91,19 @@ class SchedulerPeer:
             # Without overlap, forwards that wrote tree KV ran on schedule_stream.
             self.cache.source_leases.enable_key_index(ready_stream=scheduler.schedule_stream)
             self.tree_lock = install_tree_access_lock(self.cache)
+        self.host_adapter = None
+        if self.l2_source:
+            from sglang.srt.mem_cache.hicache_storage import PoolName
+            from ..egm_host import EGMHostPoolAdapter
+            host_pool = self.cache.host_pool_group.entry_map[PoolName.KV].host_pool
+            self.host_adapter = EGMHostPoolAdapter(host_pool, self.engine, self.adapter.layout)
         if concurrent:
             # Online source: lock and record the producer event, offer once it completes.
             allocator = self.cache.token_to_kv_pool_allocator
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, None,
                 max_leases=source_max_leases,
-                max_lease_pages=int(allocator.size // allocator.page_size * source_max_lease_fraction))
+                max_lease_pages=int(allocator.size // allocator.page_size * source_max_lease_fraction),
+                host_adapter=self.host_adapter)
         else:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
         self.source_waiters = {}  # request_id -> acquire Future awaiting the producer event
@@ -135,6 +147,7 @@ class SchedulerPeer:
                     exports=len(self.engine._exports), imports=sum(m.public.remote for m in self.engine._memories.values()),
                     batches=len(self.engine._batches), available_tokens=allocator.available_size(),
                     pinned_pages=sum(getattr(allocator, '_l1_pinned_pages', {}).values()),
+                    l2_source=getattr(self, 'l2_source', False),
                     mapping_peer_device=getattr(self, 'mapping_peer_device', None))
         if getattr(self, 'concurrent', False):
             result.update(admitted_requests=len(self.capacity.active),
@@ -287,6 +300,8 @@ class SchedulerPeer:
 
     def start_request(self, req, options):
         from .request import restore_payload
+        if getattr(self, 'l2_source', False):
+            raise ValueError('an L2 (HiCache) source Engine cannot restore as a target')
         if not self.scheduler.server_args.disable_overlap_schedule:
             raise ValueError('nonblocking peer requires disable_overlap_schedule')
         # Raw server_args.page_size is None unless set explicitly; the allocator holds the resolved size.
@@ -385,6 +400,7 @@ class SchedulerPeer:
         self.rpc = AsyncRPC(payload['host'], payload['port'], executor=self.rpc_executor)
         self.receiver = PeerReceiver(self.cache, self.adapter, self.identity, self.rpc)
         self.steps = self.receiver.prepare_steps(payload['tokens'], required_capacity=self.required_capacity,
+            tier=payload.get('tier', 'hbm'),
             **({'headroom': self.capacity.remaining() + self._unadmitted_headroom(), 'private': True}
                if concurrent else {}))
         try:
@@ -659,7 +675,8 @@ class SchedulerPeer:
         with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
             leases = ([e['lease'] for e in self.source.active.values()]
                       + [p[0] for p in self.source.pending.values()])
-        leased = {page for lease in leases for page in lease.page_indices}
+        # Host (egm) page IDs index the L2 pool, not this device pool.
+        leased = {page for lease in leases if getattr(lease, 'tier', 'hbm') == 'hbm' for page in lease.page_indices}
         if leased & set(self.receiver.pending['reservation'].pages):
             raise RuntimeError('source lease overlaps a target copy destination')
 
