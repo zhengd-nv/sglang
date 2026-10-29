@@ -23,7 +23,7 @@ trap 'rm -f "$TMPDIR"' EXIT
 sha256sum "$repo/python/sglang/srt/mem_cache/l1_transfer/"*.py \
     "$repo/python/sglang/srt/mem_cache/l1_transfer/peer/"*.py \
     "$repo/python/sglang/srt/mem_cache/l1_transfer/transport/"*.* \
-    "$repo/python/sglang/srt/mem_cache/"{source_lease,source_index,target_reservation}.py \
+    "$repo/python/sglang/srt/mem_cache/"{source_lease,source_index,tree_access_lock,target_reservation}.py \
     "$here/test-peer-model.py" "$here/test-http-multi.py" "$here/run-peer-model.sh" > "$run/source-sha256.txt"
 if [[ -f "$repo/.source-commit" ]]; then
     cp "$repo/.source-commit" "$run/sglang-commit.txt"

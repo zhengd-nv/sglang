@@ -3,11 +3,37 @@
 
 No transport dependency. Caller must serialize all cache/allocator mutations on
 this thread, synchronize producer writes in ready(), and attest transfer drain.
+With a tree access lock installed, a lock holder on another thread may lease too.
 """
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import uuid
+
+# Source leases (possibly off the scheduler thread) and target reservations share
+# the allocator's pin counter and the pool's lease count.
+_PIN_LOCK = threading.Lock()
+
+
+def pin_pages(allocator, pages):
+    with _PIN_LOCK:
+        if not hasattr(allocator, '_l1_pinned_pages'):
+            allocator._l1_pinned_pages = Counter()
+        allocator._l1_pinned_pages.update(pages)
+
+
+def unpin_pages(allocator, pages):
+    with _PIN_LOCK:
+        counter = allocator._l1_pinned_pages
+        counter.subtract(pages)
+        for page in set(pages):
+            if counter[page] <= 0:
+                del counter[page]
+
+
+def count_pool_lease(pool, delta):
+    with _PIN_LOCK:
+        pool._l1_transfer_lease_count = getattr(pool, '_l1_transfer_lease_count', 0) + delta
 
 
 @dataclass(frozen=True)
@@ -19,6 +45,8 @@ class SourceLease:
     # Token slots of the leased range only: [0, H) by token key, [L, H) by page key.
     token_indices: tuple[int, ...]
     page_indices: tuple[int, ...]
+    # Insert-time events of the leased path; wait on them before exporting.
+    ready_events: tuple = field(default=(), compare=False)
 
 
 def page_runs(pages):
@@ -42,22 +70,30 @@ class SourceLeaseManager:
         self._released = set()
         self._targets = set()
         self.key_index = None
+        self.tree_lock = None
 
     def _check_thread(self):
-        if threading.get_ident() != self._thread:
-            raise RuntimeError('source leases require the scheduler thread')
+        if threading.get_ident() == self._thread:
+            return
+        if self.tree_lock is None or not self.tree_lock._is_owned():
+            raise RuntimeError('source leases require the scheduler thread or the tree access lock')
 
     @property
     def busy(self):
         return bool(self._active or self._targets)
 
-    def enable_key_index(self):
-        """Hash and index every device node so targets can name a prefix by page key."""
+    def enable_key_index(self, ready_stream=None):
+        """Hash and index every device node so targets can name a prefix by page key.
+
+        With ``ready_stream`` each new node records an event there at insert.
+        """
         from sglang.srt.mem_cache.source_index import SourceKeyIndex
         self._check_thread()
         if self.key_index is None:
             allocator, _ = self.validate_cache()
             self.key_index = SourceKeyIndex(self.cache.tree_core, allocator.page_size)
+        if ready_stream is not None:
+            self.key_index.ready_stream = ready_stream
         return self.key_index
 
     def reset(self):
@@ -107,9 +143,10 @@ class SourceLeaseManager:
                 or not isinstance(fingerprint, str) or not fingerprint or not callable(ready)):
             raise ValueError('page key, page-aligned 0 <= start < end, fingerprint and ready required')
         node = self.key_index.find(page_key, end)
-        return self._lease(node.id, start, end, fingerprint, ready, allocator, pool)
+        return self._lease(node.id, start, end, fingerprint, ready, allocator, pool,
+                           events=self.key_index.ready_events(node))
 
-    def _lease(self, node_id, start, end, fingerprint, ready, allocator, pool):
+    def _lease(self, node_id, start, end, fingerprint, ready, allocator, pool, events=()):
         cache = self.cache
         page_size = allocator.page_size
         lock = cache.lock(node_id)
@@ -127,14 +164,12 @@ class SourceLeaseManager:
             if len(set(pages)) != len(pages):
                 raise ValueError('duplicate source pages')
             lease = SourceLease(self.incarnation, self.epoch, uuid.uuid4().hex,
-                                fingerprint, indices, tuple(pages))
+                                fingerprint, indices, tuple(pages), events)
         except BaseException:
             cache.unlock(lock)
             raise
-        if not hasattr(allocator, '_l1_pinned_pages'):
-            allocator._l1_pinned_pages = Counter()
-        allocator._l1_pinned_pages.update(lease.page_indices)
-        pool._l1_transfer_lease_count = getattr(pool, '_l1_transfer_lease_count', 0) + 1
+        pin_pages(allocator, lease.page_indices)
+        count_pool_lease(pool, 1)
         self._active[lease.lease_id] = (lease, lock, allocator, pool)
         try:
             ready()  # pin first; callback must finish the producer before returning
@@ -156,9 +191,8 @@ class SourceLeaseManager:
             raise ValueError('unknown or altered source lease')
         _, lock, allocator, pool = item
         self.cache.unlock(lock)
-        allocator._l1_pinned_pages.subtract(lease.page_indices)
-        allocator._l1_pinned_pages += Counter()  # remove zero counts
-        pool._l1_transfer_lease_count -= 1
+        unpin_pages(allocator, lease.page_indices)
+        count_pool_lease(pool, -1)
         del self._active[lease.lease_id]
         self._released.add(lease)
         return True

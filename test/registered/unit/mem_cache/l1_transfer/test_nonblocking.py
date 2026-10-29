@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, parse
 from sglang.srt.mem_cache.l1_transfer.peer.restore import RestoreState
 from sglang.srt.mem_cache.l1_transfer.peer.control import PROTOCOL_VERSION, RemoteRejected
 from sglang.srt.mem_cache.l1_transfer.peer.peer import SourceEndpoint
+from sglang.srt.mem_cache.l1_transfer.transport import BusyError
 
 
 class NonblockingTests(unittest.TestCase):
@@ -139,7 +140,8 @@ class NonblockingTests(unittest.TestCase):
         source.adapter.engine.export_memories.return_value = [SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')]
         def acquire_source_lease_by_key(key, *, end, start, fingerprint, ready):
             ready()
-            return SimpleNamespace(page_indices=tuple(range(start // 2, end // 2)), incarnation='i', epoch=0, lease_id='l')
+            return SimpleNamespace(page_indices=tuple(range(start // 2, end // 2)), incarnation='i', epoch=0,
+                                   lease_id='l', ready_events=())
         source.cache = SimpleNamespace(source_leases=SimpleNamespace(_check_thread=lambda: None),
                                        acquire_source_lease_by_key=Mock(side_effect=acquire_source_lease_by_key))
         return source
@@ -175,6 +177,24 @@ class NonblockingTests(unittest.TestCase):
         with self.assertRaisesRegex(RemoteRejected, 'lease quota'):
             source.dispatch_deferred(self.acquire('d', tokens=2), record_producer=lambda: done)
         self.assertEqual(source.cache.acquire_source_lease_by_key.call_count, 2)
+
+    def test_offthread_acquire_retries_busy_export_and_cleans_up_on_failure(self):
+        """An export refused while a local copy batch is in flight is retried, not
+        failed; a failure after leasing releases the lease and leaves nothing pending."""
+        import threading
+        source = self.online_source()
+        source.cache.release_source_lease = Mock()
+        lock = threading.RLock()
+        export = source.adapter.engine.export_memories
+        export.side_effect = [BusyError('copy in flight'), export.return_value]
+        offer = source.acquire_offthread(self.acquire('a'), lock)
+        self.assertEqual(offer['page_runs'], [[0, 2]])
+        self.assertIn('a' * 32, source.active)
+        export.side_effect = BusyError('copy stuck')
+        with self.assertRaises(BusyError):
+            source.acquire_offthread(self.acquire('b', tokens=2), lock, export_timeout=0)
+        source.cache.release_source_lease.assert_called_once()
+        self.assertEqual((set(source.active), source.pending), ({'a' * 32}, {}))
 
     def test_closed_connection_checks_only_its_own_lease(self):
         peer = self.peer()

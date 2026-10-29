@@ -52,12 +52,14 @@ class AsyncRPC:
 class SourceService:
     """One thread per connection; each connection carries one acquire/release exchange.
 
-    Each dispatch is handed to the cache owner via a bounded queue. A worker
-    timeout is an error report, never permission to reclaim the source lease.
-    The daemon is tied to Engine lifetime; no independent service shutdown API.
+    Each dispatch is handed to the cache owner via a bounded queue, or with
+    ``direct`` handled on this worker (off-thread source under the tree access
+    lock). A worker timeout is an error report, never permission to reclaim the
+    source lease. The daemon is tied to Engine lifetime; no service shutdown API.
     """
-    def __init__(self, listener):
+    def __init__(self, listener, direct=None):
         self.listener = listener
+        self.direct = direct
         self.events = Queue(maxsize=64)
         listener.settimeout(None)
         threading.Thread(target=self._run, name='l1-source', daemon=True).start()
@@ -74,6 +76,11 @@ class SourceService:
             lease_id = None
 
             def dispatch(self, request):
+                if service.direct is not None:
+                    result = service.direct(request)
+                    if request.get('operation') == 'acquire':
+                        self.lease_id = request.get('id')
+                    return result
                 future = Future()
                 future.enqueued = time.time()  # wall clock, for source lease timing samples
                 service.events.put(('request', request, future))

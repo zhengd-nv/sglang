@@ -2,8 +2,9 @@
 """Fixed-peer source endpoint and synchronous receiver preparation."""
 from dataclasses import asdict
 from array import array
+import time
 
-from sglang.srt.mem_cache.l1_transfer.transport import Opcode, RegionDescriptor
+from sglang.srt.mem_cache.l1_transfer.transport import BusyError, Opcode, RegionDescriptor
 from sglang.srt.mem_cache.l1_transfer.transport.api import MemoryHandle, TransferRequest
 from sglang.srt.mem_cache.l1_transfer.transport.layout import RegionSpan, plan_transfer, bind_regions
 from sglang.srt.mem_cache.source_index import prefix_page_keys
@@ -147,31 +148,83 @@ class SourceEndpoint:
             offers.append((rid, self._offer(rid, lease, fingerprint)))
         return offers
 
+    def acquire_offthread(self, request, lock, *, export_timeout=30.0):
+        """Acquire on a network worker: tree and endpoint state under ``lock``.
+
+        Waiting for the path's producer events and exporting happen outside the
+        lock, so the scheduler keeps running cache calls meanwhile.
+        """
+        with lock:
+            span, request_id, fingerprint = self._validate_acquire(request)
+            if request_id in self.active:
+                entry = self.active[request_id]
+                if entry['receipt']['fingerprint'] != fingerprint:
+                    raise RemoteRejected('request ID reused with different prefix')
+                return entry['offer']
+            self._check_quota(span)
+            lease = self._lock(span, fingerprint, lambda: None)
+            self.pending[request_id] = (lease, fingerprint, None)
+        exports = []
+        try:
+            for event in lease.ready_events:
+                event.synchronize()
+            exports = self._export_when_idle(export_timeout)
+            with lock:
+                offer = self._offer_from(request_id, lease, fingerprint, exports)
+                del self.pending[request_id]
+            return offer
+        except BaseException:
+            # No descriptor escaped: the offer was never returned.
+            with lock:
+                self.pending.pop(request_id, None)
+                self.active.pop(request_id, None)
+                self.adapter.engine.release_exports([d.lease_id for d in exports])
+                self.cache.release_source_lease(lease, drained=True)
+            raise
+
+    def release_offthread(self, request, lock):
+        with lock:
+            return self.release(request)
+
+    def _export_when_idle(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self.adapter.engine.export_memories(self.adapter.memories, 'read')
+            except BusyError:
+                # A local copy batch into this pool is in flight; it completes on its own.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.0002)
+
     def _offer(self, request_id, lease, fingerprint):
         exports = []
         try:
             exports = self.adapter.engine.export_memories(self.adapter.memories, 'read')
-            if self._static_offer is None:
-                ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
-                # tier/protection: an EGM (L2) region may be owned and protected differently.
-                self._static_offer = wire_copy({
-                    'contract': self.contract, 'capacity': self.adapter.capacity,
-                    'tier': 'hbm', 'protection': 'tree-pin',
-                    'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
-                                    for s in spans] for k,spans in self.adapter.bindings.items()}})
-                self._region_templates = [d.to_dict() for d in exports]
-            receipt = {'request_id': request_id, 'incarnation': lease.incarnation,
-                       'epoch': lease.epoch, 'lease_id': lease.lease_id, 'fingerprint': fingerprint}
-            # Every field is already a JSON value (str/int), so no deep copy is needed.
-            offer = dict(self._static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
-                         regions=[dict(t, lease_id=d.lease_id) for t, d in zip(self._region_templates, exports)])
-            self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
-            return offer
+            return self._offer_from(request_id, lease, fingerprint, exports)
         except BaseException:
             # No descriptor escaped this synchronous operation.
             self.adapter.engine.release_exports([d.lease_id for d in exports])
             self.cache.release_source_lease(lease, drained=True)
             raise
+
+    def _offer_from(self, request_id, lease, fingerprint, exports):
+        if self._static_offer is None:
+            ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
+            # tier/protection: an EGM (L2) region may be owned and protected differently.
+            self._static_offer = wire_copy({
+                'contract': self.contract, 'capacity': self.adapter.capacity,
+                'tier': 'hbm', 'protection': 'tree-pin',
+                'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
+                                for s in spans] for k,spans in self.adapter.bindings.items()}})
+            self._region_templates = [d.to_dict() for d in exports]
+        receipt = {'request_id': request_id, 'incarnation': lease.incarnation,
+                   'epoch': lease.epoch, 'lease_id': lease.lease_id, 'fingerprint': fingerprint}
+        # Every field is already a JSON value (str/int), so no deep copy is needed.
+        offer = dict(self._static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
+                     regions=[dict(t, lease_id=d.lease_id) for t, d in zip(self._region_templates, exports)])
+        self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
+        return offer
 
     def release(self, request):
         receipt = request.get('receipt')

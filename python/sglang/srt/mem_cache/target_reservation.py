@@ -4,10 +4,10 @@
 No transport dependency. A reservation protects its pool until release(); on
 publication failure ownership may be partial and the Engine must fail-stop.
 """
-from collections import Counter
 
 import torch
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.source_lease import count_pool_lease, pin_pages, unpin_pages
 
 
 class TargetReservation:
@@ -59,7 +59,7 @@ class TargetReservation:
             cache.unlock(self._lock)
             raise
         self.manager._targets.add(self)
-        self.pool._l1_transfer_lease_count = getattr(self.pool, '_l1_transfer_lease_count', 0) + 1
+        count_pool_lease(self.pool, 1)
         self.allocator._l1_target_count = getattr(self.allocator, '_l1_target_count', 0) + 1
         self.state = 'PRIVATE'
 
@@ -70,14 +70,11 @@ class TargetReservation:
 
     def _set_pins(self, indices):
         pages = tuple(int(x) for x in (indices[::self.allocator.page_size] // self.allocator.page_size).tolist())
-        if not hasattr(self.allocator, '_l1_pinned_pages'):
-            self.allocator._l1_pinned_pages = Counter()
-        self.allocator._l1_pinned_pages.update(pages)
+        pin_pages(self.allocator, pages)
         self._pins = pages
 
     def _unpin(self):
-        self.allocator._l1_pinned_pages.subtract(self._pins)
-        self.allocator._l1_pinned_pages += Counter()
+        unpin_pages(self.allocator, self._pins)
         self._pins = ()
 
     def publish(self):
@@ -139,7 +136,7 @@ class TargetReservation:
 
     def _drop_guard(self):
         self.manager._targets.remove(self)
-        self.pool._l1_transfer_lease_count -= 1
+        count_pool_lease(self.pool, -1)
         self.allocator._l1_target_count -= 1
 
     def discard(self):

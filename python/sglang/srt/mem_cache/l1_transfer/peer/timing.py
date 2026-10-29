@@ -40,7 +40,7 @@ def install(peer):
             ready_tx = peer.session['transaction'] if label == 'target._ready' else None
             if label == 'target.start_request':
                 peer._trace_request_start = (start, cpu)
-            elif label in ('source.acquire', 'source.begin_acquire'):
+            elif label in ('source.acquire', 'source.begin_acquire', 'source.acquire_offthread'):
                 # Online sources overlap leases; lease_total then pairs with the latest begin.
                 peer._trace_source_start = (start, cpu)
             try:
@@ -60,7 +60,7 @@ def install(peer):
                     row['mapped_bytes'] = sum(h.size for h in tx.imports) if tx else 0
                 with lock:
                     output.write(json.dumps(row, separators=(',', ':')) + '\n')
-                    if label in ('target._ready', 'source.release'):
+                    if label in ('target._ready', 'source.release', 'source.release_offthread'):
                         before, before_cpu = (peer._trace_request_start if label == 'target._ready'
                                               else peer._trace_source_start)
                         interval = dict(name='target.restore_total' if label == 'target._ready' else 'source.lease_total',
@@ -76,10 +76,12 @@ def install(peer):
 
     for name in ('start_request', '_ready', 'finish', 'finish_request'):
         wrap(peer, name, 'target.' + name, name == 'finish_request')
-    for name in ('acquire', 'release', 'ready', 'begin_acquire', 'poll_ready'):
+    for name in ('acquire', 'release', 'ready', 'begin_acquire', 'poll_ready',
+                 'acquire_offthread', 'release_offthread'):
         if getattr(peer.source, name) is not None:  # ready is None for an online source
-            wrap(peer.source, name, 'source.' + name, name == 'release')
+            wrap(peer.source, name, 'source.' + name, name in ('release', 'release_offthread'))
     wrap(peer.cache.source_leases, 'acquire', 'source.lease')
+    wrap(peer.cache.source_leases, 'acquire_by_key', 'source.lease')
     for name in ('__init__', 'publish', 'release', '_set_pins'):
         wrap(TargetReservation, name, 'reservation.' + name)
     for name in ('plan_transfer', 'bind_regions'):

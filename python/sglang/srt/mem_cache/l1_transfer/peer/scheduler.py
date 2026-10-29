@@ -1,4 +1,5 @@
 """Explicit fixed-peer restore operations on an idle TP1 scheduler thread."""
+import contextlib
 import json
 import logging
 import os
@@ -40,14 +41,14 @@ def _mapping_peer_device(device):
 
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
-                 source_max_leases=4, source_max_lease_fraction=0.5):
+                 source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
                 or args.enable_lora or (not concurrent and args.max_running_requests != 1)):
             raise ValueError('Peer restore requires ordinary TP/PP/DP1, no speculation/LoRA, max_running_requests=1')
-        if type(concurrent) is not bool:
-            raise ValueError('concurrent must be boolean')
+        if type(concurrent) is not bool or type(source_offthread) is not bool:
+            raise ValueError('concurrent and source_offthread must be boolean')
         if type(queue_limit) is not int or queue_limit < 0:
             raise ValueError('queue_limit must be a nonnegative integer')
         if type(source_max_leases) is not int or source_max_leases < 1:
@@ -77,6 +78,14 @@ class SchedulerPeer:
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
+        # Off-thread source (D1): network workers lease under the tree access lock
+        # instead of queuing for a scheduler turn.
+        self.tree_lock = None
+        if concurrent and source_offthread:
+            from sglang.srt.mem_cache.tree_access_lock import install_tree_access_lock
+            # Without overlap, forwards that wrote tree KV ran on schedule_stream.
+            self.cache.source_leases.enable_key_index(ready_stream=scheduler.schedule_stream)
+            self.tree_lock = install_tree_access_lock(self.cache)
         if concurrent:
             # Online source: lock and record the producer event, offer once it completes.
             allocator = self.cache.token_to_kv_pool_allocator
@@ -266,7 +275,8 @@ class SchedulerPeer:
         if not self.scheduler.server_args.disable_overlap_schedule:
             raise ValueError('nonblocking peer requires disable_overlap_schedule')
         address = self.listen(host, port)
-        self.service = SourceService(self.listener)
+        self.service = SourceService(self.listener,
+                                     direct=self._serve_direct if self.tree_lock is not None else None)
         self.service_address = address
         return address
 
@@ -579,7 +589,9 @@ class SchedulerPeer:
                 logger.warning('L1 source connection error: %r', data)
                 continue
             if kind == 'closed':
-                if data is not None and (data in self.source.active or data in self.source.pending):
+                with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
+                    outstanding = data is not None and (data in self.source.active or data in self.source.pending)
+                if outstanding:
                     raise RuntimeError('source connection ended with outstanding lease')
                 continue
             try:
@@ -602,6 +614,8 @@ class SchedulerPeer:
                     if concurrent and data.get('operation') == 'release':
                         self._close_source_timing(data['receipt']['request_id'])
                     future.set_result(answer)
+        if getattr(self, 'tree_lock', None) is not None:
+            return  # off-thread acquires answer from the network worker
         offers = self.source.poll_ready()
         if offers:
             self._check_roles_disjoint()
@@ -609,6 +623,24 @@ class SchedulerPeer:
             if request_id in self.source_timing_open:
                 self.source_timing_open[request_id]['offered'] = time.time()
             self.source_waiters.pop(request_id).set_result(offer)
+
+    def _serve_direct(self, request):
+        """Network-worker dispatch for an off-thread source; never touches the target."""
+        torch.cuda.set_device(self.engine.device)
+        if request.get('operation') == 'acquire':
+            begin = time.time()
+            offer = self.source.acquire_offthread(request, self.tree_lock)
+            self.source_timing_open[request['id']] = dict(
+                enqueued=begin, begin=begin, offered=time.time(),
+                pages=sum(count for _, count in offer['page_runs']))
+            return offer
+        if request.get('operation') == 'release':
+            answer = self.source.release_offthread(request, self.tree_lock)
+            receipt = request.get('receipt')
+            if isinstance(receipt, dict):
+                self._close_source_timing(receipt.get('request_id'))
+            return answer
+        raise RemoteRejected('unknown operation')
 
     def _close_source_timing(self, request_id):
         entry = self.source_timing_open.pop(request_id, None)
@@ -624,7 +656,9 @@ class SchedulerPeer:
         """
         if self.receiver is None or self.receiver.pending is None:
             return
-        leases = [e['lease'] for e in self.source.active.values()] + [p[0] for p in self.source.pending.values()]
+        with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
+            leases = ([e['lease'] for e in self.source.active.values()]
+                      + [p[0] for p in self.source.pending.values()])
         leased = {page for lease in leases for page in lease.page_indices}
         if leased & set(self.receiver.pending['reservation'].pages):
             raise RuntimeError('source lease overlaps a target copy destination')
@@ -672,7 +706,7 @@ class SchedulerPeer:
 
 
 L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
-                  'source_max_leases', 'source_max_lease_fraction'}
+                  'source_max_leases', 'source_max_lease_fraction', 'source_offthread'}
 
 
 def parse_l1_config(text):
@@ -691,7 +725,7 @@ def init_scheduler_peer_from_config(scheduler, text):
     config = parse_l1_config(text)
     peer = SchedulerPeer(scheduler, config['identity'], concurrent=config.get('concurrent', False),
                          **{k: config[k] for k in ('queue_limit', 'source_max_leases',
-                                                   'source_max_lease_fraction') if k in config})
+                                                   'source_max_lease_fraction', 'source_offthread') if k in config})
     address = peer.start_service(config.get('service_host', '127.0.0.1'), config.get('service_port', 0))
     logger.info('L1_PEER_SERVICE %s', address)
     return peer
@@ -707,7 +741,7 @@ def scheduler_peer_rpc(scheduler, action, payload):
             raise RuntimeError('Peer already initialized')
         scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'], concurrent=options.get('concurrent', False),
                                            **{k: options[k] for k in ('queue_limit', 'source_max_leases',
-                                                                      'source_max_lease_fraction') if k in options})
+                                                                      'source_max_lease_fraction', 'source_offthread') if k in options})
         result = scheduler._l1_peer.stats()
     else:
         if action not in ('listen', 'serve', 'restore', 'finish', 'stats', 'start_service', 'request_result'):

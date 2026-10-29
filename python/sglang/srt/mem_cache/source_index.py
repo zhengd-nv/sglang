@@ -4,7 +4,9 @@
 A target names a prefix by its last page key alone: the key chains over every
 earlier page, so finding it at the right depth identifies the whole prefix.
 Installed only on L1 sources; it hashes every new device node at insert, the
-same keys HiCache storage computes (``compute_node_hash_values``).
+same keys HiCache storage computes (``compute_node_hash_values``). With a
+``ready_stream`` each new node also records an event there, so a reader off the
+scheduler thread waits for exactly the forwards that wrote the path.
 """
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -24,6 +26,7 @@ class SourceKeyIndex:
         if not isinstance(core, UnifiedTreeCore):
             raise ValueError('L1 source key index requires the Python UnifiedTreeCore')
         self.core, self.page_size = core, page_size
+        self.ready_stream = None
         self._nodes = {}
         core.backfill_missing_hash_values()
         stack = [core.root_node]
@@ -45,11 +48,17 @@ class SourceKeyIndex:
             node = add(*args, **kwargs)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, page_size)
+            if self.ready_stream is not None:
+                import torch
+                # Insert follows the launch of the forward that wrote this node's KV.
+                node._l1_ready = torch.cuda.Event()
+                node._l1_ready.record(self.ready_stream)
             self._register(node)
             return node
 
         def split_node(*args, **kwargs):
             new_node, action = split(*args, **kwargs)
+            new_node._l1_ready = getattr(args[1] if len(args) > 1 else kwargs['child'], '_l1_ready', None)
             self._register(new_node)  # its pages moved out of the child
             return new_node, action
 
@@ -72,6 +81,16 @@ class SourceKeyIndex:
 
     def __len__(self):
         return len(self._nodes)
+
+    def ready_events(self, node):
+        """Insert-time events of ``node`` and its ancestors; nodes without one predate it."""
+        events = []
+        while node is not None and node is not self.core.root_node:
+            event = getattr(node, '_l1_ready', None)
+            if event is not None:
+                events.append(event)
+            node = node.parent
+        return tuple(events)
 
     def find(self, key, end):
         """Node holding the page that ends at token ``end``; ValueError on any miss."""

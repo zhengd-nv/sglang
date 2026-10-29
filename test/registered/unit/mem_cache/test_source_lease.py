@@ -110,6 +110,28 @@ class SourceLeaseTests(unittest.TestCase):
         with self.assertRaises(ValueError): by_key(keys[-1], 16, 8)
         self.assertFalse(self.cache.source_leases.busy)
 
+    def test_tree_lock_serializes_worker_leases_with_scheduler_calls(self):
+        """A network worker leases between scheduler cache calls: it waits while the
+        scheduler holds the tree access lock, and bypassing the lock is refused."""
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from sglang.srt.mem_cache.source_index import prefix_page_keys
+        from sglang.srt.mem_cache.tree_access_lock import install_tree_access_lock
+        self.cache.source_leases.enable_key_index(ready_stream=torch.cuda.current_stream())
+        lock = install_tree_access_lock(self.cache)
+        key = prefix_page_keys(list(range(16)), 4)[-1]
+        args = dict(end=16, start=0, fingerprint='test-model:fp16:nhd:tp1', ready=lambda: None)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            bypass = executor.submit(self.cache.source_leases.acquire_by_key, key, **args)
+            with self.assertRaises(RuntimeError): bypass.result(timeout=5)
+            with lock:  # the scheduler is inside a cache call
+                future = executor.submit(self.cache.acquire_source_lease_by_key, key, **args)
+                time.sleep(0.05)
+                self.assertFalse(future.done())
+            lease = future.result(timeout=5)
+        self.assertEqual(lease.token_indices, tuple(self.indices.tolist()))
+        self.cache.release_source_lease(lease, drained=True)
+
     def test_ready_failure_and_miss(self):
         def failure(): raise RuntimeError('producer failed')
         with self.assertRaises(RuntimeError): self.acquire(ready=failure)
