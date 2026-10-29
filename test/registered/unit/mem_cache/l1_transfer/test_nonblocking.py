@@ -9,7 +9,7 @@ from unittest.mock import Mock
 from sglang.srt.mem_cache.l1_transfer.peer.nonblocking import AsyncRPC, SourceService
 from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, parse_l1_config, scheduler_peer_rpc
 from sglang.srt.mem_cache.l1_transfer.peer.restore import RestoreState
-from sglang.srt.mem_cache.l1_transfer.peer.control import RemoteRejected
+from sglang.srt.mem_cache.l1_transfer.peer.control import PROTOCOL_VERSION, RemoteRejected
 from sglang.srt.mem_cache.l1_transfer.peer.peer import SourceEndpoint
 
 
@@ -137,16 +137,17 @@ class NonblockingTests(unittest.TestCase):
                                          capacity=8, bindings={}, engine=Mock())
         source.adapter.engine.any_in_flight.return_value = False
         source.adapter.engine.export_memories.return_value = [SimpleNamespace(to_dict=lambda: {'region': 'r'}, lease_id='x')]
-        def acquire_source_lease(key, *, fingerprint, ready):
+        def acquire_source_lease_by_key(key, *, end, start, fingerprint, ready):
             ready()
-            return SimpleNamespace(page_indices=tuple(range(len(key) // 2)), incarnation='i', epoch=0, lease_id='l')
+            return SimpleNamespace(page_indices=tuple(range(start // 2, end // 2)), incarnation='i', epoch=0, lease_id='l')
         source.cache = SimpleNamespace(source_leases=SimpleNamespace(_check_thread=lambda: None),
-                                       acquire_source_lease=Mock(side_effect=acquire_source_lease))
+                                       acquire_source_lease_by_key=Mock(side_effect=acquire_source_lease_by_key))
         return source
 
     @staticmethod
     def acquire(rid, tokens=4):
-        return dict(version=1, operation='acquire', id=rid * 32, contract={'model': 'm'}, tokens=list(range(tokens)))
+        return dict(version=PROTOCOL_VERSION, operation='acquire', id=rid * 32, contract={'model': 'm'},
+                    key='k' * 64, end=tokens, start=0)
 
     def test_online_source_offers_only_after_producer_event(self):
         source = self.online_source()
@@ -160,7 +161,7 @@ class NonblockingTests(unittest.TestCase):
         self.assertEqual(source.poll_ready(), [])
         source.adapter.engine.any_in_flight.return_value = False
         [(rid, offer)] = source.poll_ready()
-        self.assertEqual((rid, offer['pages']), ('a' * 32, [0, 1]))
+        self.assertEqual((rid, offer['page_runs']), ('a' * 32, [[0, 2]]))
         self.assertIn(rid, source.active)
         self.assertFalse(source.pending)
 
@@ -173,7 +174,7 @@ class NonblockingTests(unittest.TestCase):
         source.dispatch_deferred(self.acquire('c', tokens=2), record_producer=lambda: done)
         with self.assertRaisesRegex(RemoteRejected, 'lease quota'):
             source.dispatch_deferred(self.acquire('d', tokens=2), record_producer=lambda: done)
-        self.assertEqual(source.cache.acquire_source_lease.call_count, 2)
+        self.assertEqual(source.cache.acquire_source_lease_by_key.call_count, 2)
 
     def test_closed_connection_checks_only_its_own_lease(self):
         peer = self.peer()

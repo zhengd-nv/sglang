@@ -86,6 +86,30 @@ class SourceLeaseTests(unittest.TestCase):
                 executor.submit(self.cache.release_source_lease, lease, drained=True).result()
         self.assertTrue(self.cache.source_leases.busy)
 
+    def test_page_key_lease_is_depth_checked_split_safe_and_evictable(self):
+        """A target's own page keys must name the source prefix: only [L, H) is leased,
+        a key at another depth is refused, a later split keeps the prefix findable,
+        and after eviction the key misses instead of returning a stale node."""
+        from sglang.srt.mem_cache.source_index import prefix_page_keys
+        self.cache.source_leases.enable_key_index()
+        keys = prefix_page_keys(list(range(16)), 4)
+        def by_key(key, end, start):
+            return self.cache.acquire_source_lease_by_key(key, end=end, start=start,
+                fingerprint='test-model:fp16:nhd:tp1', ready=torch.cuda.synchronize)
+        lease = by_key(keys[-1], 16, 8)
+        self.assertEqual(lease.token_indices, tuple(self.indices[8:16].tolist()))
+        with self.assertRaises(ValueError): by_key(keys[1], 16, 8)  # key of page 2 ends at 8
+        branch = self.allocator.alloc(4)
+        self.cache.insert(InsertParams(key=RadixKey(array('q', [*range(8), 90, 91, 92, 93])),
+                                       value=torch.cat((self.indices[:8], branch))))
+        inner = by_key(keys[1], 8, 0)  # page 2 now ends a split-off node
+        self.assertEqual(inner.token_indices, tuple(self.indices[:8].tolist()))
+        for item in (lease, inner):
+            self.cache.release_source_lease(item, drained=True)
+        self.cache.evict(EvictParams(num_tokens=64))
+        with self.assertRaises(ValueError): by_key(keys[-1], 16, 8)
+        self.assertFalse(self.cache.source_leases.busy)
+
     def test_ready_failure_and_miss(self):
         def failure(): raise RuntimeError('producer failed')
         with self.assertRaises(RuntimeError): self.acquire(ready=failure)

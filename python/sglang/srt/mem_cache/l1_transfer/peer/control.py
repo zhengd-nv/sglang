@@ -13,6 +13,8 @@ import uuid
 from dataclasses import asdict, dataclass
 
 MAX_FRAME = 8 * 1024 * 1024
+# 2: acquire names a prefix by <last page key, end, start>; offers carry page runs.
+PROTOCOL_VERSION = 2
 
 
 def digest(value):
@@ -90,11 +92,11 @@ class SocketRPC:
     def call(self, operation, **payload):
         if self.failed:
             raise RuntimeError('control channel quarantined')
-        request = {'version': 1, 'id': uuid.uuid4().hex, 'operation': operation, **payload}
+        request = {'version': PROTOCOL_VERSION, 'id': uuid.uuid4().hex, 'operation': operation, **payload}
         try:
             send(self.sock, request)
             response = receive(self.sock)
-            if response.get('version') != 1 or response.get('id') != request['id']:
+            if response.get('version') != PROTOCOL_VERSION or response.get('id') != request['id']:
                 raise ValueError('stale or mismatched response')
             if response.get('ok') is not True:
                 if response.get('safe_rejection') is True:
@@ -110,7 +112,7 @@ class SocketRPC:
 
 def serve_once(sock, endpoint):
     request = receive(sock)
-    response = {'version': 1, 'id': request.get('id'), 'ok': False}
+    response = {'version': PROTOCOL_VERSION, 'id': request.get('id'), 'ok': False}
     try:
         response['result'] = endpoint.dispatch(request)
         response['ok'] = True

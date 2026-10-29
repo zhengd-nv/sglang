@@ -15,7 +15,8 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, EvictParams
 from test_source_lease import make_cache
 from sglang.srt.mem_cache.l1_transfer.transport import NvlinkEngine
 from sglang.srt.mem_cache.l1_transfer.transport.sglang_adapter import SGLangPoolAdapter
-from sglang.srt.mem_cache.l1_transfer.peer.control import ModelIdentity, SocketRPC, RemoteRejected, digest, serve_once, send, receive
+from sglang.srt.mem_cache.l1_transfer.peer.control import PROTOCOL_VERSION, ModelIdentity, SocketRPC, RemoteRejected, digest, serve_once, send, receive
+from sglang.srt.mem_cache.source_index import prefix_page_keys
 from sglang.srt.mem_cache.l1_transfer.peer.peer import SourceEndpoint, PeerReceiver
 
 spec=importlib.util.spec_from_file_location('gpu_helpers',Path(__file__).with_name('test-gpu.py'))
@@ -93,8 +94,9 @@ def run(root,rank):
                     except RemoteRejected:pass
                     else:raise AssertionError('altered receipt accepted')
                     # Replay the original acquire ID: same lease, no extra pin/export.
-                    send(conn,{'version':1,'id':receipt['request_id'],'operation':'acquire',
-                               'tokens':tokens[:112],'contract':receiver.contract})
+                    send(conn,{'version':PROTOCOL_VERSION,'id':receipt['request_id'],'operation':'acquire',
+                               'key':prefix_page_keys(tokens[:112],receiver.adapter.layout.page_size)[-1],
+                               'end':112,'start':reservation.prefix_len,'contract':receiver.contract})
                     replay=receive(conn);assert replay['ok'] and replay['result']==session['offer']
                     if case=='cancel':tx.cancel();tx.cancel()
                     else:tx.start();tx.wait(30);tx.wait(0)

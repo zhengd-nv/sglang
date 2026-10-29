@@ -392,6 +392,12 @@ class UnifiedRadixCache(BasePrefixCache):
         """Scheduler-thread API; ready() must synchronize producer writes."""
         return self.source_leases.acquire(key, fingerprint=fingerprint, ready=ready)
 
+    def acquire_source_lease_by_key(self, page_key, *, end, start, fingerprint, ready):
+        """Scheduler-thread API; lease [start, end) of the prefix ending in page_key."""
+        return self.source_leases.acquire_by_key(
+            page_key, end=end, start=start, fingerprint=fingerprint, ready=ready
+        )
+
     def release_source_lease(self, lease, *, drained):
         return self.source_leases.release(lease, drained=drained)
 

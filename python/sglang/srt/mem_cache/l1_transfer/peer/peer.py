@@ -6,7 +6,9 @@ from array import array
 from sglang.srt.mem_cache.l1_transfer.transport import Opcode, RegionDescriptor
 from sglang.srt.mem_cache.l1_transfer.transport.api import MemoryHandle, TransferRequest
 from sglang.srt.mem_cache.l1_transfer.transport.layout import RegionSpan, plan_transfer, bind_regions
-from .control import contract, digest, wire_copy, RemoteRejected
+from sglang.srt.mem_cache.source_index import prefix_page_keys
+from sglang.srt.mem_cache.source_lease import page_runs
+from .control import PROTOCOL_VERSION, contract, digest, wire_copy, RemoteRejected
 from .restore import RestoreTransaction
 
 
@@ -41,6 +43,7 @@ class SourceEndpoint:
     """
     def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None):
         self.cache, self.adapter, self.ready = cache, adapter, ready
+        cache.source_leases.enable_key_index()  # targets name prefixes by page key
         self.contract = wire_copy(contract(identity, adapter.layout))
         self.max_leases = max_leases
         self.max_lease_pages = max_lease_pages
@@ -53,7 +56,7 @@ class SourceEndpoint:
 
     def dispatch(self, request):
         self.cache.source_leases._check_thread()
-        if request.get('version') != 1:
+        if request.get('version') != PROTOCOL_VERSION:
             raise RemoteRejected('unsupported protocol version')
         operation = request.get('operation')
         if operation == 'acquire':
@@ -65,7 +68,7 @@ class SourceEndpoint:
     def dispatch_deferred(self, request, *, record_producer):
         """Like dispatch, but acquire returns None and its offer comes from poll_ready."""
         self.cache.source_leases._check_thread()
-        if request.get('version') != 1:
+        if request.get('version') != PROTOCOL_VERSION:
             raise RemoteRejected('unsupported protocol version')
         if request.get('operation') == 'acquire':
             self.begin_acquire(request, record_producer=record_producer)
@@ -75,11 +78,11 @@ class SourceEndpoint:
     def _validate_acquire(self, request):
         if request.get('contract') != self.contract:
             raise RemoteRejected('incompatible model/context/layout')
-        tokens = request.get('tokens')
+        key, end, start = request.get('key'), request.get('end'), request.get('start')
         page = self.adapter.layout.page_size
-        if (not isinstance(tokens, list) or not tokens or len(tokens) % page or
-                any(type(x) is not int or not 0 <= x < 2**31 for x in tokens)):
-            raise RemoteRejected('complete token pages required')
+        if (not isinstance(key, str) or len(key) != 64 or type(end) is not int or type(start) is not int
+                or not 0 <= start < end or end % page or start % page):
+            raise RemoteRejected('page key and page-aligned 0 <= start < end required')
         request_id = request.get('id')
         if not isinstance(request_id, str) or len(request_id) != 32:
             raise RemoteRejected('invalid request ID')
@@ -87,43 +90,45 @@ class SourceEndpoint:
             raise RemoteRejected('request already released')
         if request_id in self.pending:
             raise RemoteRejected('request ID already pending')
-        return tokens, request_id, digest({'contract': self.contract, 'tokens': tokens})
+        span = (key, end, start)
+        return span, request_id, digest({'contract': self.contract, 'key': key, 'end': end, 'start': start})
 
-    def _check_quota(self, tokens):
+    def _check_quota(self, span):
         leases = list(self.active.values()) + [{'lease': p[0]} for p in self.pending.values()]
         if self.max_leases is not None and len(leases) >= self.max_leases:
             raise RemoteRejected('source busy: lease quota')
         if self.max_lease_pages is not None:
-            pages = len(tokens) // self.adapter.layout.page_size
+            pages = (span[1] - span[2]) // self.adapter.layout.page_size
             held = sum(len(item['lease'].page_indices) for item in leases)
             if held + pages > self.max_lease_pages:
                 raise RemoteRejected('source busy: leased page quota')
 
-    def _lock(self, tokens, fingerprint, ready):
-        from sglang.srt.mem_cache.radix_cache import RadixKey
+    def _lock(self, span, fingerprint, ready):
+        key, end, start = span
         try:
-            return self.cache.acquire_source_lease(RadixKey(array('q', tokens)), fingerprint=fingerprint, ready=ready)
+            return self.cache.acquire_source_lease_by_key(key, end=end, start=start,
+                                                          fingerprint=fingerprint, ready=ready)
         except ValueError as exc:
             raise RemoteRejected(str(exc)) from exc
 
     def acquire(self, request):
-        tokens, request_id, fingerprint = self._validate_acquire(request)
+        span, request_id, fingerprint = self._validate_acquire(request)
         if request_id in self.active:
             entry = self.active[request_id]
             if entry['receipt']['fingerprint'] != fingerprint:
                 raise RemoteRejected('request ID reused with different prefix')
             return entry['offer']
-        self._check_quota(tokens)
-        return self._offer(request_id, self._lock(tokens, fingerprint, self.ready), fingerprint)
+        self._check_quota(span)
+        return self._offer(request_id, self._lock(span, fingerprint, self.ready), fingerprint)
 
     def begin_acquire(self, request, *, record_producer):
         """Lock the prefix and record the producer event; the offer follows in poll_ready."""
-        tokens, request_id, fingerprint = self._validate_acquire(request)
+        span, request_id, fingerprint = self._validate_acquire(request)
         if request_id in self.active:
             raise RemoteRejected('request ID already acquired')
-        self._check_quota(tokens)
+        self._check_quota(span)
         events = []
-        lease = self._lock(tokens, fingerprint, lambda: events.append(record_producer()))
+        lease = self._lock(span, fingerprint, lambda: events.append(record_producer()))
         self.pending[request_id] = (lease, fingerprint, events[0])
         return request_id
 
@@ -148,15 +153,17 @@ class SourceEndpoint:
             exports = self.adapter.engine.export_memories(self.adapter.memories, 'read')
             if self._static_offer is None:
                 ids = {h.region_id:i for i,h in enumerate(self.adapter.memories)}
+                # tier/protection: an EGM (L2) region may be owned and protected differently.
                 self._static_offer = wire_copy({
                     'contract': self.contract, 'capacity': self.adapter.capacity,
+                    'tier': 'hbm', 'protection': 'tree-pin',
                     'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
                                     for s in spans] for k,spans in self.adapter.bindings.items()}})
                 self._region_templates = [d.to_dict() for d in exports]
             receipt = {'request_id': request_id, 'incarnation': lease.incarnation,
                        'epoch': lease.epoch, 'lease_id': lease.lease_id, 'fingerprint': fingerprint}
             # Every field is already a JSON value (str/int), so no deep copy is needed.
-            offer = dict(self._static_offer, receipt=receipt, pages=[int(p) for p in lease.page_indices],
+            offer = dict(self._static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
                          regions=[dict(t, lease_id=d.lease_id) for t, d in zip(self._region_templates, exports)])
             self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
             return offer
@@ -232,22 +239,28 @@ class PeerReceiver:
             publish()
             return self.pending  # all-local hit: no RPC/data transfer
         try:
-            offer = yield 'acquire', dict(tokens=complete, contract=self.contract)
+            key = prefix_page_keys(complete, page)[-1]
+            start, end = reservation.prefix_len, len(complete)
+            offer = yield 'acquire', dict(key=key, end=end, start=start, contract=self.contract)
         except RemoteRejected:
             reservation.discard(); self.pending = None
             raise
         self.pending['offer'] = offer
-        expected = digest({'contract':self.contract, 'tokens':complete})
+        expected = digest({'contract': self.contract, 'key': key, 'end': end, 'start': start})
         if offer['contract'] != self.contract or offer['receipt']['fingerprint'] != expected:
             raise ValueError('offer identity mismatch; fail-stop')
-        pages = offer['pages']
-        if len(pages)*page != len(complete) or len(set(pages)) != len(pages) or any(type(x) is not int or x <= 0 for x in pages):
+        runs = offer['page_runs']
+        if not isinstance(runs, list) or any(not isinstance(r, list) or len(r) != 2
+                or any(type(x) is not int for x in r) or r[0] <= 0 or r[1] <= 0 for r in runs):
+            raise ValueError('invalid source page runs; fail-stop')
+        pages = [first + i for first, count in runs for i in range(count)]
+        if len(pages)*page != end - start or len(set(pages)) != len(pages):
             raise ValueError('invalid source pages; fail-stop')
         descriptors = [RegionDescriptor.from_dict(d) for d in offer['regions']]
         if not descriptors or len({d.owner_id for d in descriptors}) != 1 or any(d.access != 'read' for d in descriptors):
             raise ValueError('invalid source region ownership; fail-stop')
         plan = plan_transfer(self.adapter.layout, self.adapter.layout,
-            pages[reservation.prefix_len//page:], reservation.pages,
+            pages, reservation.pages,
             source_capacity=offer['capacity'], target_capacity=self.adapter.capacity)
         needed, planned = plan_remote_regions(descriptors, offer['bindings'], plan, self.adapter.bindings)
         imported = self.pending['imports']
