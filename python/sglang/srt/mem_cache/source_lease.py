@@ -8,6 +8,7 @@ With a tree access lock installed, a lock holder on another thread may lease too
 from collections import Counter
 from dataclasses import dataclass, field
 import threading
+import time
 import uuid
 
 # Source leases (possibly off the scheduler thread) and target reservations share
@@ -31,6 +32,27 @@ def unpin_pages(allocator, pages):
                 del counter[page]
 
 
+class PageGenerations:
+    """Per-page free counter; a page whose count is unchanged was never reused.
+
+    Bumped on CPU before the free becomes visible to any allocation, so a copy
+    that finished before an unchanged read cannot have seen a later owner's KV.
+    """
+    def __init__(self, num_pages):
+        import numpy
+        self.values = numpy.zeros(num_pages + 1, dtype=numpy.int64)
+
+    def bump(self, page_ids):
+        import numpy
+        numpy.add.at(self.values, page_ids.cpu().numpy(), 1)
+
+    def bump_all(self):
+        self.values += 1
+
+    def snapshot(self, pages):
+        return tuple(int(x) for x in self.values[list(pages)])
+
+
 def count_pool_lease(pool, delta):
     with _PIN_LOCK:
         pool._l1_transfer_lease_count = getattr(pool, '_l1_transfer_lease_count', 0) + delta
@@ -49,6 +71,10 @@ class SourceLease:
     ready_events: tuple = field(default=(), compare=False)
     # hbm: device pages under the radix lock; egm: host pages under host_lock_ref.
     tier: str = 'hbm'
+    # tree: locked before the offer. step: locked at the next scheduler step, read
+    # optimistically and valid only if the page generations are unchanged at release.
+    protection: str = 'tree'
+    generations: tuple = ()
 
 
 def page_runs(pages):
@@ -75,6 +101,10 @@ class SourceLeaseManager:
         self.tree_lock = None
         # Set by an L2 (HiCache) source; such an Engine never restores as a target.
         self.allow_host_pool = False
+        self.generations = None
+        # lease_id -> step-lock state of an optimistic lease; released ones move to step_log.
+        self._step = {}
+        self.step_log = {}
 
     def _check_thread(self):
         if threading.get_ident() == self._thread:
@@ -138,7 +168,16 @@ class SourceLeaseManager:
         match = self.cache.match_prefix(MatchPrefixParams(key=key))
         return self._lease(match.last_device_node, 0, len(key), fingerprint, ready, allocator, pool)
 
-    def acquire_by_key(self, page_key, *, end, start, fingerprint, ready, tier='hbm'):
+    def enable_step_protection(self):
+        """Track page generations so a lease may be read before its lock applies (c')."""
+        self._check_thread()
+        allocator, _ = self.validate_cache()
+        if self.generations is None:
+            self.generations = PageGenerations(allocator.size // allocator.page_size)
+            allocator._l1_page_generations = self.generations
+        return self.generations
+
+    def acquire_by_key(self, page_key, *, end, start, fingerprint, ready, tier='hbm', protection='tree'):
         """Lease [start, end) of the prefix whose last page key is ``page_key``."""
         self._check_thread()
         allocator, pool = self.validate_cache()
@@ -155,8 +194,69 @@ class SourceLeaseManager:
         self.key_index.touch(node)
         if tier == 'egm':
             return self._lease_host(node, start, end, fingerprint, ready, page_size)
+        if protection == 'step':
+            return self._lease_optimistic(node, page_key, start, end, fingerprint, allocator, pool)
+        if protection != 'tree':
+            raise ValueError('protection must be tree or step')
         return self._lease(node.id, start, end, fingerprint, ready, allocator, pool,
                            events=self.key_index.ready_events(node))
+
+    def _path_pages(self, node_id, start, end, page_size):
+        path = self.cache.path_device_indices(node_id)
+        if len(path) < end:
+            raise ValueError('requested prefix is not fully resident')
+        indices = tuple(int(x) for x in path[start:end].tolist())
+        pages = []
+        for first in range(0, len(indices), page_size):
+            row = indices[first:first + page_size]
+            if row[0] % page_size or row != tuple(range(row[0], row[0] + page_size)):
+                raise ValueError('source page is not physically contiguous/aligned')
+            pages.append(row[0] // page_size)
+        if len(set(pages)) != len(pages):
+            raise ValueError('duplicate source pages')
+        return indices, tuple(pages)
+
+    def _lease_optimistic(self, node, page_key, start, end, fingerprint, allocator, pool):
+        """No lock and no pin: the scheduler locks at its next step (apply_step_locks)."""
+        if self.generations is None:
+            raise RuntimeError('step protection not enabled')
+        indices, pages = self._path_pages(node.id, start, end, allocator.page_size)
+        lease = SourceLease(self.incarnation, self.epoch, uuid.uuid4().hex, fingerprint, indices, pages,
+                            self.key_index.ready_events(node), 'hbm', 'step',
+                            self.generations.snapshot(pages))
+        count_pool_lease(pool, 1)
+        self._active[lease.lease_id] = (lease, None, allocator, pool)
+        self._step[lease.lease_id] = dict(key=page_key, end=end, granted=time.time(), locked=None,
+                                          outcome=None, pages=len(pages))
+        return lease
+
+    def _generations_unchanged(self, lease):
+        return self.generations.snapshot(lease.page_indices) == lease.generations
+
+    def apply_step_locks(self):
+        """Lock every optimistic lease still unlocked; call at a scheduler step boundary.
+
+        A lease whose pages were freed meanwhile is left unlocked and fails at release.
+        With TP>1 this runs on every rank at the same step (ridden on the input broadcast).
+        """
+        self._check_thread()
+        for lease_id, state in list(self._step.items()):
+            if state['outcome'] is not None:
+                continue
+            lease, _, allocator, pool = self._active[lease_id]
+            if not self._generations_unchanged(lease):
+                state['outcome'] = 'stale_at_lock'
+                continue
+            try:
+                node = self.key_index.find(state['key'], state['end'], 'hbm')
+            except ValueError:
+                state['outcome'] = 'stale_at_lock'  # unreachable while no page was freed
+                continue
+            lock = self.cache.lock(node.id)
+            pin_pages(allocator, lease.page_indices)
+            self._active[lease_id] = (lease, lock, allocator, pool)
+            state['locked'] = time.time()
+            state['outcome'] = 'locked'
 
     def _lease(self, node_id, start, end, fingerprint, ready, allocator, pool, events=()):
         cache = self.cache
@@ -237,7 +337,21 @@ class SourceLeaseManager:
         if item is None or item[0] != lease:
             raise ValueError('unknown or altered source lease')
         _, lock, allocator, pool = item
-        if isinstance(lock, tuple) and lock[0] == 'host':
+        if lease.protection == 'step':
+            state = self._step.pop(lease.lease_id)
+            if state['outcome'] is None:
+                state['outcome'] = 'released_unlocked'
+            # A lock only stops future frees; the generations cover the unlocked window.
+            state['valid'] = state['outcome'] != 'stale_at_lock' and self._generations_unchanged(lease)
+            state['released'] = time.time()
+            if lock is not None:
+                self.cache.unlock(lock)
+                unpin_pages(allocator, lease.page_indices)
+            count_pool_lease(pool, -1)
+            self.step_log[lease.lease_id] = state
+            while len(self.step_log) > 8192:
+                del self.step_log[next(iter(self.step_log))]
+        elif isinstance(lock, tuple) and lock[0] == 'host':
             self.cache.dec_host_lock_ref(lock[1], lock[2])
         else:
             self.cache.unlock(lock)
@@ -246,3 +360,9 @@ class SourceLeaseManager:
         del self._active[lease.lease_id]
         self._released.add(lease)
         return True
+
+    def lease_valid(self, lease):
+        """After release: was the optimistic read intact (always True for a locked lease)."""
+        if lease.protection != 'step':
+            return True
+        return self.step_log[lease.lease_id]['valid']

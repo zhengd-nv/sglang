@@ -35,7 +35,7 @@ class RestoreTransaction:
     Source ready and target exclusive ownership remain adapter prerequisites.
     """
     def __init__(self, engine, requests, imports, *, publish, discard,
-                 release_source, keepalive=()):
+                 release_source, keepalive=(), validate_on_release=False):
         requests, imports = tuple(requests), tuple(imports)
         if not requests or any(not isinstance(r, TransferRequest) or r.opcode is not Opcode.READ
                                for r in requests):
@@ -59,6 +59,10 @@ class RestoreTransaction:
         self.discarded = False
         self.source_released = False
         self.cancel_requested = False
+        # Optimistic source: publish only after the release ACK says the read was intact.
+        self.validate_on_release = validate_on_release
+        self.copied = False
+        self.stale = False
         self.unmapped_count = 0
         self._context = (os.getpid(), threading.get_ident())
         self._busy = False
@@ -98,12 +102,9 @@ class RestoreTransaction:
             for handle in self.imports:
                 self.engine.unregister_memory(handle)
                 self.unmapped_count += 1
-            if success:
-                self._publish()
-                self.published = True
-            else:
-                self._discard()
-                self.discarded = True
+            self.copied = success
+            if not self.validate_on_release:
+                self._settle(success)
             self.state = RestoreState.RELEASING
             return self._poll_release()
         except BaseException as exc:
@@ -111,11 +112,25 @@ class RestoreTransaction:
             raise
         return self.state
 
+    def _settle(self, success):
+        if success:
+            self._publish()
+            self.published = True
+        else:
+            self._discard()
+            self.discarded = True
+
     def _poll_release(self):
         try:
             # False means ACK pending; None preserves the synchronous callback API.
-            if self._release_source() is not False:
+            answer = self._release_source()
+            if answer is not False:
                 self.source_released = True
+                if self.validate_on_release:
+                    if type(answer) is not dict or type(answer.get('valid')) is not bool:
+                        raise RuntimeError('optimistic source release must report validity')
+                    self.stale = self.copied and not answer['valid']
+                    self._settle(self.copied and answer['valid'])
                 self.state = RestoreState.PUBLISHED if self.published else RestoreState.DISCARDED
         except BaseException as exc:
             self._quarantine(exc)

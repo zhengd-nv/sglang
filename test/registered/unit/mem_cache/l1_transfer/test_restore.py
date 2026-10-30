@@ -236,7 +236,36 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(self.events, ['publish', 'release'])
         self.receiver.wait.assert_not_called()
 
-
+    def test_optimistic_source_publishes_only_a_read_its_release_validates(self):
+        """An optimistic source may reuse the pages mid-read: the target publishes only
+        after the release ACK reports the read intact, and discards a stale read
+        (a fallback, not a fault) even though the copy itself succeeded."""
+        for valid, expected in ((True, ['release', 'publish']), (False, ['release', 'discard'])):
+            events = []
+            descriptor = self.owner.export_memory(self.source)
+            remote = self.receiver.import_memory(descriptor)
+            answers = iter((False, {'released': True, 'valid': valid}))
+            def release():
+                answer = next(answers)
+                if answer is not False:
+                    events.append('release')
+                return answer
+            tx = RestoreTransaction(self.receiver, [replace(self.request, remote=remote)], [remote],
+                publish=lambda: events.append('publish'), discard=lambda: events.append('discard'),
+                release_source=release, validate_on_release=True)
+            self.driver.state = 1; tx.start()
+            self.assertEqual(tx.poll(), RestoreState.RELEASING)
+            self.assertEqual(events, [])  # ACK pending: nothing settled yet
+            self.assertEqual(tx.poll(), RestoreState.PUBLISHED if valid else RestoreState.DISCARDED)
+            self.assertEqual(events, expected)
+            self.assertEqual(tx.stale, not valid)
+            self.owner.release_export(descriptor.lease_id)
+        missing = RestoreTransaction(self.receiver, [self.request], [self.remote], publish=self.publish,
+            discard=self.discard, release_source=lambda: {'released': True}, validate_on_release=True)
+        missing.start()
+        with self.assertRaises(RuntimeError): missing.wait()  # an ACK without validity is a fault
+        self.assertEqual(missing.state, RestoreState.QUARANTINED)
+        self.assertEqual(self.events, [])  # neither published nor discarded
 
     def test_plan_contract(self):
         for requests, imports in (([], []), ([replace(self.request, opcode=Opcode.WRITE)], [self.remote]),

@@ -149,6 +149,35 @@ class SourceLeaseTests(unittest.TestCase):
         self.assertEqual(lease.token_indices, tuple(self.indices.tolist()))
         self.cache.release_source_lease(lease, drained=True)
 
+    def step_lease(self):
+        from sglang.srt.mem_cache.source_index import prefix_page_keys
+        self.cache.source_leases.enable_key_index()
+        self.cache.source_leases.enable_step_protection()
+        return self.cache.acquire_source_lease_by_key(prefix_page_keys(list(range(16)), 4)[-1],
+            end=16, start=0, fingerprint='test-model:fp16:nhd:tp1', ready=lambda: None, protection='step')
+
+    def test_step_lease_is_invalid_once_a_page_was_freed_before_its_lock(self):
+        """An optimistic (c') lease holds nothing until the next step: eviction may free
+        and reuse its pages, and then neither the step lock nor the release may call
+        the read intact, even after the same page IDs come back."""
+        lease = self.step_lease()
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 16)
+        reused = self.allocator.alloc(16)
+        self.assertEqual(sorted(reused.tolist()), sorted(self.indices.tolist()))
+        self.cache.source_leases.apply_step_locks()
+        self.assertTrue(self.cache.release_source_lease(lease, drained=True))
+        self.assertFalse(self.cache.source_leases.lease_valid(lease))
+        self.assertEqual(self.cache.source_leases.step_log[lease.lease_id]['outcome'], 'stale_at_lock')
+
+    def test_step_lock_protects_the_rest_of_the_read(self):
+        """Once the step lock applies, eviction cannot touch the pages and the read stays valid."""
+        lease = self.step_lease()
+        self.cache.source_leases.apply_step_locks()
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 0)
+        self.assertTrue(self.cache.release_source_lease(lease, drained=True))
+        self.assertTrue(self.cache.source_leases.lease_valid(lease))
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 16)
+
     def test_ready_failure_and_miss(self):
         def failure(): raise RuntimeError('producer failed')
         with self.assertRaises(RuntimeError): self.acquire(ready=failure)

@@ -41,7 +41,8 @@ def _mapping_peer_device(device):
 
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
-                 source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True):
+                 source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True,
+                 source_protection='tree'):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
@@ -49,6 +50,11 @@ class SchedulerPeer:
             raise ValueError('Peer restore requires ordinary TP/PP/DP1, no speculation/LoRA, max_running_requests=1')
         if type(concurrent) is not bool or type(source_offthread) is not bool:
             raise ValueError('concurrent and source_offthread must be boolean')
+        if source_protection not in ('tree', 'step'):
+            raise ValueError('source_protection must be tree or step')
+        if source_protection == 'step' and not (concurrent and source_offthread):
+            raise ValueError('step source protection requires a concurrent off-thread source')
+        self.source_protection = source_protection
         if type(queue_limit) is not int or queue_limit < 0:
             raise ValueError('queue_limit must be a nonnegative integer')
         if type(source_max_leases) is not int or source_max_leases < 1:
@@ -103,7 +109,7 @@ class SchedulerPeer:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, None,
                 max_leases=source_max_leases,
                 max_lease_pages=int(allocator.size // allocator.page_size * source_max_lease_fraction),
-                host_adapter=self.host_adapter)
+                host_adapter=self.host_adapter, protection=source_protection)
         else:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
         self.source_waiters = {}  # request_id -> acquire Future awaiting the producer event
@@ -295,8 +301,11 @@ class SchedulerPeer:
 
     def endpoint_info(self):
         """What a router or peer needs to address and check this source."""
+        with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
+            step_log = list(self.cache.source_leases.step_log.values())
         return dict(service=self.service_address, contract_digest=digest(self.source.contract),
-                    concurrent=self.concurrent, stats=self.stats(), source_timing=list(self.source_timing))
+                    concurrent=self.concurrent, stats=self.stats(), source_timing=list(self.source_timing),
+                    source_protection=getattr(self, 'source_protection', 'tree'), source_step_log=step_log)
 
     def start_request(self, req, options):
         from .request import restore_payload
@@ -685,6 +694,10 @@ class SchedulerPeer:
             self.capacity.prune()
         if self.service is not None:
             self._serve_source_events()
+        if getattr(self, 'source_protection', 'tree') == 'step':
+            # The step boundary: after input ingestion, before this step allocates or evicts.
+            with self.tree_lock:
+                self.cache.source_leases.apply_step_locks()
         if self.request is not None and self.deadline is not None and time.monotonic() >= self.deadline:
             self.cancel_request('WAIT_TIMEOUT')
         self._expire_queued()
@@ -715,7 +728,8 @@ class SchedulerPeer:
                 else:
                     self._ready()
             elif state == RestoreState.DISCARDED:
-                self._fail_request(self.cancel_reason or 'TRANSFER_FAILED_DRAINED')
+                stale = self.session['transaction'].stale
+                self._fail_request(self.cancel_reason or ('SOURCE_STALE' if stale else 'TRANSFER_FAILED_DRAINED'))
             elif state == RestoreState.RELEASING:
                 self.phase = 'WAIT_RELEASE'
             elif state != RestoreState.IN_FLIGHT:
@@ -723,7 +737,10 @@ class SchedulerPeer:
 
 
 L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
-                  'source_max_leases', 'source_max_lease_fraction', 'source_offthread'}
+                  'source_max_leases', 'source_max_lease_fraction', 'source_offthread',
+                  'source_protection'}
+_PEER_OPTION_KEYS = ('queue_limit', 'source_max_leases', 'source_max_lease_fraction',
+                     'source_offthread', 'source_protection')
 
 
 def parse_l1_config(text):
@@ -741,8 +758,7 @@ def init_scheduler_peer_from_config(scheduler, text):
     """Build the peer on the scheduler thread and start its source service."""
     config = parse_l1_config(text)
     peer = SchedulerPeer(scheduler, config['identity'], concurrent=config.get('concurrent', False),
-                         **{k: config[k] for k in ('queue_limit', 'source_max_leases',
-                                                   'source_max_lease_fraction', 'source_offthread') if k in config})
+                         **{k: config[k] for k in _PEER_OPTION_KEYS if k in config})
     address = peer.start_service(config.get('service_host', '127.0.0.1'), config.get('service_port', 0))
     logger.info('L1_PEER_SERVICE %s', address)
     return peer
@@ -757,8 +773,7 @@ def scheduler_peer_rpc(scheduler, action, payload):
         if hasattr(scheduler, '_l1_peer'):
             raise RuntimeError('Peer already initialized')
         scheduler._l1_peer = SchedulerPeer(scheduler, options['identity'], concurrent=options.get('concurrent', False),
-                                           **{k: options[k] for k in ('queue_limit', 'source_max_leases',
-                                                                      'source_max_lease_fraction', 'source_offthread') if k in options})
+                                           **{k: options[k] for k in _PEER_OPTION_KEYS if k in options})
         result = scheduler._l1_peer.stats()
     else:
         if action not in ('listen', 'serve', 'restore', 'finish', 'stats', 'start_service', 'request_result'):

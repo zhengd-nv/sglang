@@ -383,6 +383,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def _release_page_ids(self, *page_ids: torch.Tensor):
         for ids in page_ids:
             self._check_source_pages(ids)
+        # Every page that becomes reusable passes here; optimistic L1 leases check it.
+        generations = getattr(self, "_l1_page_generations", None)
+        if generations is not None:
+            for ids in page_ids:
+                generations.bump(ids)
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
@@ -405,6 +410,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         if getattr(self, "_l1_pinned_pages", None) or getattr(self, "_l1_target_count", 0):
             raise RuntimeError("allocator has active L1 transfer leases")
+        generations = getattr(self, "_l1_page_generations", None)
+        if generations is not None:
+            generations.bump_all()
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device

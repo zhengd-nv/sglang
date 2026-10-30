@@ -50,7 +50,7 @@ class LifecycleTests(unittest.TestCase):
     def transferring(self, state):
         p = self.acquiring()
         p.phase = 'WAIT_TRANSFER'
-        tx = Mock()
+        tx = Mock(stale=False)
         tx.poll.return_value = state
         p.session = dict(transaction=tx)
         return p, tx
@@ -232,6 +232,14 @@ class LifecycleTests(unittest.TestCase):
         with patch(MODULE + '.torch.cuda.synchronize'):
             p._pump()
         self.assert_fallback('TRANSFER_FAILED_DRAINED')
+
+    def test_stale_optimistic_read_recomputes(self):
+        """A read an optimistic source reports stale is an ordinary fallback, never an abort."""
+        p, tx = self.transferring(RestoreState.DISCARDED)
+        tx.stale = True
+        with patch(MODULE + '.torch.cuda.synchronize'):
+            p._pump()
+        self.assert_fallback('SOURCE_STALE')
 
     def test_deadline_during_dma_waits_for_drain(self):
         p, tx = self.transferring(RestoreState.IN_FLIGHT)

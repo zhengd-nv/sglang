@@ -43,8 +43,15 @@ class SourceEndpoint:
     event, and poll_ready exports and offers only after that event completes.
     """
     def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None,
-                 host_adapter=None):
+                 host_adapter=None, protection='tree'):
         self.cache, self.adapter, self.ready = cache, adapter, ready
+        # tree: hbm leases are radix-locked before the offer. step (c'): locked at the
+        # next scheduler step, read optimistically, validated by page generations at release.
+        if protection not in ('tree', 'step'):
+            raise ValueError('protection must be tree or step')
+        self.protection = protection
+        if protection == 'step':
+            cache.source_leases.enable_step_protection()
         # tier -> pool adapter whose pages a lease of that tier names (egm: the L2 host pool).
         self.adapters = {'hbm': adapter, **({'egm': host_adapter} if host_adapter is not None else {})}
         cache.source_leases.enable_key_index()  # targets name prefixes by page key
@@ -56,6 +63,7 @@ class SourceEndpoint:
         # Per-tier constant offer fields, built on first use; regions vary only by lease_id.
         self._static_offers = {}
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
+        self.released_answers = {}  # request_id -> release answer, replayed on a duplicate release
 
     def dispatch(self, request):
         self.cache.source_leases._check_thread()
@@ -113,8 +121,9 @@ class SourceEndpoint:
     def _lock(self, span, fingerprint, ready):
         key, end, start, tier = span
         try:
-            return self.cache.acquire_source_lease_by_key(key, end=end, start=start,
-                                                          fingerprint=fingerprint, ready=ready, tier=tier)
+            return self.cache.acquire_source_lease_by_key(
+                key, end=end, start=start, fingerprint=fingerprint, ready=ready, tier=tier,
+                protection=self.protection if tier == 'hbm' else 'tree')
         except ValueError as exc:
             raise RemoteRejected(str(exc)) from exc
 
@@ -219,10 +228,12 @@ class SourceEndpoint:
         if lease.tier not in self._static_offers:
             adapter = self.adapters[lease.tier]
             ids = {h.region_id:i for i,h in enumerate(adapter.memories)}
-            # hbm pages are radix-locked; egm (L2 host) pages are held by host_lock_ref.
+            # hbm pages are radix-locked (or optimistic under step); egm pages are held by host_lock_ref.
+            protection = ('host-tree-pin' if lease.tier == 'egm'
+                          else 'optimistic' if lease.protection == 'step' else 'tree-pin')
             self._static_offers[lease.tier] = (wire_copy({
                 'contract': self.contract, 'capacity': adapter.capacity, 'tier': lease.tier,
-                'protection': 'tree-pin' if lease.tier == 'hbm' else 'host-tree-pin',
+                'protection': protection,
                 'bindings': {k:[[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
                                 for s in spans] for k,spans in adapter.bindings.items()}}),
                 [d.to_dict() for d in exports])
@@ -243,15 +254,18 @@ class SourceEndpoint:
         if rid in self.released:
             if self.released[rid] != receipt:
                 raise RemoteRejected('altered released receipt')
-            return {'released':True}
+            return self.released_answers[rid]
         entry = self.active.get(rid)
         if entry is None or entry['receipt'] != receipt:
             raise RemoteRejected('stale or altered source receipt')
         self.adapter.engine.release_exports([d.lease_id for d in entry['exports']])
         self.cache.release_source_lease(entry['lease'], drained=True)
+        # valid: an optimistic read saw no reuse of its pages; a locked lease is always valid.
+        answer = {'released': True, 'valid': self.cache.source_leases.lease_valid(entry['lease'])}
         self.released[rid] = receipt
+        self.released_answers[rid] = answer
         del self.active[rid]
-        return {'released':True}
+        return answer
 
 
 class PeerReceiver:
@@ -341,9 +355,13 @@ class PeerReceiver:
                 return False
             if answer.get('released') is not True:
                 raise RuntimeError('source release not confirmed')
+            return answer
+        if offer.get('protection') not in ('tree-pin', 'host-tree-pin', 'optimistic'):
+            raise ValueError('unknown source protection; fail-stop')
         self.pending['transaction'] = RestoreTransaction(self.adapter.engine, requests, imported,
             publish=publish, discard=reservation.discard, release_source=release,
-            keepalive=(reservation, self.adapter, offer))
+            keepalive=(reservation, self.adapter, offer),
+            validate_on_release=offer['protection'] == 'optimistic')
         return self.pending
 
     def finish_consumer(self):
