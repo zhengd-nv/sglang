@@ -406,19 +406,33 @@ class NvlinkEngine:
         return item.status
 
     @locked
+    def _in_flight_native(self, batch):
+        item = self._batch(batch)
+        return item.native if item.status.state == TransferState.IN_FLIGHT else None
+
+    @locked
+    def _fail_uncertain(self, batch, exc):
+        item = self._batch(batch)
+        item.status = TransferStatus(TransferState.FAILED_UNCERTAIN,
+                                     item.status.requested_bytes, None, error=str(exc))
+        for key in item.memories:
+            self._memories[key].poisoned = True
+
     def wait(self, batch, timeout=None):
+        """Block until ``batch`` completes or ``timeout``; the batch's owner alone waits and releases it.
+
+        The engine lock is not held while blocking, so other threads keep submitting and
+        polling their own batches (holding it serialized concurrent readers).
+        """
         if timeout is not None and (not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0):
             raise ValueError("timeout must be finite and non-negative")
         if os.environ.get("NVT_NATIVE_WAIT", "1") != "0" and hasattr(self._driver, "wait"):
-            item = self._batch(batch)
-            if item.status.state == TransferState.IN_FLIGHT:
+            native = self._in_flight_native(batch)
+            if native is not None:
                 try:
-                    self._driver.wait(item.native, timeout)
+                    self._driver.wait(native, timeout)
                 except Exception as exc:
-                    item.status = TransferStatus(TransferState.FAILED_UNCERTAIN,
-                                                 item.status.requested_bytes, None, error=str(exc))
-                    for key in item.memories:
-                        self._memories[key].poisoned = True
+                    self._fail_uncertain(batch, exc)
             result = self.get_transfer_status(batch)
             if result.state == TransferState.IN_FLIGHT:
                 raise TimeoutError("transfer still in flight; buffers must not be released")
