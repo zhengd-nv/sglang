@@ -64,6 +64,7 @@ class RestoreTransaction:
         self.copied = False
         self.stale = False
         self.unmapped_count = 0
+        self.retained_count = 0
         self._context = (os.getpid(), threading.get_ident())
         self._busy = False
 
@@ -100,6 +101,9 @@ class RestoreTransaction:
             if self.batch is not None:
                 self.engine.release_batch(self.batch)
             for handle in self.imports:
+                if self.engine.retains(handle):
+                    self.retained_count += 1  # shared across restores; drained is the proof
+                    continue
                 self.engine.unregister_memory(handle)
                 self.unmapped_count += 1
             self.copied = success

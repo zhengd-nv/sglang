@@ -64,7 +64,7 @@ class _Batch:
 class NvlinkEngine:
     def __init__(self, device: int, library: str | None = None, *,
                  mapping_peer_device: int | None = None, shared_read_exports: bool = False,
-                 _driver=None):
+                 retain_imports: bool = False, _driver=None):
         """Optionally keep peer-mapping state alive using private backing memory.
 
         mapping_peer_device must be a distinct, caller-authorized LOCAL CUDA device.
@@ -76,6 +76,10 @@ class NvlinkEngine:
         destination of local READ batches. The caller must guarantee that the
         remotely readable byte ranges never overlap those destinations. Exporting
         a region with a local batch in flight stays refused (the native layer too).
+
+        retain_imports keeps one mapping per peer region: a later lease of the same
+        region reuses it instead of importing again, and the caller must not unmap it
+        (``retains``). Release then attests drained DMA, not an unmap.
         """
         checked_int(device, "device")
         if mapping_peer_device is not None:
@@ -97,6 +101,9 @@ class NvlinkEngine:
         self._imported_leases = set()
         self._mapping_guard = None
         self._mapping_guard_poisoned = False
+        self._retain_imports = retain_imports
+        # (peer owner_id, peer region_id) -> (MemoryHandle, export identity)
+        self._retained = {}
         if mapping_peer_device is not None:
             self._mapping_guard = self._driver.create_mapping_guard(device, mapping_peer_device)
 
@@ -224,10 +231,27 @@ class NvlinkEngine:
         lease_key = (descriptor.owner_id, descriptor.lease_id)
         if lease_key in self._imported_leases:
             raise ValueError("lease already imported by this engine; obtain a fresh export")
+        region_key = (descriptor.owner_id, descriptor.region_id)
+        identity = (descriptor.transport_handle, descriptor.size, descriptor.physical_size,
+                    descriptor.granularity, descriptor.access)
+        cached = self._retained.get(region_key) if self._retain_imports else None
+        if cached is not None:
+            memory, cached_identity = cached
+            if cached_identity != identity:
+                raise ValueError("peer region changed under a retained mapping")
+            if memory.region_id in self._memories:
+                self._imported_leases.add(lease_key)
+                return memory
         native = self._driver.import_region(self.device, descriptor)
         memory = self._track(native, descriptor.size, descriptor)
         self._imported_leases.add(lease_key) # tombstone survives unregister
+        if self._retain_imports:
+            self._retained[region_key] = (memory, identity)
         return memory
+
+    def retains(self, memory):
+        """Whether ``memory`` is a retained peer mapping the caller must not unmap."""
+        return any(cached is memory for cached, _ in self._retained.values())
 
     @locked
     def unregister_memory(self, memory):

@@ -267,6 +267,27 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(missing.state, RestoreState.QUARANTINED)
         self.assertEqual(self.events, [])  # neither published nor discarded
 
+    def test_retained_import_is_reused_and_never_unmapped_by_a_restore(self):
+        """With retain_imports a peer region is mapped once: each later lease of it reuses
+        that mapping, a finished restore leaves it mapped, and a changed descriptor for the
+        same region is refused rather than silently reusing the old mapping."""
+        receiver = NvlinkEngine(1, _driver=self.driver, retain_imports=True)
+        first = self.owner.export_memory(self.source)
+        mapped = receiver.import_memory(first)
+        second = self.owner.export_memory(self.source)
+        self.assertIs(receiver.import_memory(second), mapped)
+        target = receiver.allocate_memory(64)
+        tx = RestoreTransaction(receiver, [TransferRequest(Opcode.READ, target, mapped, 0, 0, 8)], [mapped],
+            publish=lambda: None, discard=lambda: None, release_source=lambda: {'released': True})
+        self.driver.state = 1; tx.start()
+        self.assertEqual(tx.wait(), RestoreState.PUBLISHED)
+        self.assertEqual((tx.unmapped_count, tx.retained_count), (0, 1))
+        self.assertTrue(receiver.retains(mapped))
+        with self.assertRaises(ValueError):
+            receiver.import_memory(replace(self.owner.export_memory(self.source), size=32))
+        for d in (first, second):
+            self.owner.release_export(d.lease_id)
+
     def test_plan_contract(self):
         for requests, imports in (([], []), ([replace(self.request, opcode=Opcode.WRITE)], [self.remote]),
                                   ([self.request], []), ([self.request], [self.remote, self.remote])):

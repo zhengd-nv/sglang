@@ -49,7 +49,7 @@ def _mapping_peer_device(device):
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
                  source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True,
-                 source_protection='tree'):
+                 source_protection='tree', retain_imports=False):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
@@ -62,6 +62,8 @@ class SchedulerPeer:
         if source_protection == 'step' and not (concurrent and source_offthread):
             raise ValueError('step source protection requires a concurrent off-thread source')
         self.source_protection = source_protection
+        if type(retain_imports) is not bool or (retain_imports and not concurrent):
+            raise ValueError('retain_imports must be boolean and requires concurrent mode')
         if type(queue_limit) is not int or queue_limit < 0:
             raise ValueError('queue_limit must be a nonnegative integer')
         if type(source_max_leases) is not int or source_max_leases < 1:
@@ -91,8 +93,9 @@ class SchedulerPeer:
         device = scheduler.tp_worker.model_runner.gpu_id
         self.mapping_peer_device = _mapping_peer_device(device)
         # A concurrent Engine may copy into its pool while peers read leased pages of it.
+        # retain_imports (D6): one mapping per peer region, reused by every later lease of it.
         self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device,
-                                   shared_read_exports=concurrent)
+                                   shared_read_exports=concurrent, retain_imports=retain_imports)
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
@@ -757,9 +760,9 @@ class SchedulerPeer:
 
 L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
                   'source_max_leases', 'source_max_lease_fraction', 'source_offthread',
-                  'source_protection'}
+                  'source_protection', 'retain_imports'}
 _PEER_OPTION_KEYS = ('queue_limit', 'source_max_leases', 'source_max_lease_fraction',
-                     'source_offthread', 'source_protection')
+                     'source_offthread', 'source_protection', 'retain_imports')
 
 
 def parse_l1_config(text):

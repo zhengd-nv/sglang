@@ -248,8 +248,10 @@ class SourceEndpoint:
 
     def release(self, request):
         receipt = request.get('receipt')
-        if not isinstance(receipt, dict) or request.get('unmapped') is not True:
-            raise RemoteRejected('exact receipt and unmapped attestation required')
+        # unmapped: the target closed its import. drained: its DMA finished and it keeps a
+        # retained mapping of the region (D6); the lease no longer covers any access.
+        if not isinstance(receipt, dict) or not (request.get('unmapped') is True or request.get('drained') is True):
+            raise RemoteRejected('exact receipt and unmapped or drained attestation required')
         rid = receipt.get('request_id')
         if rid in self.released:
             if self.released[rid] != receipt:
@@ -350,7 +352,8 @@ class PeerReceiver:
         requests = tuple(TransferRequest(r.opcode, r.local, materialized[r.remote.region_id],
                                          r.local_offset, r.remote_offset, r.length) for r in planned)
         def release():
-            answer = self.rpc.call('release', receipt=offer['receipt'], unmapped=True)
+            answer = self.rpc.call('release', receipt=offer['receipt'],
+                                   **({'unmapped': True} if transaction.retained_count == 0 else {'drained': True}))
             if answer is None:  # asynchronous release ACK is still pending
                 return False
             if answer.get('released') is not True:
@@ -358,7 +361,7 @@ class PeerReceiver:
             return answer
         if offer.get('protection') not in ('tree-pin', 'host-tree-pin', 'optimistic'):
             raise ValueError('unknown source protection; fail-stop')
-        self.pending['transaction'] = RestoreTransaction(self.adapter.engine, requests, imported,
+        transaction = self.pending['transaction'] = RestoreTransaction(self.adapter.engine, requests, imported,
             publish=publish, discard=reservation.discard, release_source=release,
             keepalive=(reservation, self.adapter, offer),
             validate_on_release=offer['protection'] == 'optimistic')
