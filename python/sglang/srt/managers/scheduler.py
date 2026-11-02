@@ -2134,10 +2134,15 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         ):
             local_reqs = self._poll_timeout_aborts()
+        peer = getattr(self, '_l1_peer', None)
+        if peer is not None and get_parallel().tp_rank == 0:
+            # L1 lock commands ride this step's broadcast so every TP rank applies them here.
+            local_reqs = local_reqs + peer.drain_step_commands()
         recv_start_ns = time.monotonic_ns()
-        self._deferred_input_requests.extend(
-            self.request_receiver.recv_requests(local_reqs=local_reqs)
-        )
+        received = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if peer is not None:
+            received = peer.apply_step_commands(received)
+        self._deferred_input_requests.extend(received)
 
         num_requests_to_process = len(self._deferred_input_requests)
         if stop_at_pause:

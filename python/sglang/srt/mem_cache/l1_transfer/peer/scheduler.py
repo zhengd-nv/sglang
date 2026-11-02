@@ -51,10 +51,18 @@ class SchedulerPeer:
                  source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True,
                  source_protection='tree', retain_imports=False, target_slots=1):
         args = scheduler.server_args
-        if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
+        # TP>1 is a source-only prototype: c' locks ride the step broadcast (V-G).
+        tp_source = (args.tp_size > 1 and concurrent and source_protection == 'step' and source_offthread)
+        if ((args.tp_size != 1 and not tp_source) or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
                 or args.enable_lora or (not concurrent and args.max_running_requests != 1)):
-            raise ValueError('Peer restore requires ordinary TP/PP/DP1, no speculation/LoRA, max_running_requests=1')
+            raise ValueError('Peer restore requires ordinary TP/PP/DP1 (TP>1 only as a step-protected concurrent source), '
+                             'no speculation/LoRA, max_running_requests=1')
+        from sglang.srt.runtime_context import get_parallel
+        self.tp_size = args.tp_size
+        self.tp_rank = get_parallel().tp_rank if args.tp_size > 1 else 0
+        if self.tp_size > 1 and scheduler.request_receiver.recv_skipper is not None:
+            raise ValueError('TP>1 step commands need every step to broadcast its input')
         if type(concurrent) is not bool or type(source_offthread) is not bool:
             raise ValueError('concurrent and source_offthread must be boolean')
         if source_protection not in ('tree', 'step'):
@@ -126,6 +134,8 @@ class SchedulerPeer:
                 host_adapter=self.host_adapter, protection=source_protection)
         else:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
+        if self.tp_size > 1:
+            self.cache.source_leases.broadcast_steps = True
         self.source_waiters = {}  # request_id -> acquire Future awaiting the producer event
         # Wall-clock lease timeline (enqueued, begin, offered, released) for online sources.
         self.source_timing_open = {}
@@ -311,6 +321,11 @@ class SchedulerPeer:
 
     def note_forward(self, batch):
         self.forward_count += 1
+        if getattr(self, 'tp_size', 1) > 1 and self.forward_count % 100 == 0:
+            # Compared offline across ranks: identical at every step unless the trees diverged.
+            leases = self.cache.source_leases
+            logger.info('L1_TREE step=%d evictable=%d protected=%d held=%d', self.forward_count,
+                        self.cache.evictable_size(), self.cache.protected_size(), len(leases._held))
         if getattr(self, 'concurrent', False):
             for slot in self._slots():
                 if slot.phase in slot.overlap_forwards:
@@ -335,6 +350,8 @@ class SchedulerPeer:
 
     def start_request(self, req, options):
         from .request import restore_payload
+        if getattr(self, 'tp_size', 1) > 1:
+            raise ValueError('a TP>1 L1 peer is a source only')
         if getattr(self, 'l2_source', False):
             raise ValueError('an L2 (HiCache) source Engine cannot restore as a target')
         if not self.scheduler.server_args.disable_overlap_schedule:
@@ -699,9 +716,36 @@ class SchedulerPeer:
                 self.source_timing_open[request_id]['offered'] = time.time()
             self.source_waiters.pop(request_id).set_result(offer)
 
+    def drain_step_commands(self):
+        """Rank 0: lock / unlock commands to ride this step's input broadcast."""
+        with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
+            return self.cache.source_leases.drain_step_commands()
+
+    def apply_step_commands(self, received):
+        """Every rank, after the broadcast and before this step allocates: apply and strip them."""
+        from sglang.srt.mem_cache.source_lease import StepCommand
+        commands = [r for r in received if isinstance(r, StepCommand)]
+        if not commands:
+            return received
+        with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
+            for command in commands:
+                self.cache.source_leases.apply_step_command(command)
+        return [r for r in received if not isinstance(r, StepCommand)]
+
     def _serve_direct(self, request):
         """Network-worker dispatch for an off-thread source; never touches the target."""
         torch.cuda.set_device(self.engine.device)
+        if request.get('operation') == 'regions':
+            # TP>1 readers copy each rank's shard; this rank's pool, exported once.
+            with self.tree_lock:
+                return self.source.standing_offer()
+        if request.get('operation') == 'verify':
+            pages, generations = request.get('pages'), request.get('generations')
+            if not isinstance(pages, list) or not isinstance(generations, list) or len(pages) != len(generations):
+                raise RemoteRejected('pages and generations required')
+            return {'valid': self.cache.source_leases.generations.snapshot(pages) == tuple(generations)}
+        if request.get('operation') == 'acquire' and getattr(self, 'tp_rank', 0) != 0:
+            raise RemoteRejected('acquire only on TP rank 0')
         if request.get('operation') == 'acquire':
             begin = time.time()
             offer = self.source.acquire_offthread(request, self.tree_lock)
@@ -851,7 +895,9 @@ def init_scheduler_peer_from_config(scheduler, text):
     config = parse_l1_config(text)
     peer = SchedulerPeer(scheduler, config['identity'], concurrent=config.get('concurrent', False),
                          **{k: config[k] for k in _PEER_OPTION_KEYS if k in config})
-    address = peer.start_service(config.get('service_host', '127.0.0.1'), config.get('service_port', 0))
+    port = config.get('service_port', 0)
+    # One service per TP rank: rank r listens on service_port + r.
+    address = peer.start_service(config.get('service_host', '127.0.0.1'), port + peer.tp_rank if port else 0)
     logger.info('L1_PEER_SERVICE %s', address)
     return peer
 

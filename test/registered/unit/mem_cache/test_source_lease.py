@@ -178,6 +178,26 @@ class SourceLeaseTests(unittest.TestCase):
         self.assertTrue(self.cache.source_leases.lease_valid(lease))
         self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 16)
 
+    def test_tp_step_commands_change_locks_only_when_applied(self):
+        """With TP>1 every rank must lock and unlock at the same step: a lease only queues a
+        lock command, release only queues an unlock, and nothing changes the tree until a
+        command is applied; a lock command for pages freed meanwhile locks nothing."""
+        self.cache.source_leases.broadcast_steps = True
+        lease = self.step_lease()
+        manager = self.cache.source_leases
+        [lock] = manager.drain_step_commands()
+        self.assertEqual((lock.kind, lock.pages), ('lock', lease.page_indices))
+        manager.apply_step_command(lock)
+        self.assertTrue(self.cache.release_source_lease(lease, drained=True))
+        self.assertTrue(manager.lease_valid(lease))
+        [unlock] = manager.drain_step_commands()
+        self.assertEqual(unlock.kind, 'unlock')
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 0)  # still locked
+        manager.apply_step_command(unlock)
+        self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 16)
+        manager.apply_step_command(lock)  # replayed after the pages were freed
+        self.assertFalse(manager._held)
+
     def test_ready_failure_and_miss(self):
         def failure(): raise RuntimeError('producer failed')
         with self.assertRaises(RuntimeError): self.acquire(ready=failure)

@@ -64,6 +64,7 @@ class SourceEndpoint:
         self._static_offers = {}
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
         self.released_answers = {}  # request_id -> release answer, replayed on a duplicate release
+        self._standing = None  # this pool exported once, for TP>1 readers (standing_offer)
 
     def dispatch(self, request):
         self.cache.source_leases._check_thread()
@@ -212,6 +213,24 @@ class SourceEndpoint:
                     raise
                 time.sleep(0.0002)
 
+    def standing_offer(self):
+        """The whole device pool, exported once: regions, bindings and per-buffer page bytes.
+
+        A TP>1 reader uses it for ranks other than 0; page safety comes from the c' lease
+        acquired on rank 0 and from each rank's own generation check, not from this export.
+        """
+        if self._standing is None:
+            adapter = self.adapter
+            exports = self._export_when_idle(adapter, 30.0)
+            ids = {h.region_id: i for i, h in enumerate(adapter.memories)}
+            self._standing = wire_copy({
+                'contract': self.contract, 'capacity': adapter.capacity,
+                'page_bytes': {b.name: b.page_bytes for b in adapter.layout.buffers},
+                'bindings': {k: [[s.buffer_offset, s.length, ids[s.memory.region_id], s.region_offset]
+                                 for s in spans] for k, spans in adapter.bindings.items()},
+                'regions': [d.to_dict() for d in exports]})
+        return self._standing
+
     def _offer(self, request_id, lease, fingerprint):
         exports = []
         try:
@@ -243,6 +262,9 @@ class SourceEndpoint:
         # Every field is already a JSON value (str/int), so no deep copy is needed.
         offer = dict(static_offer, receipt=receipt, page_runs=page_runs(lease.page_indices),
                      regions=[dict(t, lease_id=d.lease_id) for t, d in zip(region_templates, exports)])
+        if getattr(lease, 'protection', 'tree') == 'step':
+            # TP>1 readers check every rank's own generations against this snapshot.
+            offer['generations'] = list(lease.generations)
         self.active[request_id] = {'receipt':receipt, 'offer':offer, 'lease':lease, 'exports':exports}
         return offer
 

@@ -5,11 +5,13 @@ No transport dependency. Caller must serialize all cache/allocator mutations on
 this thread, synchronize producer writes in ready(), and attest transfer drain.
 With a tree access lock installed, a lock holder on another thread may lease too.
 """
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 import threading
 import time
 import uuid
+
+import msgspec
 
 # Source leases (possibly off the scheduler thread) and target reservations share
 # the allocator's pin counter and the pool's lease count.
@@ -51,6 +53,20 @@ class PageGenerations:
 
     def snapshot(self, pages):
         return tuple(int(x) for x in self.values[list(pages)])
+
+
+class StepCommand(msgspec.Struct, frozen=True):
+    """A lock or unlock of an optimistic lease, applied by every TP rank at the same step.
+
+    Rank 0 queues it; it rides the step's input broadcast, so all ranks change the same
+    node's lock before the same allocation and their trees stay identical.
+    """
+    kind: str  # lock | unlock
+    lease_id: str
+    key: str = ''
+    end: int = 0
+    pages: tuple = ()
+    generations: tuple = ()
 
 
 def count_pool_lease(pool, delta):
@@ -105,6 +121,10 @@ class SourceLeaseManager:
         # lease_id -> step-lock state of an optimistic lease; released ones move to step_log.
         self._step = {}
         self.step_log = {}
+        # TP>1: locks change only through StepCommands applied at a step on every rank.
+        self.broadcast_steps = False
+        self._commands = deque()  # rank 0: queued for the next step's broadcast
+        self._held = {}  # lease_id -> (lock, pages) applied by a lock command
 
     def _check_thread(self):
         if threading.get_ident() == self._thread:
@@ -114,7 +134,7 @@ class SourceLeaseManager:
 
     @property
     def busy(self):
-        return bool(self._active or self._targets)
+        return bool(self._active or self._targets or self._held)
 
     def enable_key_index(self, ready_stream=None):
         """Hash and index every device node so targets can name a prefix by page key.
@@ -228,7 +248,43 @@ class SourceLeaseManager:
         self._active[lease.lease_id] = (lease, None, allocator, pool)
         self._step[lease.lease_id] = dict(key=page_key, end=end, granted=time.time(), locked=None,
                                           outcome=None, pages=len(pages))
+        if self.broadcast_steps:
+            self._commands.append(StepCommand('lock', lease.lease_id, page_key, end, pages, lease.generations))
         return lease
+
+    def drain_step_commands(self):
+        """Rank 0, at a step boundary: the commands to broadcast with this step's input."""
+        commands = list(self._commands)
+        self._commands.clear()
+        return commands
+
+    def apply_step_command(self, command):
+        """Every rank, same step, before this step allocates. Decisions use only this rank's
+        state, which is identical across ranks at a given step."""
+        self._check_thread()
+        allocator, _ = self.validate_cache()
+        if command.kind == 'unlock':
+            held = self._held.pop(command.lease_id, None)
+            if held is not None:
+                self.cache.unlock(held[0])
+                unpin_pages(allocator, held[1])
+            return
+        state = self._step.get(command.lease_id)  # rank 0 while the lease is still out
+        if self.generations.snapshot(command.pages) != tuple(command.generations):
+            if state is not None:
+                state['outcome'] = 'stale_at_lock'
+            return
+        try:
+            node = self.key_index.find(command.key, command.end, 'hbm')
+        except ValueError:
+            if state is not None:
+                state['outcome'] = 'stale_at_lock'
+            return
+        self._held[command.lease_id] = (self.cache.lock(node.id), tuple(command.pages))
+        pin_pages(allocator, command.pages)
+        if state is not None:
+            state['locked'] = time.time()
+            state['outcome'] = 'locked'
 
     def _generations_unchanged(self, lease):
         return self.generations.snapshot(lease.page_indices) == lease.generations
@@ -240,6 +296,8 @@ class SourceLeaseManager:
         With TP>1 this runs on every rank at the same step (ridden on the input broadcast).
         """
         self._check_thread()
+        if self.broadcast_steps:
+            return  # locks arrive as StepCommands instead
         for lease_id, state in list(self._step.items()):
             if state['outcome'] is not None:
                 continue
@@ -344,7 +402,10 @@ class SourceLeaseManager:
             # A lock only stops future frees; the generations cover the unlocked window.
             state['valid'] = state['outcome'] != 'stale_at_lock' and self._generations_unchanged(lease)
             state['released'] = time.time()
-            if lock is not None:
+            if self.broadcast_steps:
+                # Every rank drops its lock at the same step; never here, off the step.
+                self._commands.append(StepCommand('unlock', lease.lease_id))
+            elif lock is not None:
                 self.cache.unlock(lock)
                 unpin_pages(allocator, lease.page_indices)
             count_pool_lease(pool, -1)
