@@ -49,7 +49,7 @@ def _mapping_peer_device(device):
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
                  source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True,
-                 source_protection='tree', retain_imports=False):
+                 source_protection='tree', retain_imports=False, target_slots=1):
         args = scheduler.server_args
         if (args.tp_size != 1 or args.pp_size != 1 or args.dp_size != 1
                 or args.disaggregation_mode != 'null' or args.speculative_algorithm is not None
@@ -64,6 +64,8 @@ class SchedulerPeer:
         self.source_protection = source_protection
         if type(retain_imports) is not bool or (retain_imports and not concurrent):
             raise ValueError('retain_imports must be boolean and requires concurrent mode')
+        if type(target_slots) is not int or target_slots < 1 or (target_slots > 1 and not concurrent):
+            raise ValueError('target_slots must be a positive integer; more than one requires concurrent mode')
         if type(queue_limit) is not int or queue_limit < 0:
             raise ValueError('queue_limit must be a nonnegative integer')
         if type(source_max_leases) is not int or source_max_leases < 1:
@@ -151,14 +153,16 @@ class SchedulerPeer:
         if not math.isfinite(self.poll_interval) or not 0 <= self.poll_interval <= 0.1:
             raise ValueError('SGLANG_L1_POLL_INTERVAL must be finite and in [0, 0.1] seconds')
         # One worker per Engine; connections and receipts remain per transaction.
-        self.rpc_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='l1-rpc')
+        self.rpc_executor = ThreadPoolExecutor(max_workers=target_slots, thread_name_prefix='l1-rpc')
+        # D5: restores in flight at once; slot 0 is the peer itself.
+        self.slots = [self] + [_RestoreSlot(self) for _ in range(target_slots - 1)]
         from .timing import install
         install(self)
 
     def stats(self):
         allocator = self.cache.token_to_kv_pool_allocator
         result = dict(wait_state=getattr(self, "phase", None), source_leases=len(self.source.active),
-                    source_pending=len(self.source.pending), target_active=self.receiver is not None,
+                    source_pending=len(self.source.pending), target_active=any(slot.receiver is not None for slot in self._slots()),
                     forward_count=self.forward_count,
                     exports=len(self.engine._exports), imports=sum(m.public.remote for m in self.engine._memories.values()),
                     batches=len(self.engine._batches), available_tokens=allocator.available_size(),
@@ -271,21 +275,28 @@ class SchedulerPeer:
         # may consume the full-request headroom before our consumer finishes.
         if not getattr(self, 'concurrent', False):
             return self.phase in (None, 'WAIT_CAPACITY') or req is self.request
-        if req is self.request or req.rid in self.capacity.active or req.rid in self.unadmitted:
+        slots = self._slots()
+        if any(req is slot.request for slot in slots) or req.rid in self.capacity.active or req.rid in self.unadmitted:
             return True
         # Drain existing consumers instead of starving a waiting restore with
         # an unbounded stream of newly admitted ordinary requests.
-        if self.phase == 'WAIT_CAPACITY':
+        if any(slot.phase == 'WAIT_CAPACITY' for slot in slots):
             return False
         return self.capacity.can_admit(req, self.reserved_headroom())
 
     def reserved_headroom(self):
-        unadmitted = self._unadmitted_headroom()
+        return self._unadmitted_headroom() + sum(slot._outstanding() for slot in self._slots())
+
+    def _outstanding(self):
+        """Growth this slot's restore still needs beyond the pages it has reserved."""
         if self.request is None or self.request.rid in self.capacity.active:
-            return unadmitted
+            return 0
         if self.receiver is not None and self.receiver.pending is not None:
-            return unadmitted + max(0, self.required_capacity - len(self.receiver.pending['reservation'].indices))
-        return unadmitted + self.required_capacity
+            return max(0, self.required_capacity - len(self.receiver.pending['reservation'].indices))
+        return self.required_capacity
+
+    def _slots(self):
+        return getattr(self, 'slots', None) or [self]
 
     def _unadmitted_headroom(self):
         return sum(headroom for _, headroom in self.unadmitted.values())
@@ -298,8 +309,10 @@ class SchedulerPeer:
 
     def note_forward(self, batch):
         self.forward_count += 1
-        if getattr(self, 'concurrent', False) and self.phase in self.overlap_forwards:
-            self.overlap_forwards[self.phase] += 1
+        if getattr(self, 'concurrent', False):
+            for slot in self._slots():
+                if slot.phase in slot.overlap_forwards:
+                    slot.overlap_forwards[slot.phase] += 1
 
     def start_service(self, host='127.0.0.1', port=0):
         if not self.scheduler.server_args.disable_overlap_schedule:
@@ -369,7 +382,7 @@ class SchedulerPeer:
         self.required_capacity = required
         self.deadline = deadline
         self.phase = 'WAIT_CAPACITY'
-        self.poll_counts = dict(WAIT_CAPACITY=0, WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
+        self.poll_counts = dict(WAIT_CAPACITY=0, WAIT_ACQUIRE=0, WAIT_COPY=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
         self.overlap_forwards = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
 
     def _expire_queued(self):
@@ -399,9 +412,10 @@ class SchedulerPeer:
             self.scheduler._add_request_to_queue(req)
 
     def abort_matching(self, rid, abort_all):
-        """Cancel the active shared request and drop queued ones; queued own nothing."""
-        if self.request is not None and (abort_all or self.request.rid.startswith(rid)):
-            self.cancel_request()
+        """Cancel the active shared requests and drop queued ones; queued own nothing."""
+        for slot in self._slots():
+            if slot.request is not None and (abort_all or slot.request.rid.startswith(rid)):
+                slot.cancel_request()
         for consumer in self.consumers:
             if abort_all or consumer.startswith(rid):
                 self.consumers[consumer] = True  # ordinary abort releases it
@@ -424,7 +438,9 @@ class SchedulerPeer:
         self.receiver = PeerReceiver(self.cache, self.adapter, self.identity, self.rpc)
         self.steps = self.receiver.prepare_steps(payload['tokens'], required_capacity=self.required_capacity,
             tier=payload.get('tier', 'hbm'),
-            **({'headroom': self.capacity.remaining() + self._unadmitted_headroom(), 'private': True}
+            **({'headroom': self.capacity.remaining() + self._unadmitted_headroom()
+                            + sum(slot._outstanding() for slot in self._slots() if slot is not self),
+                'private': True}
                if concurrent else {}))
         try:
             operation, data = next(self.steps)
@@ -457,14 +473,22 @@ class SchedulerPeer:
                 tx.cancel()
                 self.phase = 'WAIT_RELEASE'
             else:
-                if getattr(self, 'concurrent', False):
-                    self._check_roles_disjoint()
-                # Order reuse of target slots after prior schedule-stream work.
-                # Future ordinary forwards remain independent and use other pages.
-                tx.start(**({'producer_stream': self.scheduler.schedule_stream.cuda_stream}
-                            if getattr(self, 'concurrent', False) else {}))
-                _mark(getattr(self, 'request', None), 'copy_started')
-                self.phase = 'WAIT_TRANSFER'
+                self.phase = 'WAIT_COPY'
+                self._start_copy()
+
+    def _start_copy(self):
+        # A pool region carries one batch at a time, so slots pipeline: only the copy is serial.
+        if any(slot is not self and slot.phase == 'WAIT_TRANSFER' for slot in self._slots()):
+            return
+        tx = self.session['transaction']
+        if getattr(self, 'concurrent', False):
+            self._check_roles_disjoint()
+        # Order reuse of target slots after prior schedule-stream work.
+        # Future ordinary forwards remain independent and use other pages.
+        tx.start(**({'producer_stream': self.scheduler.schedule_stream.cuda_stream}
+                    if getattr(self, 'concurrent', False) else {}))
+        _mark(getattr(self, 'request', None), 'copy_started')
+        self.phase = 'WAIT_TRANSFER'
 
     def _ready(self):
         reservation, tx = self.session['reservation'], self.session['transaction']
@@ -527,6 +551,9 @@ class SchedulerPeer:
             self._fail_request(self.cancel_reason)
         elif self.phase in ('WAIT_TRANSFER', 'WAIT_RELEASE'):
             self.session['transaction'].cancel()
+        elif self.phase == 'WAIT_COPY':
+            self.session['transaction'].cancel()  # never submitted: discards and releases the source
+            self.phase = 'WAIT_RELEASE'
         # ACQUIRE: retain the future and reservation, then clean a valid late
         # offer without DMA. Unknown reply still reaches pump's fail-stop.
         # READY/RUNNING: ordinary abort owns queue removal and GPU-safe cleanup.
@@ -698,14 +725,16 @@ class SchedulerPeer:
         Leased pages are locked tree pages and copy destinations are newly allocated
         private pages, so an overlap means the allocator invariant broke: fail-stop.
         """
-        if self.receiver is None or self.receiver.pending is None:
+        targets = {page for slot in self._slots() if slot.receiver is not None and slot.receiver.pending is not None
+                   for page in slot.receiver.pending['reservation'].pages}
+        if not targets:
             return
         with getattr(self, 'tree_lock', None) or contextlib.nullcontext():
             leases = ([e['lease'] for e in self.source.active.values()]
                       + [p[0] for p in self.source.pending.values()])
         # Host (egm) page IDs index the L2 pool, not this device pool.
         leased = {page for lease in leases if getattr(lease, 'tier', 'hbm') == 'hbm' for page in lease.page_indices}
-        if leased & set(self.receiver.pending['reservation'].pages):
+        if leased & targets:
             raise RuntimeError('source lease overlaps a target copy destination')
 
     def _pump(self):
@@ -717,10 +746,17 @@ class SchedulerPeer:
             # The step boundary: after input ingestion, before this step allocates or evicts.
             with self.tree_lock:
                 self.cache.source_leases.apply_step_locks()
+        self._expire_queued()
+        for slot in self._slots():
+            slot._pump_slot()
+
+    def _pump_slot(self):
+        """Advance one restore slot (the peer itself is slot 0)."""
         if self.request is not None and self.deadline is not None and time.monotonic() >= self.deadline:
             self.cancel_request('WAIT_TIMEOUT')
-        self._expire_queued()
         self._activate_next()
+        if self.phase == 'WAIT_COPY':
+            self._start_copy()
         if self.phase == 'WAIT_CAPACITY':
             self._try_capacity()
         if self.request is not None and self.phase in self.poll_counts:
@@ -758,11 +794,41 @@ class SchedulerPeer:
                 raise RuntimeError(f'restore did not publish: {state}')
 
 
+class _RestoreSlot:
+    """One more concurrent restore. Holds only per-restore state; everything else,
+    including the shared queue, budgets and result records, is the peer's."""
+
+    def __init__(self, peer):
+        self._peer = peer
+        self.request = self.receiver = self.session = self.phase = None
+        self.required_capacity = 0
+        self.deadline = self.cancel_reason = None
+        self.overlap_forwards = dict(WAIT_ACQUIRE=0, WAIT_TRANSFER=0, WAIT_RELEASE=0)
+
+    def __getattr__(self, name):
+        return getattr(self._peer, name)
+
+    # The per-restore state machine, run against this slot's state.
+    _pump_slot = SchedulerPeer._pump_slot
+    _can_activate = SchedulerPeer._can_activate
+    _activate_next = SchedulerPeer._activate_next
+    _try_capacity = SchedulerPeer._try_capacity
+    _prepared = SchedulerPeer._prepared
+    _start_copy = SchedulerPeer._start_copy
+    _ready = SchedulerPeer._ready
+    _detach_ready = SchedulerPeer._detach_ready
+    cancel_request = SchedulerPeer.cancel_request
+    _fail_request = SchedulerPeer._fail_request
+    _next_candidate = SchedulerPeer._next_candidate
+    _outstanding = SchedulerPeer._outstanding
+    finish = SchedulerPeer.finish
+
+
 L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
                   'source_max_leases', 'source_max_lease_fraction', 'source_offthread',
-                  'source_protection', 'retain_imports'}
+                  'source_protection', 'retain_imports', 'target_slots'}
 _PEER_OPTION_KEYS = ('queue_limit', 'source_max_leases', 'source_max_lease_fraction',
-                     'source_offthread', 'source_protection', 'retain_imports')
+                     'source_offthread', 'source_protection', 'retain_imports', 'target_slots')
 
 
 def parse_l1_config(text):

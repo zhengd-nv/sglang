@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.srt.mem_cache.l1_transfer.peer.capacity import RequestCapacity
-from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer
+from sglang.srt.mem_cache.l1_transfer.peer.scheduler import SchedulerPeer, _RestoreSlot
 
 
 def req(rid, prompt=23, output=9, allocated=0):
@@ -89,6 +89,31 @@ class CapacityTests(unittest.TestCase):
         p._prepared({'transaction': tx})
         tx.start.assert_called_once_with(producer_stream=123)
         self.assertEqual(p.phase, 'WAIT_TRANSFER')
+
+    def test_concurrent_slots_pipeline_copies_and_share_one_headroom(self):
+        """Several restores run at once but a pool region takes one batch at a time: a
+        prepared slot waits while another copies, then starts. Admission headroom counts
+        every slot's unreserved growth, not just the peer's own."""
+        p = object.__new__(SchedulerPeer)
+        p.concurrent, p.capacity, p.unadmitted = True, self.c, {}
+        p.source = NS(active={}, pending={})
+        p.scheduler = NS(schedule_stream=NS(cuda_stream=7))
+        p.cancel_reason, p.receiver, p.request = None, None, None
+        second = _RestoreSlot(p)
+        p.slots = [p, second]
+        first_tx, second_tx = Mock(), Mock()
+        p._prepared({'transaction': first_tx})
+        second._prepared({'transaction': second_tx})
+        self.assertEqual((p.phase, second.phase), ('WAIT_TRANSFER', 'WAIT_COPY'))
+        second_tx.start.assert_not_called()
+        p.phase = 'WAIT_RELEASE'  # first copy drained
+        second._start_copy()
+        second_tx.start.assert_called_once_with(producer_stream=7)
+        self.assertEqual(second.phase, 'WAIT_TRANSFER')
+        p.request, p.required_capacity = req('a'), 32
+        second.request, second.required_capacity = req('b'), 48
+        second.receiver = NS(pending={'reservation': NS(indices=range(16))})
+        self.assertEqual(p.reserved_headroom(), 32 + 32)
 
     def test_busy_target_can_reserve_without_waiting_for_engine_idle(self):
         p = object.__new__(SchedulerPeer)
