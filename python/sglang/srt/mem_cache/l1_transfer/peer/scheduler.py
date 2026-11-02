@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 ABORT_REASONS = ('CANCELLED', 'CAPACITY_EXCEEDED')
 
 
+def _mark(req, phase):
+    """First wall-clock time of ``phase`` in this restore's timeline, if it has one."""
+    timeline = getattr(req, '_l1_timeline', None)
+    if isinstance(timeline, dict):
+        timeline.setdefault(phase, time.time())
+
+
 def _mapping_peer_device(device):
     value = os.environ.get('SGLANG_L1_MAPPING_PEER_DEVICE')
     if value is None:
@@ -281,6 +288,7 @@ class SchedulerPeer:
         return sum(headroom for _, headroom in self.unadmitted.values())
 
     def note_admitted(self, req):
+        _mark(req, 'admitted')
         if getattr(self, 'concurrent', False):
             self.capacity.admit(req)
             self.unadmitted.pop(req.rid, None)
@@ -332,6 +340,8 @@ class SchedulerPeer:
         if len(self.queue) >= self.queue_limit and not self._can_activate():
             self._end_unstarted(req, 'QUEUE_FULL')
             return
+        # Wall-clock phase marks of this restore; returned with its result.
+        req._l1_timeline = dict(queued=time.time())
         self.queue.append((req, payload['candidates'], required, deadline))
         self._activate_next()
 
@@ -344,6 +354,7 @@ class SchedulerPeer:
         if not self.queue or not self._can_activate():
             return
         req, candidates, required, deadline = self.queue.popleft()
+        _mark(req, 'activated')
         self.request = req
         self.candidates = candidates
         self.candidate_index = 0
@@ -426,6 +437,7 @@ class SchedulerPeer:
             self._prepared(done.value)
         else:
             data['id'] = self.restore_id
+            _mark(getattr(self, 'request', None), 'reserved')
             self.phase = 'WAIT_ACQUIRE'
             self.acquire_future = self.rpc.submit(operation, data)
 
@@ -448,6 +460,7 @@ class SchedulerPeer:
                 # Future ordinary forwards remain independent and use other pages.
                 tx.start(**({'producer_stream': self.scheduler.schedule_stream.cuda_stream}
                             if getattr(self, 'concurrent', False) else {}))
+                _mark(getattr(self, 'request', None), 'copy_started')
                 self.phase = 'WAIT_TRANSFER'
 
     def _ready(self):
@@ -455,8 +468,10 @@ class SchedulerPeer:
         self.restored = dict(restored_tokens=len(reservation.indices), local_tokens=reservation.prefix_len,
                              transferred_bytes=sum(r.length for r in tx.requests) if tx else 0,
                              wait_polls=dict(self.poll_counts), **self.stats())
+        _mark(getattr(self, 'request', None), 'ready')
         self.restored.update(restore_id=self.restore_id, state='READY', reason=None,
-                             overlap_forwards=dict(getattr(self, "overlap_forwards", {})))
+                             overlap_forwards=dict(getattr(self, "overlap_forwards", {})),
+                             timeline=getattr(self.request, '_l1_timeline', None))
         self.restored['attempts'] = list(self.attempts)
         self.rpc.close()
         self.deadline = None
@@ -521,7 +536,8 @@ class SchedulerPeer:
             self.rpc.close()
         result = dict(restore_id=self.restore_id, state=None, reason=reason,
                       consumer_released=True, transferred_bytes=None,
-                      wait_polls=dict(self.poll_counts), attempts=list(self.attempts))
+                      wait_polls=dict(self.poll_counts), attempts=list(self.attempts),
+                      timeline=getattr(req, '_l1_timeline', None))
         self.request = None
         self.phase = None
         self.required_capacity = 0
@@ -707,6 +723,7 @@ class SchedulerPeer:
         if self.request is not None and self.phase in self.poll_counts:
             self.poll_counts[self.phase] += 1
         if self.phase == 'WAIT_ACQUIRE' and self.acquire_future.done():
+            _mark(getattr(self, 'request', None), 'offered')
             try:
                 answer = self.acquire_future.result()
             except RemoteRejected as exc:
@@ -722,6 +739,8 @@ class SchedulerPeer:
                 self._prepared(done.value)
         if self.phase in ('WAIT_TRANSFER', 'WAIT_RELEASE'):
             state = self.session['transaction'].poll()
+            if state != RestoreState.IN_FLIGHT:
+                _mark(getattr(self, 'request', None), 'copied')
             if state == RestoreState.PUBLISHED:
                 if self.cancel_reason:
                     self._fail_request(self.cancel_reason)
