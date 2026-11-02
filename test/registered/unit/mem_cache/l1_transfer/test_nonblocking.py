@@ -134,6 +134,7 @@ class NonblockingTests(unittest.TestCase):
         source.ready, source.max_leases, source.max_lease_pages = None, max_leases, max_lease_pages
         source.active, source.pending, source.released = {}, {}, {}
         source.released_answers, source.protection = {}, 'tree'
+        source.export_once, source._standing_exports, source.acquire_spans = False, {}, {}
         source._static_offers = {}
         source.adapter = SimpleNamespace(layout=SimpleNamespace(page_size=2), memories=[SimpleNamespace(region_id='r')],
                                          capacity=8, bindings={}, engine=Mock())

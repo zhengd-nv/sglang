@@ -43,7 +43,7 @@ class SourceEndpoint:
     event, and poll_ready exports and offers only after that event completes.
     """
     def __init__(self, cache, adapter, identity, ready, *, max_leases=None, max_lease_pages=None,
-                 host_adapter=None, protection='tree'):
+                 host_adapter=None, protection='tree', export_once=False):
         self.cache, self.adapter, self.ready = cache, adapter, ready
         # tree: hbm leases are radix-locked before the offer. step (c'): locked at the
         # next scheduler step, read optimistically, validated by page generations at release.
@@ -65,6 +65,10 @@ class SourceEndpoint:
         self.released = {}  # bounded by endpoint lifetime; no TTL reclamation
         self.released_answers = {}  # request_id -> release answer, replayed on a duplicate release
         self._standing = None  # this pool exported once, for TP>1 readers (standing_offer)
+        # export_once: offers reference standing exports instead of exporting every region per lease.
+        self.export_once = export_once
+        self._standing_exports = {}  # tier -> exports kept for the endpoint's lifetime
+        self.acquire_spans = {}  # request_id -> perf_counter marks of the last acquires (bounded)
 
     def dispatch(self, request):
         self.cache.source_leases._check_thread()
@@ -170,7 +174,9 @@ class SourceEndpoint:
         Waiting for the path's producer events and exporting happen outside the
         lock, so the scheduler keeps running cache calls meanwhile.
         """
+        marks = dict(entered=time.perf_counter())
         with lock:
+            marks['locked'] = time.perf_counter()
             span, request_id, fingerprint = self._validate_acquire(request)
             if request_id in self.active:
                 entry = self.active[request_id]
@@ -180,27 +186,46 @@ class SourceEndpoint:
             self._check_quota(span)
             lease = self._lock(span, fingerprint, lambda: None)
             self.pending[request_id] = (lease, fingerprint, None)
+            marks['leased'] = time.perf_counter()
         exports = []
         try:
             for event in lease.ready_events:
                 event.synchronize()
-            exports = self._export_when_idle(self.adapters[lease.tier], export_timeout)
+            marks['ready'] = time.perf_counter()
+            exports = self._exports_for(lease.tier, export_timeout)
+            marks['exported'] = time.perf_counter()
             with lock:
+                marks['relocked'] = time.perf_counter()
                 offer = self._offer_from(request_id, lease, fingerprint, exports)
+                if self.export_once:
+                    self.active[request_id]['exports'] = []  # standing: never released per lease
                 del self.pending[request_id]
+            marks['offered'] = time.perf_counter()
+            self.acquire_spans[request_id] = marks
+            while len(self.acquire_spans) > 4096:
+                del self.acquire_spans[next(iter(self.acquire_spans))]
             return offer
         except BaseException:
             # No descriptor escaped: the offer was never returned.
             with lock:
                 self.pending.pop(request_id, None)
                 self.active.pop(request_id, None)
-                self.adapter.engine.release_exports([d.lease_id for d in exports])
+                if not self.export_once:
+                    self.adapter.engine.release_exports([d.lease_id for d in exports])
                 self.cache.release_source_lease(lease, drained=True)
             raise
 
     def release_offthread(self, request, lock):
         with lock:
             return self.release(request)
+
+    def _exports_for(self, tier, timeout):
+        """Exports for one offer: fresh per lease, or the tier's standing set with export_once."""
+        if not self.export_once:
+            return self._export_when_idle(self.adapters[tier], timeout)
+        if tier not in self._standing_exports:
+            self._standing_exports[tier] = self._export_when_idle(self.adapters[tier], timeout)
+        return self._standing_exports[tier]
 
     def _export_when_idle(self, adapter, timeout):
         deadline = time.monotonic() + timeout
@@ -221,7 +246,7 @@ class SourceEndpoint:
         """
         if self._standing is None:
             adapter = self.adapter
-            exports = self._export_when_idle(adapter, 30.0)
+            exports = self._exports_for('hbm', 30.0)
             ids = {h.region_id: i for i, h in enumerate(adapter.memories)}
             self._standing = wire_copy({
                 'contract': self.contract, 'capacity': adapter.capacity,

@@ -49,7 +49,7 @@ def _mapping_peer_device(device):
 class SchedulerPeer:
     def __init__(self, scheduler, identity, *, concurrent=False, queue_limit=16,
                  source_max_leases=4, source_max_lease_fraction=0.5, source_offthread=True,
-                 source_protection='tree', retain_imports=False, target_slots=1):
+                 source_protection='tree', retain_imports=False, target_slots=1, source_export_once=False):
         args = scheduler.server_args
         # TP>1 is a source-only prototype: c' locks ride the step broadcast (V-G).
         tp_source = (args.tp_size > 1 and concurrent and source_protection == 'step' and source_offthread)
@@ -131,7 +131,8 @@ class SchedulerPeer:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, None,
                 max_leases=source_max_leases,
                 max_lease_pages=int(allocator.size // allocator.page_size * source_max_lease_fraction),
-                host_adapter=self.host_adapter, protection=source_protection)
+                host_adapter=self.host_adapter, protection=source_protection,
+                export_once=source_export_once)
         else:
             self.source = SourceEndpoint(self.cache, self.adapter, self.identity, torch.cuda.synchronize)
         if self.tp_size > 1:
@@ -749,8 +750,14 @@ class SchedulerPeer:
         if request.get('operation') == 'acquire':
             begin = time.time()
             offer = self.source.acquire_offthread(request, self.tree_lock)
+            marks = self.source.acquire_spans.get(request['id'], {})
+            # Per-phase ms of this acquire: lock wait, lease, ready events, export, offer.
+            spans = {f'{a}->{b}': (marks[b] - marks[a]) * 1e3
+                     for a, b in zip(('entered', 'locked', 'leased', 'ready', 'exported', 'relocked'),
+                                     ('locked', 'leased', 'ready', 'exported', 'relocked', 'offered'))
+                     if a in marks and b in marks}
             self.source_timing_open[request['id']] = dict(
-                enqueued=begin, begin=begin, offered=time.time(),
+                enqueued=begin, begin=begin, offered=time.time(), spans=spans,
                 pages=sum(count for _, count in offer['page_runs']))
             return offer
         if request.get('operation') == 'release':
@@ -874,9 +881,10 @@ class _RestoreSlot:
 
 L1_CONFIG_KEYS = {'identity', 'concurrent', 'service_host', 'service_port', 'queue_limit',
                   'source_max_leases', 'source_max_lease_fraction', 'source_offthread',
-                  'source_protection', 'retain_imports', 'target_slots'}
+                  'source_protection', 'retain_imports', 'target_slots', 'source_export_once'}
 _PEER_OPTION_KEYS = ('queue_limit', 'source_max_leases', 'source_max_lease_fraction',
-                     'source_offthread', 'source_protection', 'retain_imports', 'target_slots')
+                     'source_offthread', 'source_protection', 'retain_imports', 'target_slots',
+                     'source_export_once')
 
 
 def parse_l1_config(text):

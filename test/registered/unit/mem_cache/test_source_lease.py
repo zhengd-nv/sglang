@@ -45,7 +45,7 @@ class SourceLeaseTests(unittest.TestCase):
 
     def test_pin_evict_release(self):
         lease = self.acquire()
-        self.assertEqual(lease.token_indices, tuple(self.indices.tolist()))
+        self.assertEqual(tuple(lease.token_indices.tolist()), tuple(self.indices.tolist()))
         self.assertEqual(self.cache.evict(EvictParams(num_tokens=64)).num_tokens_evicted, 0)
         self.assertTrue(self.cache.release_source_lease(lease, drained=True))
         self.assertFalse(self.cache.release_source_lease(lease, drained=True))
@@ -97,13 +97,13 @@ class SourceLeaseTests(unittest.TestCase):
             return self.cache.acquire_source_lease_by_key(key, end=end, start=start,
                 fingerprint='test-model:fp16:nhd:tp1', ready=torch.cuda.synchronize)
         lease = by_key(keys[-1], 16, 8)
-        self.assertEqual(lease.token_indices, tuple(self.indices[8:16].tolist()))
+        self.assertEqual(tuple(lease.token_indices.tolist()), tuple(self.indices[8:16].tolist()))
         with self.assertRaises(ValueError): by_key(keys[1], 16, 8)  # key of page 2 ends at 8
         branch = self.allocator.alloc(4)
         self.cache.insert(InsertParams(key=RadixKey(array('q', [*range(8), 90, 91, 92, 93])),
                                        value=torch.cat((self.indices[:8], branch))))
         inner = by_key(keys[1], 8, 0)  # page 2 now ends a split-off node
-        self.assertEqual(inner.token_indices, tuple(self.indices[:8].tolist()))
+        self.assertEqual(tuple(inner.token_indices.tolist()), tuple(self.indices[:8].tolist()))
         for item in (lease, inner):
             self.cache.release_source_lease(item, drained=True)
         self.cache.evict(EvictParams(num_tokens=64))
@@ -146,7 +146,7 @@ class SourceLeaseTests(unittest.TestCase):
                 time.sleep(0.05)
                 self.assertFalse(future.done())
             lease = future.result(timeout=5)
-        self.assertEqual(lease.token_indices, tuple(self.indices.tolist()))
+        self.assertEqual(tuple(lease.token_indices.tolist()), tuple(self.indices.tolist()))
         self.cache.release_source_lease(lease, drained=True)
 
     def step_lease(self):

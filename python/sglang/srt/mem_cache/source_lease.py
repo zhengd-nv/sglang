@@ -81,7 +81,8 @@ class SourceLease:
     lease_id: str
     fingerprint: str
     # Token slots of the leased range only: [0, H) by token key, [L, H) by page key.
-    token_indices: tuple[int, ...]
+    # Token slots as a 1-D tensor; identity is lease_id, so it takes no part in equality.
+    token_indices: object = field(compare=False)
     page_indices: tuple[int, ...]
     # Insert-time events of the leased path; wait on them before exporting.
     ready_events: tuple = field(default=(), compare=False)
@@ -222,19 +223,21 @@ class SourceLeaseManager:
                            events=self.key_index.ready_events(node))
 
     def _path_pages(self, node_id, start, end, page_size):
+        """Token slots and page IDs of [start, end), checked as whole tensors, not per token."""
+        import torch
         path = self.cache.path_device_indices(node_id)
         if len(path) < end:
             raise ValueError('requested prefix is not fully resident')
-        indices = tuple(int(x) for x in path[start:end].tolist())
-        pages = []
-        for first in range(0, len(indices), page_size):
-            row = indices[first:first + page_size]
-            if row[0] % page_size or row != tuple(range(row[0], row[0] + page_size)):
-                raise ValueError('source page is not physically contiguous/aligned')
-            pages.append(row[0] // page_size)
+        indices = path[start:end]
+        heads = indices[::page_size]
+        offsets = torch.arange(page_size, dtype=indices.dtype, device=indices.device)
+        if bool((heads % page_size).any()) or not torch.equal(
+                indices.view(-1, page_size), heads.unsqueeze(1) + offsets):
+            raise ValueError('source page is not physically contiguous/aligned')
+        pages = tuple((heads // page_size).tolist())
         if len(set(pages)) != len(pages):
             raise ValueError('duplicate source pages')
-        return indices, tuple(pages)
+        return indices, pages
 
     def _lease_optimistic(self, node, page_key, start, end, fingerprint, allocator, pool):
         """No lock and no pin: the scheduler locks at its next step (apply_step_locks)."""
@@ -321,20 +324,9 @@ class SourceLeaseManager:
         page_size = allocator.page_size
         lock = cache.lock(node_id)
         try:
-            path = cache.path_device_indices(node_id)
-            if len(path) < end:
-                raise ValueError('requested prefix is not fully resident')
-            indices = tuple(int(x) for x in path[start:end].tolist())
-            pages = []
-            for first in range(0, len(indices), page_size):
-                row = indices[first:first + page_size]
-                if row[0] % page_size or row != tuple(range(row[0], row[0] + page_size)):
-                    raise ValueError('source page is not physically contiguous/aligned')
-                pages.append(row[0] // page_size)
-            if len(set(pages)) != len(pages):
-                raise ValueError('duplicate source pages')
+            indices, pages = self._path_pages(node_id, start, end, page_size)
             lease = SourceLease(self.incarnation, self.epoch, uuid.uuid4().hex,
-                                fingerprint, indices, tuple(pages), events)
+                                fingerprint, indices, pages, events)
         except BaseException:
             cache.unlock(lock)
             raise

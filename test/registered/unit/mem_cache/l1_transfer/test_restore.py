@@ -276,6 +276,7 @@ class RestoreTests(unittest.TestCase):
         mapped = receiver.import_memory(first)
         second = self.owner.export_memory(self.source)
         self.assertIs(receiver.import_memory(second), mapped)
+        self.assertIs(receiver.import_memory(first), mapped)  # a source exporting once repeats its lease
         target = receiver.allocate_memory(64)
         tx = RestoreTransaction(receiver, [TransferRequest(Opcode.READ, target, mapped, 0, 0, 8)], [mapped],
             publish=lambda: None, discard=lambda: None, release_source=lambda: {'released': True})

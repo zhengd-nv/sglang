@@ -236,19 +236,21 @@ class NvlinkEngine:
         if descriptor.owner_id == self.owner_id:
             raise ValueError("remote descriptor must belong to a peer engine")
         lease_key = (descriptor.owner_id, descriptor.lease_id)
-        if lease_key in self._imported_leases:
-            raise ValueError("lease already imported by this engine; obtain a fresh export")
         region_key = (descriptor.owner_id, descriptor.region_id)
         identity = (descriptor.transport_handle, descriptor.size, descriptor.physical_size,
                     descriptor.granularity, descriptor.access)
         cached = self._retained.get(region_key) if self._retain_imports else None
         if cached is not None:
+            # A retained mapping is reused by region identity; a source that exports once
+            # repeats the same lease, which a fresh import would refuse as a replay.
             memory, cached_identity = cached
             if cached_identity != identity:
                 raise ValueError("peer region changed under a retained mapping")
             if memory.region_id in self._memories:
                 self._imported_leases.add(lease_key)
                 return memory
+        if lease_key in self._imported_leases:
+            raise ValueError("lease already imported by this engine; obtain a fresh export")
         native = self._driver.import_region(self.device, descriptor)
         memory = self._track(native, descriptor.size, descriptor)
         self._imported_leases.add(lease_key) # tombstone survives unregister
