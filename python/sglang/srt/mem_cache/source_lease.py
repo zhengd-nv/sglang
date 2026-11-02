@@ -212,7 +212,10 @@ class SourceLeaseManager:
         if tier not in ('hbm', 'egm'):
             raise ValueError('tier must be hbm or egm')
         node = self.key_index.find(page_key, end, tier)
-        self.key_index.touch(node)
+        if not (self.broadcast_steps and protection == 'step'):
+            # Recency decides eviction: on TP>1 it changes only at a step, on every rank
+            # (apply_step_command), or the ranks' trees diverge.
+            self.key_index.touch(node)
         if tier == 'egm':
             return self._lease_host(node, start, end, fingerprint, ready, page_size)
         if protection == 'step':
@@ -283,6 +286,7 @@ class SourceLeaseManager:
             if state is not None:
                 state['outcome'] = 'stale_at_lock'
             return
+        self.key_index.touch(node)
         self._held[command.lease_id] = (self.cache.lock(node.id), tuple(command.pages))
         pin_pages(allocator, command.pages)
         if state is not None:

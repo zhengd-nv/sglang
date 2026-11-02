@@ -198,6 +198,27 @@ class SourceLeaseTests(unittest.TestCase):
         manager.apply_step_command(lock)  # replayed after the pages were freed
         self.assertFalse(manager._held)
 
+    def test_tp_lease_refreshes_recency_only_at_the_step(self):
+        """Recency decides eviction, so on TP>1 a lease taken off the step on rank 0 must not
+        touch it; the lock command refreshes it on every rank at the same step instead."""
+        from sglang.srt.mem_cache.source_index import prefix_page_keys
+        manager = self.cache.source_leases
+        index = manager.enable_key_index()
+        manager.enable_step_protection()
+        manager.broadcast_steps = True
+        key = prefix_page_keys(list(range(16)), 4)[-1]
+        node = index.find(key, 16)
+        before = node.last_access_time
+        lease = self.cache.acquire_source_lease_by_key(key, end=16, start=0,
+            fingerprint='test-model:fp16:nhd:tp1', ready=lambda: None, protection='step')
+        self.assertEqual(node.last_access_time, before)
+        [lock] = manager.drain_step_commands()
+        manager.apply_step_command(lock)
+        self.assertGreater(node.last_access_time, before)
+        self.cache.release_source_lease(lease, drained=True)
+        for command in manager.drain_step_commands():
+            manager.apply_step_command(command)
+
     def test_ready_failure_and_miss(self):
         def failure(): raise RuntimeError('producer failed')
         with self.assertRaises(RuntimeError): self.acquire(ready=failure)
