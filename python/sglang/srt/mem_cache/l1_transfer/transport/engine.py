@@ -53,6 +53,20 @@ class _Memory:
     export_info: tuple | None = None
 
 
+def _sorted_overlap(left, right):
+    """Whether two sorted, internally disjoint interval lists intersect; linear, not pairwise."""
+    i = j = 0
+    while i < len(left) and j < len(right):
+        (a, b), (c, d) = left[i], right[j]
+        if a < d and c < b:
+            return True
+        if b <= d:
+            i += 1
+        else:
+            j += 1
+    return False
+
+
 @dataclass
 class _Batch:
     public: BatchHandle
@@ -368,7 +382,7 @@ class NvlinkEngine:
                 raise ValueError("overlapping destination ranges")
         for other in self._batches.values():
             for key, intervals in writes.items():
-                if any(a < d and c < b for a, b in intervals for c, d in other.writes.get(key, ())):
+                if _sorted_overlap(intervals, other.writes.get(key, ())):
                     raise BusyError("destination overlaps a batch in flight")
         # If the native call raises unexpectedly after partial issue, conservatively quarantine.
         try:
