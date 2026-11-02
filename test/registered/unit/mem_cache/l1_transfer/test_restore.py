@@ -288,6 +288,25 @@ class RestoreTests(unittest.TestCase):
         for d in (first, second):
             self.owner.release_export(d.lease_id)
 
+    def test_concurrent_reads_share_regions_only_with_disjoint_destinations(self):
+        """Several restores copy into one pool region at once: with concurrent_reads two
+        READ batches may be in flight on the same local and remote regions if their
+        destination bytes are disjoint; an overlap is refused, and without the option
+        the second batch is refused as before."""
+        for concurrent in (False, True):
+            receiver = NvlinkEngine(1, _driver=self.driver, concurrent_reads=concurrent)
+            remote = receiver.import_memory(self.owner.export_memory(self.source))
+            target = receiver.allocate_memory(64)
+            self.driver.state = 0  # keep batches in flight
+            receiver.submit_transfer([TransferRequest(Opcode.READ, target, remote, 0, 0, 8)])
+            disjoint = [TransferRequest(Opcode.READ, target, remote, 8, 8, 8)]
+            if not concurrent:
+                with self.assertRaises(BusyError): receiver.submit_transfer(disjoint)
+                continue
+            receiver.submit_transfer(disjoint)
+            with self.assertRaises(BusyError):
+                receiver.submit_transfer([TransferRequest(Opcode.READ, target, remote, 4, 16, 8)])
+
     def test_plan_contract(self):
         for requests, imports in (([], []), ([replace(self.request, opcode=Opcode.WRITE)], [self.remote]),
                                   ([self.request], []), ([self.request], [self.remote, self.remote])):

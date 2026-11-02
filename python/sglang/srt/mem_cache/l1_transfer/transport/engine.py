@@ -59,12 +59,15 @@ class _Batch:
     native: int
     memories: set
     status: TransferStatus
+    # Destination byte ranges per target region; read-only batches may overlap in time.
+    writes: dict = field(default_factory=dict)
+    read_only: bool = False
 
 
 class NvlinkEngine:
     def __init__(self, device: int, library: str | None = None, *,
                  mapping_peer_device: int | None = None, shared_read_exports: bool = False,
-                 retain_imports: bool = False, _driver=None):
+                 retain_imports: bool = False, concurrent_reads: bool = False, _driver=None):
         """Optionally keep peer-mapping state alive using private backing memory.
 
         mapping_peer_device must be a distinct, caller-authorized LOCAL CUDA device.
@@ -76,6 +79,9 @@ class NvlinkEngine:
         destination of local READ batches. The caller must guarantee that the
         remotely readable byte ranges never overlap those destinations. Exporting
         a region with a local batch in flight stays refused (the native layer too).
+
+        concurrent_reads lets READ batches share a local or imported region while in
+        flight, provided their destination ranges never overlap (checked here).
 
         retain_imports keeps one mapping per peer region: a later lease of the same
         region reuses it instead of importing again, and the caller must not unmap it
@@ -102,6 +108,7 @@ class NvlinkEngine:
         self._mapping_guard = None
         self._mapping_guard_poisoned = False
         self._retain_imports = retain_imports
+        self.concurrent_reads = concurrent_reads
         # (peer owner_id, peer region_id) -> (MemoryHandle, export identity)
         self._retained = {}
         if mapping_peer_device is not None:
@@ -330,7 +337,10 @@ class NvlinkEngine:
                 read = req.opcode == Opcode.READ
                 shared = (self._shared_read_exports and read
                           and all(self._exports[x][1] == "read" for x in local.exports))
-                if (local.exports and not shared) or local.active or remote.active:
+                busy = local.active | remote.active
+                if busy and read and self.concurrent_reads:
+                    busy = {b for b in busy if not self._batches[b].read_only}
+                if (local.exports and not shared) or busy:
                     raise BusyError("region exported or already used by another batch")
                 required = "read" if read else "write"
                 if remote.descriptor.access != required:
@@ -354,6 +364,10 @@ class NvlinkEngine:
             intervals.sort()
             if any(a[1] > b[0] for a, b in zip(intervals, intervals[1:])):
                 raise ValueError("overlapping destination ranges")
+        for other in self._batches.values():
+            for key, intervals in writes.items():
+                if any(a < d and c < b for a, b in intervals for c, d in other.writes.get(key, ())):
+                    raise BusyError("destination overlaps a batch in flight")
         # If the native call raises unexpectedly after partial issue, conservatively quarantine.
         try:
             native = (self._driver.submit(ranges) if producer_stream is None else
@@ -364,7 +378,8 @@ class NvlinkEngine:
             raise
         public = BatchHandle(uuid.uuid4().hex)
         self._batches[public.batch_id] = _Batch(public, native, touched,
-                                              TransferStatus(TransferState.IN_FLIGHT, total, None))
+                                              TransferStatus(TransferState.IN_FLIGHT, total, None),
+                                              writes, all(r.opcode is Opcode.READ for r in requests))
         for key in touched:
             self._memories[key].active.add(public.batch_id)
         return public

@@ -96,8 +96,10 @@ class SchedulerPeer:
         self.mapping_peer_device = _mapping_peer_device(device)
         # A concurrent Engine may copy into its pool while peers read leased pages of it.
         # retain_imports (D6): one mapping per peer region, reused by every later lease of it.
+        # Several slots copy into disjoint private pages of the same pool regions at once.
         self.engine = NvlinkEngine(device, mapping_peer_device=self.mapping_peer_device,
-                                   shared_read_exports=concurrent, retain_imports=retain_imports)
+                                   shared_read_exports=concurrent, retain_imports=retain_imports,
+                                   concurrent_reads=target_slots > 1)
         self.adapter = SGLangPoolAdapter(pool, self.engine)
         self.identity = ModelIdentity(**identity)
         self.identity.validate()
@@ -477,8 +479,10 @@ class SchedulerPeer:
                 self._start_copy()
 
     def _start_copy(self):
-        # A pool region carries one batch at a time, so slots pipeline: only the copy is serial.
-        if any(slot is not self and slot.phase == 'WAIT_TRANSFER' for slot in self._slots()):
+        # Without concurrent reads a pool region carries one batch at a time: copies go one by one.
+        engine = getattr(self, 'engine', None)
+        if (not getattr(engine, 'concurrent_reads', False)
+                and any(slot is not self and slot.phase == 'WAIT_TRANSFER' for slot in self._slots())):
             return
         tx = self.session['transaction']
         if getattr(self, 'concurrent', False):
