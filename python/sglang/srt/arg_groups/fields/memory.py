@@ -268,6 +268,19 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori", "dynamic"],
         ),
     ] = "mooncake"
+    unified_cache_external_linker_load_failure: A[
+        str,
+        Arg(
+            help=(
+                "What happens to a request whose external-linker KV load fails. "
+                "recompute: drop that forward, release its KV and requeue it to "
+                "recompute the prefix without the linker. abort: finish it with 503. "
+                "Chunked prefills, PD prefill servers and embedding models always "
+                "abort."
+            ),
+            choices=["recompute", "abort"],
+        ),
+    ] = "recompute"
     unified_cache_external_linker_config: A[
         Optional[Dict[str, Any]],
         Arg(

@@ -559,5 +559,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "unified_cache_external_linker_load_failure",
 )
 # fmt: on

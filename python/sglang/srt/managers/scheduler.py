@@ -782,6 +782,7 @@ class Scheduler(
 
         self.init_output_streamer()
 
+        self.init_external_load_failure_policy()
         self.init_batch_result_processor()
 
         self.init_internal_state()
@@ -2861,6 +2862,15 @@ class Scheduler(
             future_map=self.future_map,
         )
 
+    def init_external_load_failure_policy(self) -> None:
+        """Recompute, not abort, a request whose external-linker load fails."""
+        self.recompute_failed_external_loads = (
+            self.enable_unified_cache_external_linker
+            and get_memory().unified_cache_external_linker_load_failure == "recompute"
+            and self.is_generation
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        )
+
     def init_batch_result_processor(self) -> None:
         self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -2885,6 +2895,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            requeue_for_recompute=self._requeue_for_recompute,
             uocr_doc_hooks=self.uocr_doc_hooks,
         )
 
@@ -3691,6 +3702,11 @@ class Scheduler(
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
+    def _requeue_for_recompute(self, req: Req) -> None:
+        """Requeue a request released after its external-linker load failed."""
+        self.running_reqs.leave([req])
+        self._add_request_to_queue(req, is_retracted=True)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
@@ -4197,6 +4213,16 @@ class Scheduler(
 
             if self.dllm_config is not None and last_batch.reqs:
                 reqs_to_exclude.update(last_batch.reqs)
+
+            # Their failed step's result requeues them; they never run in this batch.
+            failed_loads = [
+                req
+                for req in last_batch.reqs
+                if req.failed_external_load_iter is not None
+                and req.failed_external_load_iter == last_batch.forward_iter
+            ]
+            reqs_to_exclude.update(failed_loads)
+            self.running_reqs.leave(failed_loads)
 
             # Filter batch
             last_bs = last_batch.batch_size()
@@ -5287,7 +5313,15 @@ class Scheduler(
                 )
 
         if self.enable_unified_cache_external_linker:
-            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+            # TODO(zhengd-nv): recompute a chunked request too; its in-flight
+            # middle chunks under overlap make the requeue unsafe today.
+            failed = self.tree_cache.finish_external_linker_loads(
+                batch.reqs,
+                recompute_iter=(
+                    batch.forward_iter if self.recompute_failed_external_loads else None
+                ),
+                abort_only=self.chunked_req,
+            )
             if self.chunked_req in failed:
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.

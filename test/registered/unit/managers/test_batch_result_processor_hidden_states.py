@@ -450,6 +450,89 @@ class TestMixedBatchKvRelease(CustomTestCase):
         )
 
 
+class TestPrefillFailedExternalLoad(CustomTestCase):
+    def test_failed_load_requeues_tagged_req_and_aborts_the_rest(self):
+        """A request whose external-linker load failed in this step is released
+        unchecked, reset and requeued without streaming or a stale cache-hit count;
+        an untagged failure (chunked, or recompute disabled) still finishes with 503."""
+        reason = FINISH_ABORT("External KV cache load failed", 503)
+        retry, abort = (
+            _PrefillReq(rid=rid, inflight_middle_chunks=0, return_hidden_states=False)
+            for rid in ("retry", "abort")
+        )
+        for req in (retry, abort):
+            req.discard_output_reason = reason
+            req.to_finish = None
+            req.request_finish = MethodType(Req.request_finish, req)
+            req.cancel_discard = MethodType(Req.cancel_discard, req)
+            req.finished = lambda req=req: req.to_finish is not None
+            req.update_finish_state = lambda *args: None
+            req.reset_for_retract = Mock()
+            req.cached_tokens = req.cached_tokens_storage = 4096
+            req.cached_tokens_device = req.cached_tokens_host = 0
+        retry.failed_external_load_iter = 7
+        abort.failed_external_load_iter = None
+        batch = SimpleNamespace(
+            reqs=[retry, abort],
+            decoding_reqs=[],
+            forward_iter=7,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            kv_weight_version_record=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            next_token_ids=torch.tensor([5, 6]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        requeue = Mock()
+        processor = replace(_make_processor(self), requeue_for_recompute=requeue)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ) as release,
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        requeue.assert_called_once_with(retry)
+        retry.reset_for_retract.assert_called_once_with()
+        self.assertIsNone(retry.discard_output_reason)
+        self.assertIsNone(retry.to_finish)
+        self.assertEqual(retry.output_ids, [])
+        # The failed load's span must not be reported as a cache hit.
+        self.assertEqual(retry.cached_tokens, 0)
+        self.assertEqual(retry.cached_tokens_storage, 0)
+        self.assertIs(abort.to_finish, reason)
+        abort.reset_for_retract.assert_not_called()
+        release.assert_any_call(retry, processor.tree_cache, checkpoint=False)
+        release.assert_any_call(abort, processor.tree_cache, checkpoint=False)
+        self.assertEqual(release.call_count, 2)
+        processor.output_streamer.stream_output.assert_called_once_with(
+            [abort], False, None
+        )
+
+
 class TestDecodeWithoutLogits(CustomTestCase):
     def test_pipeline_result_commits_token_without_sampling_metadata(self):
         processor = _make_processor(self)

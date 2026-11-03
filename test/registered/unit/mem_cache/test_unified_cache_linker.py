@@ -656,7 +656,12 @@ class TestUnifiedCacheLinkerPythonBackend(
     def test_swa_failed_load_frees_private_slots_unpublished(self):
         self._run_swa_hit(load_landed=False)
 
-    def _run_swa_hit(self, load_landed):
+    def test_swa_failed_load_tagged_for_recompute_skips_linker_on_retry(self):
+        """A request requeued after its load failed must not hit the linker
+        again, or a store that keeps failing would requeue it forever."""
+        self._run_swa_hit(load_landed=False, recompute_iter=7)
+
+    def _run_swa_hit(self, load_landed, recompute_iter=None):
         cfg = CacheConfig(
             page_size=1,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -757,9 +762,15 @@ class TestUnifiedCacheLinkerPythonBackend(
             )
         else:
             consumer_linker.load_landed = False
-            self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
+            self.assertEqual(
+                consumer.finish_external_linker_loads(
+                    [req], recompute_iter=recompute_iter
+                ),
+                [req],
+            )
             self.assertEqual(req.discard_output_reason.status_code, 503)
-            self.assertTrue(req.skip_radix_cache_insert)
+            self.assertEqual(req.failed_external_load_iter, recompute_iter)
+            self.assertEqual(req.skip_radix_cache_insert, recompute_iter is None)
             release_kv_cache(req, consumer, checkpoint=False)
             self.assertFalse(req.kv.holds_kv)
             self.assertTrue(req.kv.is_kv_released)
@@ -773,6 +784,11 @@ class TestUnifiedCacheLinkerPythonBackend(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
             self.assertEqual(unpublished.device_prefix_len, 3)
+            # The store still holds the fourth page; only the tag keeps it unread.
+            retry = consumer.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens[:4])), req=req)
+            )
+            self.assertEqual(retry.host_hit_length, 0 if recompute_iter else 1)
         consumer.sanity_check()
 
     def _mamba_linker_consumer(self, tokens):
@@ -1525,7 +1541,9 @@ def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
         best_match_node=0,
     )
     matched = wrapper.match(
-        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="match"), result
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(rid="match", failed_external_load_iter=None),
+        result,
     )
     assert matched.host_hit_length == 4
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [

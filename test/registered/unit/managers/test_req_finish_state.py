@@ -24,6 +24,7 @@ _OWNER_SCOPES = {
     "Req.__init__",
     "Req.request_finish",
     "Req.request_discard",
+    "Req.cancel_discard",
     "Req.clear_requested_finish",
     "Req.finish_outside_step",
     # The step commit's finish checks.
@@ -58,6 +59,7 @@ class TestReqFinishMethods(CustomTestCase):
         cases = [
             ("request_finish", (reason,), dict(to_finish=reason)),
             ("request_discard", (reason,), dict(discard_output_reason=reason)),
+            ("cancel_discard", (), dict(discard_output_reason=None)),
             ("clear_requested_finish", (), dict(to_finish=None)),
             ("finish_outside_step", (reason,), dict(finished_reason=reason)),
         ]
@@ -65,6 +67,7 @@ class TestReqFinishMethods(CustomTestCase):
             with self.subTest(method=method):
                 req = Req("r", "", [1, 2], SamplingParams())
                 req.to_finish = pending
+                req.discard_output_reason = pending
                 expected = {**_finish_state(req), **changed}
                 getattr(req, method)(*args)
                 self.assertEqual(_finish_state(req), expected)

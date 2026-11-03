@@ -1542,6 +1542,9 @@ class Req(ReqDllmMixin):
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
+        # forward_iter of the step whose external-linker load failed; that step's
+        # output is dropped, and the requeued request never consults the linker again.
+        self.failed_external_load_iter: Optional[int] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -2156,6 +2159,10 @@ class Req(ReqDllmMixin):
     def request_discard(self, reason: FINISH_ABORT) -> None:
         """Drop the output of the request's in-flight step and finish with reason."""
         self.discard_output_reason = reason
+
+    def cancel_discard(self) -> None:
+        """Forget a discard whose request is requeued instead of finishing."""
+        self.discard_output_reason = None
 
     def clear_requested_finish(self) -> None:
         """Drop the finish requested for the next commit."""

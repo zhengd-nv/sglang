@@ -307,6 +307,8 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        if req.failed_external_load_iter is not None:
+            return result
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size

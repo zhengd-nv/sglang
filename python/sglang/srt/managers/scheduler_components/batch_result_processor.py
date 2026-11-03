@@ -152,6 +152,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    requeue_for_recompute: Optional[Callable[[Req], None]] = None
     uocr_doc_hooks: Optional[UocrDocHooks] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -317,6 +318,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        recompute_reqs: list[Req] = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -413,7 +415,13 @@ class SchedulerBatchResultProcessor:
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
 
-                    if discard_finish_reason is not None:
+                    if self._recomputes_failed_load(
+                        req=req,
+                        discard_finish_reason=discard_finish_reason,
+                        batch=batch,
+                    ):
+                        recompute_reqs.append(req)
+                    elif discard_finish_reason is not None:
                         req.request_finish(discard_finish_reason)
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
@@ -444,7 +452,10 @@ class SchedulerBatchResultProcessor:
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.commit_decode(1)
-                    if req.finished():
+                    if req in recompute_reqs:
+                        # Released after the loop; logprob accounting still reads it.
+                        pass
+                    elif req.finished():
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
@@ -570,9 +581,17 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        for req in recompute_reqs:
+            self._release_for_recompute(req)
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            (
+                [req for req in batch.reqs if req not in recompute_reqs]
+                if recompute_reqs
+                else batch.reqs
+            ),
+            batch.return_logprob,
+            skip_stream_req,
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -585,6 +604,33 @@ class SchedulerBatchResultProcessor:
                 can_run_cuda_graph=can_run_cuda_graph,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+
+    def _recomputes_failed_load(
+        self,
+        *,
+        req: Req,
+        discard_finish_reason: Optional[FINISH_ABORT],
+        batch: ScheduleBatch,
+    ) -> bool:
+        return (
+            discard_finish_reason is not None
+            and self.requeue_for_recompute is not None
+            and req.failed_external_load_iter is not None
+            and req.failed_external_load_iter == batch.forward_iter
+        )
+
+    def _release_for_recompute(self, req: Req) -> None:
+        """Drop the KV a failed external-linker load left and requeue the
+        request to recompute its prefix."""
+        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        req.reset_for_retract()
+        req.cancel_discard()
+        # The failed span was never reused; the retract stain keeps the retry from
+        # recounting, so report no cache hit rather than the failed attempt's.
+        req.cached_tokens = 0
+        req.cached_tokens_device = req.cached_tokens_host = 0
+        req.cached_tokens_storage = 0
+        self.requeue_for_recompute(req)
 
     def _convert_embeddings(
         self, *, result: EmbeddingBatchResult, batch: ScheduleBatch
