@@ -917,6 +917,61 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
 
+    def test_plain_mha_packs_k_then_v_per_page(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolFP4,
+        )
+
+        def mha_pool(cls=MHATokenToKVPool, page_size=2):
+            pool = cls.__new__(cls)
+            pool.page_size, pool.layer_num, pool.start_layer = page_size, 2, 0
+            pool.k_scale_buffer = pool.native_k_scale_buffer = None
+            pool.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+            pool.v_buffer = [torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
+            return pool
+
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(), sidecar_draft_device_pools=()
+        )
+
+        def resolve(kvcache, dcp_size=1):
+            with patch.object(
+                linker_pool_assembler,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+            ):
+                return resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=params,
+                    components={ComponentType.FULL},
+                )
+
+        kvcache = mha_pool()
+        group = resolve(kvcache)
+        self.assertEqual(group.num_layers, 2)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping, {0: (0, 2), 1: (1, 3)})
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+        # One page object: K of both layers (2 tokens x 3 B each), then V (x 5 B).
+        _, sizes, offsets = kv.get_prepared_layer_range_meta([2], 1)
+        self.assertEqual(sizes, [[6, 10]])
+        self.assertEqual(offsets, [[6, 22]])
+
+        with self.assertRaisesRegex(ValueError, "plain MHA"):
+            resolve(kvcache, dcp_size=2)
+        with self.assertRaisesRegex(ValueError, "plain MHA"):
+            resolve(mha_pool(page_size=4))
+        with self.assertRaisesRegex(ValueError, "plain MHA"):
+            resolve(mha_pool(cls=MHATokenToKVPoolFP4))
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "plain MHA"):
+            resolve(kvcache)
+
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 

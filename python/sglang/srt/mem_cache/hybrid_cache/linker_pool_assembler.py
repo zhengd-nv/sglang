@@ -451,6 +451,28 @@ def _mha_device_pool_entry(
     )
 
 
+def _build_mha_device_pool_group(
+    *, kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # TODO(zhengd-nv): support MLA, MHA subclasses, DCP and packed draft KV.
+    if (
+        type(kvcache) is not MHATokenToKVPool
+        or kvcache.page_size != page_size
+        or get_parallel().attn_dcp_size > 1
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL-only models only with a "
+            "plain MHA pool at the tree page size, without DCP or packed draft KV."
+        )
+    layer_mapping = {layer: layer for layer in range(len(kvcache.k_buffer))}
+    entry = _mha_device_pool_entry(PoolName.KV, kvcache, layer_mapping, page_size)
+    # Not rank_replicated: MHA heads are TP-sharded.
+    return DevicePoolGroup([entry], len(layer_mapping), page_size)
+
+
 def _mamba_device_pool_entry(state: Any, start_layer: int) -> DevicePoolEntry:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _stage_local_layer_mapping,
