@@ -1,0 +1,161 @@
+From d6740b49a6cca41609455aef2ebc126dcaa8f04d Mon Sep 17 00:00:00 2001
+From: zhengd-nv <200704041+zhengd-nv@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:29:28 -0800
+Subject: [PATCH] [TE] NVLink: group scatter fragments into one task
+
+A store range read issues one scatter per layer, and without grouped
+scatter every fragment became its own task: the scatter wait polled each
+one through getTransferStatus, i.e. one cudaStreamQuery per fragment per
+poll. Opt in to grouped scatter like RDMA/TCP, submit every request of a
+grouped task to the same batched memcpy, and fail all unsubmitted
+requests on a relocation error instead of leaving them pending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../nvlink_transport/nvlink_transport.h       |  4 +
+ .../nvlink_transport/nvlink_transport.cpp     | 86 +++++++++++++------
+ 2 files changed, 66 insertions(+), 24 deletions(-)
+
+diff --git a/mooncake-transfer-engine/include/transport/nvlink_transport/nvlink_transport.h b/mooncake-transfer-engine/include/transport/nvlink_transport/nvlink_transport.h
+index 859734e2..56945b8b 100644
+--- a/mooncake-transfer-engine/include/transport/nvlink_transport/nvlink_transport.h
++++ b/mooncake-transfer-engine/include/transport/nvlink_transport/nvlink_transport.h
+@@ -107,6 +107,10 @@ class NvlinkTransport : public Transport {
+     Status getTransferStatus(BatchID batch_id, size_t task_id,
+                              TransferStatus& status) override;
+
++    // One task per scatter keeps completion polling to one stream query per
++    // submission instead of one per fragment.
++    bool supportsGroupedScatter() const override { return true; }
++
+     static void* allocatePinnedLocalMemory(size_t length);
+
+     static void freePinnedLocalMemory(void* addr);
+diff --git a/mooncake-transfer-engine/src/transport/nvlink_transport/nvlink_transport.cpp b/mooncake-transfer-engine/src/transport/nvlink_transport/nvlink_transport.cpp
+index 1804f9a4..664d42d9 100644
+--- a/mooncake-transfer-engine/src/transport/nvlink_transport/nvlink_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/nvlink_transport/nvlink_transport.cpp
+@@ -858,10 +858,24 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+     // direct-query behavior.
+     std::map<int, std::unordered_map<cudaStream_t, cudaError_t>>
+         stream_status_cache;
++    // A grouped task posts all its slices to one stream; skip the map lookup
++    // for repeats of the previous slice's stream.
++    cudaStream_t last_stream = nullptr;
++    int last_device = -1;
++    cudaError_t last_err = cudaErrorNotReady;
+     for (auto *slice : task.slice_list) {
+         if (slice && slice->status == Slice::POSTED) {
+             cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
+             const int stream_device = slice->local.cuda_device;
++            if (last_device >= 0 && stream == last_stream &&
++                stream_device == last_device) {
++                if (last_err == cudaSuccess) {
++                    slice->markSuccess();
++                } else if (last_err != cudaErrorNotReady) {
++                    slice->markFailed();
++                }
++                continue;
++            }
+             auto &device_cache = stream_status_cache[stream_device];
+             auto it = device_cache.find(stream);
+             cudaError_t cuda_err;
+@@ -880,6 +894,9 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+             } else {
+                 cuda_err = it->second;
+             }
++            last_stream = stream;
++            last_device = stream_device;
++            last_err = cuda_err;
+             if (cuda_err == cudaSuccess) {
+                 slice->markSuccess();
+             } else if (cuda_err != cudaErrorNotReady) {
+@@ -926,23 +943,22 @@ Status NvlinkTransport::submitTransferTask(
+                                std::string(cudaGetErrorString(sync_err)));
+     }
+
+-    // Phase 1: Prepare slices and collect memcpy parameters
++    // Phase 1: Prepare slices and collect memcpy parameters.  A grouped
++    // scatter task carries request_count requests; each gets one slice, in
++    // request order, as getScatterRequestStatuses() expects.
++    size_t request_total = 0;
++    for (auto *task : task_list) request_total += task->request_count;
+     std::vector<void *> dsts, srcs;
+     std::vector<size_t> sizes;
+     std::vector<Slice *> slices;
+-
+-    for (size_t index = 0; index < task_list.size(); ++index) {
+-        assert(task_list[index]);
+-        auto &task = *task_list[index];
+-        assert(task.request);
+-        auto &request = *task.request;
+-        uint64_t dest_addr = request.target_offset;
+-        if (request.target_id != LOCAL_SEGMENT_ID) {
+-            int rc = relocateSharedMemoryAddress(dest_addr, request.length,
+-                                                 request.target_id);
+-            if (rc) return Status::Memory("device memory not registered");
+-        }
+-        task.total_bytes = request.length;
++    dsts.reserve(request_total);
++    srcs.reserve(request_total);
++    sizes.reserve(request_total);
++    slices.reserve(request_total);
++
++    auto add_slice = [&](TransferTask &task, const TransferRequest &request,
++                         uint64_t dest_addr) {
++        task.total_bytes += request.length;
+         Slice *slice = getSliceCache().allocate();
+         slice->source_addr = (char *)request.source;
+         slice->local.dest_addr = (char *)dest_addr;
+@@ -954,17 +970,39 @@ Status NvlinkTransport::submitTransferTask(
+         slice->ts = getCurrentTimeInNano();
+         task.slice_list.push_back(slice);
+         __sync_fetch_and_add(&task.slice_count, 1);
++        return slice;
++    };
+
+-        void *src = (request.opcode == TransferRequest::READ)
+-                        ? (void *)slice->local.dest_addr
+-                        : (void *)slice->source_addr;
+-        void *dst = (request.opcode == TransferRequest::READ)
+-                        ? slice->source_addr
+-                        : (void *)slice->local.dest_addr;
+-        srcs.push_back(src);
+-        dsts.push_back(dst);
+-        sizes.push_back(slice->length);
+-        slices.push_back(slice);
++    for (size_t index = 0; index < task_list.size(); ++index) {
++        assert(task_list[index]);
++        auto &task = *task_list[index];
++        assert(task.request);
++        for (size_t r = 0; r < task.request_count; ++r) {
++            const auto &request = task.request[r];
++            uint64_t dest_addr = request.target_offset;
++            if (request.target_id != LOCAL_SEGMENT_ID &&
++                relocateSharedMemoryAddress(dest_addr, request.length,
++                                            request.target_id)) {
++                // Nothing is submitted yet; fail every request of this
++                // submission so no task is left waiting on an absent copy.
++                for (Slice *slice : slices) slice->markFailed();
++                for (size_t i = index; i < task_list.size(); ++i) {
++                    auto &rest = *task_list[i];
++                    for (size_t j = i == index ? r : 0; j < rest.request_count;
++                         ++j)
++                        add_slice(rest, rest.request[j], 0)->markFailed();
++                }
++                return Status::Memory("device memory not registered");
++            }
++            Slice *slice = add_slice(task, request, dest_addr);
++            const bool read = request.opcode == TransferRequest::READ;
++            srcs.push_back(read ? (void *)slice->local.dest_addr
++                                : (void *)slice->source_addr);
++            dsts.push_back(read ? (void *)slice->source_addr
++                                : (void *)slice->local.dest_addr);
++            sizes.push_back(slice->length);
++            slices.push_back(slice);
++        }
+     }
+
+     // Phase 2: See submitTransfer() for backend-specific stream grouping.
+--
+2.43.0
