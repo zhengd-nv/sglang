@@ -1,23 +1,37 @@
 # 在 NVL72 域内经 Grace 内存跨节点共享前缀 KV
 
 这个示例在同一个 NVL72 域的两个节点上各起一个 SGLang 服务。**writer** 计算一段长前缀，
-它的 KV 页经 write-through 写进一个 Mooncake store，store 放在其中一个节点的 Grace CPU 内存（EGM）里。
-**reader** 从空的 GPU 缓存起步，在 store 里找到这段前缀，经 NVLink 把它读回来，而不是重算。
+它的 KV 页经 write-through 写进 Grace CPU 内存（EGM）里的一个 store。
+**reader** 在另一个节点上，GPU 缓存是空的。它在 store 里找到这段前缀，经 NVLink 把它读回来，而不是重算。
 客户端检查两件事：reader 命中了缓存，并且它的输出与 writer 逐 token 一致。
 
-```
- 节点 0                                      节点 1（同一 NVL72 域）
- +---------------------------------+         +---------------------------+
- | mooncake_master + HTTP 元数据    |         |                           |
- | EGM provider（NUMA 0 Grace DRAM）|<------->| reader：sglang 服务        |
- | writer：sglang 服务（GPU 0）      | NVLink  |   （GPU 0）                |
- +---------------------------------+  fabric |   demo_client.py          |
-                                             +---------------------------+
-```
-
-不经主机中转，也不走 RDMA：reader 的 GPU 经 NVLink fabric 直接读 provider 的 EGM 页。
+读写都不经主机中转，也不走 RDMA：GPU 经 NVLink fabric 直接读写另一个节点的 Grace 内存。
 
 这里的「节点」即 Slurm 节点，GB200 NVL72 上对应一个 compute tray（4 GPU + 2 Grace）；节点内按 NUMA 划分。
+
+## 两种后端
+
+用 `BACKEND` 选择，两者用同一个客户端、同一套判据：
+
+| | `mooncake`（默认）| `egm` |
+|---|---|---|
+| store | Mooncake Store：一个 master（带 HTTP 元数据服务）加每 NUMA 一个 EGM provider，只在节点 0 上 | 每个节点每 NUMA 一个 EGM store 服务（`sglang.srt.mem_cache.storage.egm.service`）|
+| 写到哪 | master 分配（本示例只有节点 0 有 provider）| 本节点、本 NUMA 的 store |
+| 怎么找到 | 问 master | 并行问所有 store，本节点优先 |
+| 数据面 | Mooncake Transfer Engine 的 nvlink transport（`cudaMemcpyBatchAsync`）| 读方 / 写方 GPU 自己发 gather kernel，每层一次 |
+| 依赖 | 从源码构建 Mooncake（带补丁），CMake 约 8 分钟 | CUDA driver、numpy；`nvcc` 编一个 `libegm.so`，几秒 |
+| 端口 | master RPC、HTTP 元数据、metrics、每个进程一个 Transfer Engine 端口 | 每个 store 一个 TCP 端口（带作业密钥）|
+| 全局能力 | master 统一分配、全局去重、高水位淘汰、跨节点借容量 | 跨 store 去重；无目录服务、不跨节点借容量 |
+
+```
+ BACKEND=mooncake                                      BACKEND=egm
+ 节点 0                          节点 1                 节点 0                          节点 1
+ +-------------------------+     +----------+          +-------------------------+     +-------------------------+
+ | master + 元数据          |     |          |          | EGM store（NUMA 0）      |     | EGM store（NUMA 0）      |
+ | EGM provider（NUMA 0）   |<----| reader   |          | writer（GPU 0）写本节点   |<----| reader（GPU 0）读节点 0 |
+ | writer（GPU 0）          | NVL | （GPU 0）|          |                         | NVL | 写前去重：不再写一份      |
+ +-------------------------+     +----------+          +-------------------------+     +-------------------------+
+```
 
 ## 分支内容
 
@@ -25,9 +39,10 @@
 |---|---|
 | `[HiCache] Direct linker pool group for plain MHA KV` | 让 direct external linker 支持普通 MHA 模型（上游 main 只覆盖 DSv4 / DSA / Mamba），拒绝 DCP 与打包的 draft KV |
 | `[Feature] Unified Cache: Recompute requests whose external linker load fails` | store 读失败时撤回请求并重算（`--unified-cache-external-linker-load-failure`，默认 `recompute`），而不是返回 503 |
-| `[HiCache] Direct linker: group layers per range read and keep reads in flight` | linker 按层读取时把几层合成一次调用（`load_layers_per_call`），并让多次调用同时在途（`load_inflight`）；默认 1 / 1 即原行为，本示例用 4 / 2 |
+| `[HiCache] Direct linker: group layers per range read and keep reads in flight` | Mooncake linker 按层读取时把几层合成一次调用（`load_layers_per_call`），并让多次调用同时在途（`load_inflight`）；默认 1 / 1 即原行为，本示例用 4 / 2 |
+| `[HiCache] EGM store service and direct linker` | `python/sglang/srt/mem_cache/storage/egm/`：`egm` 后端的 store 服务、linker（经 `dynamic` linker 后端加载）与 native 库，见该目录的 README |
 | `examples/runtime/nvl72_l2_sharing/` | 本示例 |
-| `mooncake-nvlink-grouped-scatter.patch` | Mooncake 补丁：NVLink transport 把一次 scatter 作为一个 task 处理。不打的话每个 32 KiB 的页片段要单独轮询，负载下恢复 16k token 前缀约 70 ms 而不是 43 ms（不含上一行的 linker 改动）|
+| `mooncake-nvlink-grouped-scatter.patch` | Mooncake 补丁：NVLink transport 把一次 scatter 作为一个 task 处理。不打的话每个 32 KiB 的页片段要单独轮询，负载下恢复 16k token 前缀约 70 ms 而不是 43 ms（不含 linker 分组）|
 
 ## 环境要求
 
@@ -35,25 +50,31 @@
   （`/dev/nvidia-caps-imex-channels/`）。Slurm 的 block 拓扑集群上用 `--segment=2` 保证两个节点在一个域里。
 - 本分支对应的 SGLang nightly 容器，例如 `lmsysorg/sglang:nightly-dev-cu13-20261102-38d9e4a3`；
   本分支装进去，或者把 `<repo>/python` 放在 `PYTHONPATH` 最前面。
-- 一个两个节点都能看到的目录（下文的 `WORK`），放 Mooncake 构建与运行日志。
+- 一个两个节点都能看到的目录（下文的 `WORK`），放构建产物、作业密钥与运行日志。
 - 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）。
 
-## 1. 构建 Mooncake（一次，在容器里）
+## 1. 构建（一次，在容器里）
 
-镜像自带的 Mooncake wheel（0.3.13.post1）没有 EGM store pool，所以要从源码构建。脚本固定 commit `522b716` 并打上 grouped-scatter 补丁：
+先让这份 checkout 能排在镜像的 SGLang 之前被导入。脚本会拷贝镜像里已编好、但不在 git 里的 Rust 扩展；`run_slurm.sh` 会自动调用：
+
+```bash
+./prepare_sglang.sh
+```
+
+**`BACKEND=egm`**：编 `libegm.so`，写 `$WORK/egm-env.sh`（`run_slurm.sh` 会自动调用）：
+
+```bash
+WORK=/shared/l2-sharing ./build_egm.sh
+```
+
+**`BACKEND=mooncake`**：镜像自带的 Mooncake wheel（0.3.13.post1）没有 EGM store pool，要从源码构建。脚本固定 commit `522b716` 并打上 grouped-scatter 补丁，
+写 `$WORK/env.sh`，把构建出的 `mooncake` 包排在镜像自带的之前：
 
 ```bash
 WORK=/shared/l2-sharing ./build_mooncake.sh
 ```
 
-它会写 `$WORK/env.sh`，其它脚本都会 source 它，把构建出的 `mooncake` 包排在镜像自带的之前。
 如果镜像缺 yaml-cpp、zstd、xxHash 或 msgpack-c，用 Mooncake 的 `dependencies.sh` 装，或者传 `DEPS_PREFIX=<prefix>`。
-
-然后让这份 checkout 能排在镜像的 SGLang 之前被导入（同样一次，在容器里）。脚本会拷贝镜像里已编好、但不在 git 里的 Rust 扩展；`run_slurm.sh` 会自动调用：
-
-```bash
-./prepare_sglang.sh
-```
 
 ## 2. 运行
 
@@ -62,15 +83,36 @@ WORK=/shared/l2-sharing ./build_mooncake.sh
 ```bash
 srun -N2 --ntasks-per-node=1 --segment=2 --gpus-per-node=4 \
   --container-image=<sglang image> --container-mounts=/shared:/shared \
-  env WORK=/shared/l2-sharing MODEL=Qwen/Qwen2-1.5B \
+  env WORK=/shared/l2-sharing MODEL=Qwen/Qwen2-1.5B BACKEND=egm \
       PYTHONPATH=<this repo>/python \
   <this repo>/examples/runtime/nvl72_l2_sharing/run_slurm.sh
 ```
 
-### 手动
+`BACKEND=egm` 时节点 0 生成作业密钥（`$WORK/runs/<job id>/egm.secret`，0600），两个节点各起本节点的 store，
+再各起一个服务：每个服务的 store 列表是「本 NUMA 的 Unix socket 在前（写入目标），对方节点的 TCP 地址在后」。
+
+### 手动（`BACKEND=egm`）
 
 ```bash
-# 每个节点：PYTHONPATH=<this repo>/python，先跑过 ./prepare_sglang.sh
+# 每个节点：PYTHONPATH=<this repo>/python，先跑过 ./prepare_sglang.sh 与 ./build_egm.sh
+export WORK=/shared/l2-sharing SECRET_FILE=/shared/l2-sharing/egm.secret   # 两个节点用同一个密钥文件
+NUMAS=0 ./start_egm_store.sh            # 每个节点各起一个，等到 STORE_READY
+
+# 节点 0（writer）
+BACKEND=egm MODEL=Qwen/Qwen2-1.5B GPU=0 \
+  EGM_STORES=/tmp/egm-numa0.sock,tcp://<节点 1 IP>:29600 ./start_server.sh
+# 节点 1（reader）
+BACKEND=egm MODEL=Qwen/Qwen2-1.5B GPU=0 \
+  EGM_STORES=/tmp/egm-numa0.sock,tcp://<节点 0 IP>:29600 ./start_server.sh
+python3 demo_client.py --writer http://<节点 0 IP>:30000 --reader http://127.0.0.1:30000
+```
+
+两个节点的 store 都要先起来，再起服务：服务启动时会连上并导入列表里的每个 store。
+`EGM_STORES` 的第一个是这个服务写入的 store，应是本节点、本 GPU 所在 NUMA 的那个（GPU 0/1 → NUMA 0，GPU 2/3 → NUMA 1）。
+
+### 手动（`BACKEND=mooncake`）
+
+```bash
 # 节点 0
 WORK=/shared/l2-sharing NUMAS=0 ./start_store.sh            # 等到 STORE_READY
 WORK=/shared/l2-sharing MASTER_HOST=<节点 0 IP> MODEL=Qwen/Qwen2-1.5B GPU=0 ./start_server.sh
@@ -80,8 +122,7 @@ python3 demo_client.py --writer http://<节点 0 IP>:30000 --reader http://127.0
 ```
 
 先起 store 再起服务：每个服务启动时会做一次预热写入，这次写入需要已有 segment 可落。
-
-`start_server.sh` 的 `LOAD_LAYERS_PER_CALL`（默认 4）与 `LOAD_INFLIGHT`（默认 2）控制按层读取的方式，见下文「实测」。
+`LOAD_LAYERS_PER_CALL`（默认 4）与 `LOAD_INFLIGHT`（默认 2）控制 Mooncake linker 按层读取的方式，见下文「实测」。
 
 ## 3. 看什么
 
@@ -97,63 +138,62 @@ DEMO_RESULT PASS prefix=16384 writer_cold=...ms reader_from_pool=...ms reader_ca
 - `run_slurm.sh` 还会打印 `READER_NODE_NVLINK_DELTA`，即演示期间 reader 节点上每块 GPU 的 NVLink 收发字节。
   只有 reader GPU 应该收到数据：每轮 `前缀 / page_size × 每页字节`（Qwen2-1.5B 每个 64 token 的页 1.75 MiB，16384 token 即 448 MiB），
   客户端会先跑一轮不计时的预热，再跑一轮计时的。
+- `BACKEND=egm` 时还打印每个 store 的 `EGM_STORE ... {"objects": ...}`：节点 0 的 store 有 512 个对象
+  （预热与计时两轮各一条前缀、各 256 页，共 896 MiB），节点 1 的 store 是 0：reader 读回后没有把前缀再写一份。
 
 ## 实测（GB200）
 
 Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8 路并发流式负载，reader 循环恢复前缀 60 s，
 数值是负载下恢复延迟 p50 / p99（ms）。
 
-**两节点，同一作业**（store 在节点 A；reader 在节点 B 读 A 的 EGM 为「跨节点」，在节点 A 读为「本节点」；linker 4 层一组 × 2 在途）：
+**两节点，同一作业，两种后端**（store 在节点 A；reader 在节点 B 读 A 为「跨节点」，在 A 上读为「本节点」；Mooncake linker 4 层一组 × 2 在途）：
 
-| 前缀 | 跨节点 | 本节点 |
+| 前缀 | egm 跨节点 | egm 本节点 | mooncake 跨节点 | mooncake 本节点 |
+|---|---|---|---|---|
+| 2048 | 16.3 / 22.1 | 15.8 / 22.9 | 15.0 / 17.8 | 14.8 / 17.4 |
+| 16384 | 21.7 / 30.1 | 21.0 / 28.9 | 25.3 / 27.7 | 24.5 / 26.6 |
+
+- 跨节点只比本节点多 0.2–0.8 ms；NVLink 计数显示数据只从 store 所在 NUMA 的入口 GPU 发到 reader GPU。
+- 长前缀 `egm` 快约 3.6 ms：它每层一次 gather kernel，不受页片段数影响；Mooncake 按片段提交批量拷贝，片段多时驱动工作会拖慢本服务的 kernel 发射。
+  短前缀 `mooncake` 快约 1.3 ms：`egm` 每次恢复多两次 RPC（查找要问所有 store，再加一次 Pin），p99 也更高。
+- writer 开 write-through 后吞吐下降：`mooncake` 约 2%，`egm` 4–6%（offload 线程的 Python 与 RPC，不是拷贝）。写本节点与写另一节点没有可分辨的差别。
+
+**单节点，与本地主机内存 L2（HiCache）对比**（同一作业；Mooncake linker 4 层一组 × 4 在途）：
+
+| 前缀 | egm | mooncake | HiCache 本地 host L2 |
+|---|---|---|---|
+| 2048 | 16.1 / 28.9 | 14.9 / 17.4 | 14.3 / 17.4 |
+| 16384 | 20.7 / 31.6 | 26.5 / 29.1 | 17.5 / 20.9 |
+
+**Mooncake 各项改动的贡献**（16384 前缀，负载下 p50，单节点，跨作业）：原版 70.0 ms → grouped-scatter 补丁 42.9 ms → 再加 linker 分组与在途 24.5 ms。
+
+两个节点上空闲时各一次运行（16384 token 前缀，生成 16 个 token，每个数值都含解码；两列是不同作业、不同节点对）：
+
+| 请求 | mooncake | egm |
 |---|---|---|
-| 2048 | 15.0 / 17.8 | 14.8 / 17.4 |
-| 16384 | 25.3 / 27.7 | 24.5 / 26.6 |
-
-跨节点只比本节点多 0.2–0.8 ms；NVLink 计数显示数据只从 store 所在 NUMA 的入口 GPU 发到 reader GPU。
-writer 开 write-through 后吞吐下降约 2%，写本节点与写另一节点没有可分辨的差别。
-
-**单节点，与本地主机内存 L2（HiCache）对比**（同一作业，linker 4 层一组 × 4 在途）：
-
-| 前缀 | 本示例 | HiCache 本地 host L2 |
-|---|---|---|
-| 2048 | 14.9 / 17.4 | 14.3 / 17.4 |
-| 16384 | 26.5 / 29.1 | 17.5 / 20.9 |
-
-**各项改动的贡献**（16384 前缀，负载下 p50，单节点，跨作业）：Mooncake 原版 70.0 ms → 打 grouped-scatter 补丁 42.9 ms → 再加 linker 分组与在途 24.5 ms。
-
-说明：
-
-- 短前缀的恢复与本地主机内存相当。长前缀仍慢约 7 ms，开销按页片段数而不是按字节数计：每页每层两个 32 KiB 片段，16384 token 就是 14336 个。
-  linker 分组与在途已经把加载完全藏到 forward 后面；剩下的差距是：多个在途读调用里逐片段的驱动工作，会拖慢本服务自己的 kernel 发射。
-  所以 `LOAD_INFLIGHT` 不宜超过 2（4 在途时加载更快，但整体反而慢 1–2 ms）。
-- 不按层切分、整页读回时，微基准里 16384 token 只要约 7 ms。
-
-两个节点上空闲时的一次运行（16384 token 前缀，生成 16 个 token，每个数值都含解码）：
-
-| 请求 | 延迟 |
-|---|---|
-| writer，冷 prefill | 118 ms |
-| writer，前缀在自己的 GPU 缓存里 | 58 ms |
-| reader，前缀从另一个节点的 EGM 读回 | 66 ms（未加 linker 分组与在途时 83 ms）|
-
-reader 所在节点只有 reader GPU 收到 939,523,072 字节，即预热 + 计时两轮各 448 MiB。
+| writer，冷 prefill | 118 ms | 114 ms |
+| writer，前缀在自己的 GPU 缓存里 | 58 ms | 58 ms |
+| reader，前缀从另一个节点的 Grace 内存读回 | 66 ms | 65 ms |
 
 ## 局限
 
-- 只能在一个 NVL72 域内用。跨域时导入另一个节点的 fabric 内存会失败（`cuMemImportFromShareableHandle` 返回 800，not permitted），
-  跨域请用走 RDMA 的 Mooncake。
-- 只在 TP1、关 overlap 调度下验证过。TP > 1、PD 分离和投机解码都没测过。
+- 只能在一个 NVL72 域内用。跨域导入另一个节点的 fabric 内存会失败（CUDA 800，not permitted）；
+  `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
+- 只在 TP1、关 overlap 调度下验证过。TP > 1、PD 分离和投机解码都没测过；`egm` 只支持普通 MHA 的 KV 池。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
+- `egm`：查找与写前去重每次都要问所有 store，适合几个节点；整个域（最多 36 个 store）需要目录服务或按 key 哈希路由。
+  本节点 store 满了就不写，不会借别的节点的容量。按页 LRU 可能先淘汰前缀的头几页。store 服务重启后，已运行的服务要一起重启。
 
 ## 排查
 
 | 现象 | 原因 |
 |---|---|
 | `start_store.sh` 报 `mooncake_master exited` | 该节点上元数据（18080）、RPC（50051）或 metrics（19003）端口被占。设 `METADATA_PORT` / `MASTER_PORT` / `METRICS_PORT`，`start_server.sh` 也设同样的 `METADATA_PORT` / `MASTER_PORT` |
-| provider 报 `invalid argument` | 它看不到所在 NUMA 的入口 GPU。`PROVIDER_GPUS` 保持全部 GPU |
-| provider 报 `EGM allocation failed ... CUDA result 2` | 该节点这块 NUMA 上空闲内存不够分配 EGM pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 pool |
-| 重启的服务报 `Duplicate rpc_meta key` | 上一个实例被杀时没有注销 transfer-engine 端点。换一个 `TE_PORT` 或重启 master |
+| provider 或 EGM store 报 `invalid argument` | 它看不到所在 NUMA 的入口 GPU。`PROVIDER_GPUS` 保持全部 GPU |
+| provider 或 EGM store 报 EGM 分配失败（`CUDA result 2` / out of memory）| 该节点这块 NUMA 上空闲内存不够分配 pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 `POOL_GIB` |
+| 服务启动时报 `is in NVLink domain ..., this Engine in ...` | `egm`：列表里有别的 NVL72 域的 store。两个节点不在一个域，Slurm 上加 `--segment` |
+| 服务启动时报 `bad or missing secret` | `egm`：两边用的不是同一个 `SECRET_FILE` |
+| 重启的服务报 `Duplicate rpc_meta key` | `mooncake`：上一个实例被杀时没有注销 transfer-engine 端点。换一个 `TE_PORT` 或重启 master |
 | `flush_cache` 返回 400 | 上一个请求还在收尾，客户端会重试 |
 | reader 的 `reader_cached_tokens` 明显小于前缀 | write-through 还没写完，调大 `--offload-wait` |
