@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -77,6 +79,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        # Grouping layers trades per-call fixed cost against the first layer's wait;
+        # in-flight calls overlap one call's CPU work with another's copy wait.
+        self.load_layers_per_call = max(
+            1, int(extra_config.get("load_layers_per_call", 1))
+        )
+        self.load_inflight = max(1, int(extra_config.get("load_inflight", 1)))
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -152,6 +160,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-load-tp{tp_rank}",
         )
         self.load_thread.start()
+        self.load_call_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.load_inflight,
+                thread_name_prefix=f"mooncake-load-call-tp{tp_rank}",
+            )
+            if self.load_inflight > 1
+            else None
+        )
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -308,20 +324,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
         started = []
+        calls = []
         try:
-            batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for transfers in request_transfers:
-                for transfer in transfers:
-                    keys, locations = batches.setdefault(transfer.name, ([], []))
-                    component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                        list(transfer.keys), transfer
-                    )
-                    keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
-                    )
+            batches = self._collect_load_batches(request_transfers)
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
                 if list(result) != [0] * len(keys):
@@ -331,42 +336,101 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 started.append(keys)
 
-            for layer in range(self.num_layers):
-                for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
+            step = self.load_layers_per_call
+            groups = [
+                range(first, min(first + step, self.num_layers))
+                for first in range(0, self.num_layers, step)
+            ]
+            if self.load_call_executor is None:
+                for layers in groups:
+                    self._read_layer_group(batches, layers)
+                    self._complete_layers(counter_index, layers)
+            else:
+                calls = [
+                    self.load_call_executor.submit(
+                        self._read_layer_group, batches, layers
                     )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
-                self.layer_done_counter.complete(counter_index, layer)
+                    for layers in groups
+                ]
+                # The layer counter only advances in order.
+                for layers, call in zip(groups, calls):
+                    call.result()
+                    self._complete_layers(counter_index, layers)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
+            # A session must outlive every read issued against it.
+            for call in calls:
+                call.cancel()
+            wait_futures(calls)
             for keys in started:
                 try:
                     self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _collect_load_batches(
+        self, request_transfers: list[list[PoolTransfer]]
+    ) -> dict[PoolName, tuple[list[str], list[int]]]:
+        batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+        for transfers in request_transfers:
+            for transfer in transfers:
+                keys, locations = batches.setdefault(transfer.name, ([], []))
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                keys.extend(self.storage._tag_keys(component_keys))
+                locations.extend(
+                    self.pools[transfer.name].prepare_locations(transfer.host_indices)
+                )
+        return batches
+
+    def _complete_layers(self, counter_index: int, layers: range) -> None:
+        for layer in layers:
+            self.layer_done_counter.complete(counter_index, layer)
+
+    def _layer_group_range_meta(
+        self, name: PoolName, locations: list[int], layers: range
+    ):
+        if len(layers) == 1:
+            return self.pools[name].get_prepared_layer_range_meta(locations, layers[0])
+        merged = None
+        for layer in layers:
+            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+            if meta is None:
+                continue
+            if merged is None:
+                merged = tuple([list(row) for row in part] for part in meta)
+                continue
+            # Every per-layer meta has one row per key, so rows concatenate per key.
+            for merged_part, part in zip(merged, meta):
+                for merged_row, row in zip(merged_part, part):
+                    merged_row.extend(row)
+        return merged
+
+    def _read_layer_group(
+        self, batches: dict[PoolName, tuple[list[str], list[int]]], layers: range
+    ) -> None:
+        for name, (keys, locations) in batches.items():
+            meta = self._layer_group_range_meta(name, locations, layers)
+            if meta is None:
+                continue
+            ptrs, sizes, offsets = meta
+            result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                keys,
+                ptrs,
+                sizes,
+                offsets,
+            )
+            expected = [sum(item) for item in sizes]
+            if result is None or isinstance(result, int) or list(result) != expected:
+                raise RuntimeError(
+                    f"Mooncake range get failed for pool={name}, "
+                    f"layers={layers.start}-{layers.stop - 1}: "
+                    f"transferred={result}, expected={expected}"
+                )
 
     def offload(
         self, transfers: list[PoolTransfer], session_id: str | None = None
@@ -434,6 +498,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        if self.load_call_executor is not None:
+            self.load_call_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:
