@@ -6,7 +6,9 @@
 #     GPU=0 PORT=30000 ./start_server.sh [extra launch_server flags]
 #
 # Optional: MASTER_PORT (50051), METADATA_PORT (18080), HOST_IP,
-#           TE_PORT (17200; this server's Mooncake transfer-engine port).
+#           TE_PORT (17200; this server's Mooncake transfer-engine port),
+#           LOAD_LAYERS_PER_CALL (4) / LOAD_INFLIGHT (2): how the linker batches
+#           layer-wise reads (1 / 1 is one read per layer, one at a time).
 set -euo pipefail
 
 : "${WORK:?set WORK to the directory build_mooncake.sh wrote}"
@@ -17,8 +19,11 @@ HOST_IP="${HOST_IP:-$(hostname -I | awk '{print $1}')}"
 MASTER_PORT="${MASTER_PORT:-50051}"
 METADATA_PORT="${METADATA_PORT:-18080}"
 
-STORE_CONFIG=$(printf '{"master_server_address": "%s:%s", "metadata_server": "http://%s:%s/metadata", "protocol": "nvlink", "device_name": "", "global_segment_size": 0}' \
-  "$MASTER_HOST" "$MASTER_PORT" "$MASTER_HOST" "$METADATA_PORT")
+# More reads in flight load faster but slow this server's own kernel launches;
+# 4 layers x 2 in flight measured best for a 16k-token prefix on GB200.
+STORE_CONFIG=$(printf '{"master_server_address": "%s:%s", "metadata_server": "http://%s:%s/metadata", "protocol": "nvlink", "device_name": "", "global_segment_size": 0, "load_layers_per_call": %d, "load_inflight": %d}' \
+  "$MASTER_HOST" "$MASTER_PORT" "$MASTER_HOST" "$METADATA_PORT" \
+  "${LOAD_LAYERS_PER_CALL:-4}" "${LOAD_INFLIGHT:-2}")
 
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 # The transfer-engine endpoint other clients use to reach this server.
