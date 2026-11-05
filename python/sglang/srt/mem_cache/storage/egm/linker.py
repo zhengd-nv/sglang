@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
-"""Direct linker over standalone EGM store services (FULL MHA, TP1).
+"""Direct linker over standalone EGM store services (FULL MHA, MLA, DSA; TP, no PP / CP).
 
 Loaded through the ``dynamic`` external-linker backend::
 
@@ -14,8 +14,12 @@ Loaded through the ``dynamic`` external-linker backend::
 
 The Engine never owns EGM: the services (``service.py``) do, so the Engine can
 run CUDA Graph and read any NUMA's slab, on this node or another node of the same
-NVLink domain. One page is one object (K of every layer, then V), the layout of
-the MHA device pool entry.
+NVLink domain. One page is one object holding every pool entry of the page, in
+entry order: K of every layer then V (MHA), or latent KV of every layer then
+indexer K (DSA). A head-sharded pool (MHA) keys its objects per TP rank and
+every rank writes its own; a replicated pool (MLA / DSA) shares one object across
+ranks and only rank 0 writes it. Every rank reads by default; with
+``"broadcast": true`` rank 0 reads and broadcasts each layer to the other ranks.
 
 Placement and discovery:
 
@@ -48,10 +52,14 @@ from pathlib import Path
 from queue import Empty, Queue
 
 import numpy as np
+import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+    LinkerMLADedupBroadcaster,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
@@ -76,43 +84,59 @@ def _ms(start, end):
 
 
 class _Layout:
-    """Vectorized range metadata for one packed device pool entry."""
+    """Vectorized range metadata for one object per page over every pool entry.
 
-    def __init__(self, entry, num_layers):
-        if not entry.packed or len(entry.components) != 1:
-            raise ValueError("EGM linker needs one packed component group")
-        meta = entry.buffer_meta[0]
-        offsets = entry._component_offsets[0]
-        self.object_bytes = sum(size for _, _, size in meta)
-        # Whole object: every buffer, in object order (offload).
-        self.all_base = np.array([b for b, _, _ in meta], dtype=np.uint64)
-        self.all_stride = np.array([s for _, s, _ in meta], dtype=np.uint64)
-        self.all_size = np.array([n for _, _, n in meta], dtype=np.uint64)
-        self.all_off = np.array(offsets, dtype=np.uint64)
-        # Per layer: the buffers that layer maps to, e.g. (K_l, V_l) for MHA.
-        per_layer = []
-        for layer in range(num_layers):
-            mapped = entry.layer_mapping[layer]
-            per_layer.append([mapped] if isinstance(mapped, int) else list(mapped))
+    The object holds each entry's buffers in entry order, e.g. K of every layer
+    then V for MHA, or latent KV of every layer then indexer K for DSA. ``rows``
+    is uint64 [entries, pages]: an entry's row of a page (its first token for a
+    token-row pool, the page itself for a page-row pool such as the indexer).
+    """
+
+    def __init__(self, entries, num_layers):
+        base, stride, size, owner = [], [], [], []
+        per_layer = [[] for _ in range(num_layers)]
+        for e, entry in enumerate(entries):
+            if not entry.packed or len(entry.components) != 1:
+                raise ValueError(
+                    f"EGM linker needs one packed component group per pool ({entry.name})"
+                )
+            first = len(base)
+            for b, s, n in entry.buffer_meta[0]:
+                base.append(b)
+                stride.append(s)
+                size.append(n)
+                owner.append(e)
+            for layer in range(num_layers):
+                mapped = entry.layer_mapping.get(layer)
+                if mapped is None:
+                    continue
+                mapped = [mapped] if isinstance(mapped, int) else list(mapped)
+                per_layer[layer] += [first + i for i in mapped]
         if len({len(x) for x in per_layer}) != 1:
-            raise ValueError("layers must map to the same number of buffers")
+            raise ValueError("every layer must map to the same number of buffers")
+        self.all_base = np.array(base, dtype=np.uint64)
+        self.all_stride = np.array(stride, dtype=np.uint64)
+        self.all_size = np.array(size, dtype=np.uint64)
+        self.all_off = np.concatenate([[0], np.cumsum(size)[:-1]]).astype(np.uint64)
+        self.all_owner = np.array(owner, dtype=np.int64)
+        self.object_bytes = int(sum(size))
         index = np.array(per_layer, dtype=np.int64)  # [layers, items]
         self.layer_base, self.layer_stride = (
             self.all_base[index],
             self.all_stride[index],
         )
         self.layer_size, self.layer_off = self.all_size[index], self.all_off[index]
+        self.layer_owner = self.all_owner[index]
 
     def load_ranges(self, rows, objects):
-        """rows / objects: uint64 [pages]. Returns layer-major flat arrays and per-layer group ends."""
+        """objects: uint64 [pages]. Returns layer-major flat arrays and per-layer group ends."""
         layers, items = self.layer_base.shape
-        ptr = (
-            self.layer_base[:, None, :]
-            + rows[None, :, None] * self.layer_stride[:, None, :]
-        )
+        # [layers, items, pages] -> [layers, pages, items]: each item reads its own entry's row.
+        item_rows = rows[self.layer_owner].transpose(0, 2, 1)
+        ptr = self.layer_base[:, None, :] + item_rows * self.layer_stride[:, None, :]
         off = objects[None, :, None] + self.layer_off[:, None, :]
         size = np.broadcast_to(self.layer_size[:, None, :], ptr.shape)
-        per_layer = len(rows) * items
+        per_layer = rows.shape[1] * items
         ends = np.arange(1, layers + 1, dtype=np.uint64) * per_layer
         return (
             off.reshape(-1),
@@ -122,7 +146,8 @@ class _Layout:
         )
 
     def store_ranges(self, rows, objects):
-        ptr = self.all_base[None, :] + rows[:, None] * self.all_stride[None, :]
+        item_rows = rows[self.all_owner].T  # [pages, buffers]
+        ptr = self.all_base[None, :] + item_rows * self.all_stride[None, :]
         off = objects[:, None] + self.all_off[None, :]
         size = np.broadcast_to(self.all_size[None, :], ptr.shape)
         return off.reshape(-1), ptr.reshape(-1), np.ascontiguousarray(size).reshape(-1)
@@ -131,8 +156,8 @@ class _Layout:
 class _TimedCounter(LayerWiseLoadCounter):
     """Records how long the forward thread actually blocks on each load batch (M8 "exposed wait")."""
 
-    def __init__(self, num_layers):
-        super().__init__(num_layers)
+    def __init__(self, num_layers, on_layer_ready=None):
+        super().__init__(num_layers, on_layer_ready)
         self.exposed = {}
 
     def wait_until(self, threshold):
@@ -212,6 +237,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
             "read_only",
             "master",
             "refresh_s",
+            "broadcast",
         }
         if set(config) - allowed:
             raise ValueError(
@@ -223,8 +249,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
         )
         if not addresses or not config.get("namespace"):
             raise ValueError("EGM linker needs stores (or store_path) and namespace")
-        if server_args.tp_size != 1 or server_args.pp_size != 1:
-            raise ValueError("EGM linker supports TP1 / PP1 only")
+        if params.pp_size != 1 or params.attn_cp_size != 1:
+            raise ValueError("EGM linker supports PP1 / attention CP1 only")
         self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -235,21 +261,27 @@ class EGMDirectLinker(UnifiedCacheLinker):
             components=components,
         )
         self.pools = self.pool_group.entry_map
-        if set(self.pools) != {PoolName.KV}:
-            raise ValueError("EGM linker supports a single FULL KV pool")
-        self.entry = self.pools[PoolName.KV]
+        self.entries = self.pool_group.entries
+        # One object per page holds every entry, so every entry must be indexed by KV pages.
+        if any(e.indices_from_pool != PoolName.KV for e in self.entries):
+            raise ValueError(
+                "EGM linker supports pools indexed by KV pages only (FULL MHA, MLA, DSA), "
+                f"got {sorted((e.name.value, e.indices_from_pool.value) for e in self.entries)}"
+            )
         self.num_layers = self.pool_group.num_layers
-        self.layout = _Layout(self.entry, self.num_layers)
-        self.device = self.entry.kv_buffer[0].device.index
-        schema = [
-            config["namespace"],
-            self.page_size,
-            sorted(self.entry.layer_mapping.items()),
-            [(str(t.dtype), list(t.shape[1:])) for t in self.entry.kv_buffer],
-        ]
-        self.prefix = hashlib.sha256(json.dumps(schema).encode()).hexdigest()[:32] + ":"
+        self.layout = _Layout(self.entries, self.num_layers)
+        self.device = self.entries[0].kv_buffer[0].device.index
+        self._init_tp(params)
+        self.prefix = self._key_prefix(config["namespace"])
         self.method = _METHODS[config.get("copy_mode", "kernel")]
         self.audit_path = config.get("audit_path")
+        if self.audit_path and self.tp_size > 1:
+            stem, dot, suffix = self.audit_path.rpartition(".")
+            self.audit_path = (
+                f"{stem}.tp{self.tp_rank}.{suffix}"
+                if dot
+                else f"{self.audit_path}.tp{self.tp_rank}"
+            )
         self.fault_dir = config.get("fault_dir")
         # A consumer-only Engine: restores from the store but never offloads to it.
         self.read_only = bool(config.get("read_only", False))
@@ -285,7 +317,16 @@ class EGMDirectLinker(UnifiedCacheLinker):
         )
         connect_import_ms = (time.perf_counter() - start) * 1e3
 
-        self.layer_done_counter = _TimedCounter(self.num_layers)
+        self.broadcaster = None
+        self.broadcast_loads = {}
+        if config.get("broadcast") and self.rank_replicated and self.tp_size > 1:
+            self.broadcaster = LinkerMLADedupBroadcaster.build(
+                self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
+            )
+        self.layer_done_counter = _TimedCounter(
+            self.num_layers,
+            self._broadcast_loaded_layers if self.broadcaster is not None else None,
+        )
         self.pending_loads = {}
         self.load_queue, self.offload_queue, self.offload_results = (
             Queue(),
@@ -317,6 +358,14 @@ class EGMDirectLinker(UnifiedCacheLinker):
             numa=self.numa,
             prefix=self.prefix,
             object_bytes=self.layout.object_bytes,
+            pools=[
+                dict(name=e.name.value, buffers=len(e.kv_buffer)) for e in self.entries
+            ],
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            rank_replicated=self.rank_replicated,
+            offload_owner=self.offload_owner,
+            broadcast=self.broadcaster is not None,
             method=self.method,
             stores=[
                 dict(store_id=c.store_id, address=a, host=c.host, numa=c.numa)
@@ -328,13 +377,47 @@ class EGMDirectLinker(UnifiedCacheLinker):
             connect_import_ms=round(connect_import_ms, 3),
         )
         logger.info(
-            "EGM direct linker: stores=%s write_store=%s master=%s device=%d object=%d B",
+            "EGM direct linker: stores=%s write_store=%s master=%s device=%d object=%d B "
+            "pools=%s tp=%d/%d replicated=%s broadcast=%s",
             addresses,
             self.write_id,
             config.get("master"),
             self.device,
             self.layout.object_bytes,
+            [e.name.value for e in self.entries],
+            self.tp_rank,
+            self.tp_size,
+            self.rank_replicated,
+            self.broadcaster is not None,
         )
+
+    def _init_tp(self, params):
+        group = params.attn_tp_cache_group or params.tp_cache_group
+        self.tp_group = group
+        self.tp_rank, self.tp_size = 0, 1
+        if torch.distributed.is_initialized():
+            self.tp_rank = torch.distributed.get_rank(group=group)
+            self.tp_size = torch.distributed.get_world_size(group=group)
+        # MLA / DSA KV is identical on every rank: rank 0 writes it, every rank may read it.
+        self.rank_replicated = self.pool_group.rank_replicated
+        self.offload_owner = not self.rank_replicated or self.tp_rank == 0
+
+    def _key_prefix(self, namespace):
+        schema = [
+            namespace,
+            self.page_size,
+            [
+                [
+                    entry.name.value,
+                    sorted(entry.layer_mapping.items()),
+                    [(str(t.dtype), list(t.shape[1:])) for t in entry.kv_buffer],
+                ]
+                for entry in self.entries
+            ],
+        ]
+        if not self.rank_replicated:
+            schema.append(f"tp{self.tp_rank}/{self.tp_size}")  # A head-sharded pool
+        return hashlib.sha256(json.dumps(schema).encode()).hexdigest()[:32] + ":"
 
     def _audit(self, op, **fields):
         if self.audit_path:
@@ -508,27 +591,98 @@ class EGMDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
-        kv = [t for t in expanded if t.name == PoolName.KV and t.keys]
-        if not kv:
+        by_name = self._by_entry(expanded)
+        if by_name is None:
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"EGM load for rid={rid} is already queued")
-        self.pending_loads[rid] = kv[0]
+        self.pending_loads[rid] = by_name
         return True
+
+    def _by_entry(self, expanded):
+        """{pool name: transfer} when every entry of the page object is present, else None."""
+        by_name = {t.name: t for t in expanded if t.keys}
+        if set(by_name) != set(self.pools):
+            # A partial set cannot fill a page object; the caller recomputes (load) or skips (offload).
+            if PoolName.KV in by_name:
+                logger.warning(
+                    "EGM linker skips a transfer without every pool: %s",
+                    sorted(n.value for n in by_name),
+                )
+            return None
+        return by_name
+
+    def _entry_rows(self, by_name):
+        """uint64 [entries, pages]; runs on a linker thread (moves the indices to the host)."""
+        return np.stack(
+            [
+                np.asarray(
+                    entry.prepare_locations(by_name[entry.name].host_indices),
+                    dtype=np.uint64,
+                )
+                for entry in self.entries
+            ]
+        )
 
     def cancel_queued_load(self, rid):
         return self.pending_loads.pop(rid, None) is not None
 
     def start_layer_wise_loading(self):
+        broadcaster = self._agreed_broadcaster()
         if not self.pending_loads:
             return -1
         pending, self.pending_loads = self.pending_loads, {}
         index = self.layer_done_counter.update_producer()
-        self.load_queue.put(
-            (index, pending, self.record_transfer_ready(), time.perf_counter())
-        )
+        ready = self.record_transfer_ready()
+        if broadcaster is not None:
+            prepared = broadcaster.prepare_broadcast(
+                {
+                    name: torch.cat([t[name].host_indices for t in pending.values()])
+                    for name in self.pools
+                },
+                torch.cuda.current_stream(),
+            )
+            self.broadcast_loads[index] = (0, prepared, ready)
+            if not broadcaster.is_src:
+                # The data arrives through the source's per-layer broadcast on the forward stream.
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(index, layer)
+        if broadcaster is None or broadcaster.is_src:
+            self.load_queue.put((index, pending, ready, time.perf_counter()))
         self.stats["load"] += len(pending)
         return index
+
+    def _agreed_broadcaster(self):
+        """The broadcaster when every rank queued the same logical loads, else None (all ranks read)."""
+        if self.broadcaster is None:
+            return None
+        # Collective on every rank, empty batches included, before deciding.
+        plan = [
+            (rid, [(name.value, list(t.keys)) for name, t in by_name.items()])
+            for rid, by_name in self.pending_loads.items()
+        ]
+        digest = hashlib.sha256(repr(plan).encode()).digest()
+        digests = [None] * self.tp_size
+        torch.distributed.all_gather_object(digests, digest, group=self.tp_group)
+        if any(other != digest for other in digests):
+            logger.warning("EGM load plans differ across ranks; every rank reads.")
+            return None
+        return self.broadcaster
+
+    def _broadcast_loaded_layers(self, index, threshold):
+        batch = self.broadcast_loads.get(index)
+        if batch is None:
+            return
+        first, prepared, ready = batch
+        if first == 0:
+            ready.wait(torch.cuda.current_stream())
+        # The forward may wait on a layer more than once, or skip layers; broadcast each once, in order.
+        for layer in range(first, threshold + 1):
+            self.broadcaster.broadcast_loaded_layer(layer, prepared)
+        if threshold == self.num_layers - 1:
+            del self.broadcast_loads[index]
+        else:
+            self.broadcast_loads[index] = (max(first, threshold + 1), prepared, ready)
 
     def finish_layer_wise_loading(self, counter_index):
         landed = self.layer_done_counter.finish(counter_index)
@@ -577,15 +731,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
         t0 = time.perf_counter()
         ready.synchronize()
         transfers = list(pending.values())
-        keys = [k for t in transfers for k in self._keys(t.keys)]
-        rows = np.concatenate(
-            [
-                np.asarray(
-                    self.entry.prepare_locations(t.host_indices), dtype=np.uint64
-                )
-                for t in transfers
-            ]
-        )
+        keys = [k for t in transfers for k in self._keys(t[PoolName.KV].keys)]
+        rows = np.concatenate([self._entry_rows(t) for t in transfers], axis=1)
         fault = self._take_fault("fail-next-load")
         mode = None if fault is None else fault.get("mode", "copy")
         if mode == "evict":
@@ -600,7 +747,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 (
                     client,
                     self.layout.load_ranges(
-                        rows[pos], np.asarray(offsets, dtype=np.uint64)
+                        rows[:, pos], np.asarray(offsets, dtype=np.uint64)
                     ),
                 )
                 for client, pos, _, offsets, _ in groups
@@ -702,12 +849,17 @@ class EGMDirectLinker(UnifiedCacheLinker):
     def offload(self, transfers, session_id=None):
         if self.read_only:
             return False
-        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
-        kv = [t for t in expanded if t.name == PoolName.KV and t.keys]
-        if not kv:
+        by_name = self._by_entry(
+            self.pool_group.resolve_transfers(transfers, allow_partial=True)
+        )
+        if by_name is None:
             return False
+        if not self.offload_owner:
+            # Rank 0 writes the replicated pages; every rank reports so the per-rank counts match.
+            self.offload_results.put(True)
+            return True
         self.offload_queue.put(
-            (kv[0], self.record_transfer_ready(), time.perf_counter())
+            (by_name, self.record_transfer_ready(), time.perf_counter())
         )
         return True
 
@@ -727,13 +879,11 @@ class EGMDirectLinker(UnifiedCacheLinker):
             finally:
                 self.offload_queue.task_done()
 
-    def _offload_one(self, transfer, ready, queued):
+    def _offload_one(self, by_name, ready, queued):
         t0 = time.perf_counter()
         ready.synchronize()
-        keys = self._keys(transfer.keys)
-        rows = np.asarray(
-            self.entry.prepare_locations(transfer.host_indices), dtype=np.uint64
-        )
+        keys = self._keys(by_name[PoolName.KV].keys)
+        rows = self._entry_rows(by_name)
         t1 = time.perf_counter()
         pending = ~self._held_elsewhere(keys)
         dedup_remote = int((~pending).sum())
@@ -818,7 +968,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
                         "EGM write reservation expired before the copy started"
                     )
                 off, ptr, size = self.layout.store_ranges(
-                    rows[idx[new]], offsets[new].astype(np.uint64)
+                    rows[:, idx[new]], offsets[new].astype(np.uint64)
                 )
                 batch = client.region.submit(
                     off,
@@ -868,6 +1018,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
 
     def reset(self):
         self.pending_loads.clear()
+        self.broadcast_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
         while True:
@@ -886,4 +1037,6 @@ class EGMDirectLinker(UnifiedCacheLinker):
         self.offload_thread.join()
         if self.membership_thread is not None:
             self.membership_thread.join()
+        if self.broadcaster is not None:
+            self.broadcaster.destroy()
         logger.info("EGM direct linker stats: %s", dict(self.stats))
