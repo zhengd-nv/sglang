@@ -16,6 +16,9 @@ may run on other nodes of the same NVLink domain.
   caller can recompute. The client checks the deadline after its copy lands.
 * Eviction: LRU over committed, unpinned objects of the requested slot size, only
   when the slab has no free slot. Pins and in-flight writes are never evicted.
+* Directory (optional): with ``--master`` the service registers with the domain
+  master (``master.py``) and reports the keys it commits and evicts, so Engines
+  find pages with one master lookup instead of asking every store.
 * Liveness: leases and reservations carry deadlines, so a dead or stuck client
   (local or on another node) never holds a pin or a slot past its TTL. A
   reservation that expires, or whose client disconnects, is quarantined before
@@ -28,11 +31,13 @@ connection per client thread). TCP clients must present the job secret in
 
     EGM_NATIVE_LIB=libegm.so python -m sglang.srt.mem_cache.storage.egm.service \\
         --numa 0 --capacity-gib 64 --listen /tmp/egm-numa0.sock \\
-        --tcp 0.0.0.0:29600 --secret-file /shared/job/egm.secret
+        --tcp 0.0.0.0:29600 --secret-file /shared/job/egm.secret \\
+        [--master tcp://10.0.0.1:29700 --advertise 10.0.0.2]
 """
 
 import argparse
 import json
+import logging
 import os
 import signal
 import socket
@@ -42,6 +47,8 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
+
+logger = logging.getLogger(__name__)
 
 ALIGN = 64
 EXISTS, FULL = -1, -2
@@ -94,25 +101,35 @@ class SlotStore:
         self.reserved = set()  # keys being written
         self.quarantine = []  # (reusable_at, size, offset)
         self.stats = Counter()
+        # key -> held now; the latest change per key, kept only while a master is attached.
+        self._changes = None
 
     # ---- allocation ----
 
-    def _take(self, size):
+    def _changed(self, key, held):
+        if self._changes is not None:
+            self._changes[key] = held
+
+    def _take(self, size, evict):
         slots = self.free.get(size)
         if slots:
             return slots.pop()
         if self.capacity - self.cursor >= size:
             offset, self.cursor = self.cursor, self.cursor + size
             return offset
+        if not evict:
+            return None
         for key, (offset, osize) in self.objects.items():
             if osize == size and not self.pins[key]:
                 del self.objects[key]
                 self.pins.pop(key, None)
+                self._changed(key, False)
                 self.stats["evicted"] += 1
                 return offset
         return None
 
-    def alloc(self, keys, size, ttl_ms=None):
+    def alloc(self, keys, size, ttl_ms=None, evict=True):
+        """``evict=False`` reports FULL instead of evicting, so the writer can place the page elsewhere."""
         size = (size + ALIGN - 1) // ALIGN * ALIGN
         token, offsets, entries = uuid.uuid4().hex, [], []
         ttl = self.write_ttl if ttl_ms is None else ttl_ms / 1e3
@@ -124,7 +141,7 @@ class SlotStore:
                     self.stats["put_dedup"] += 1
                     offsets.append(EXISTS)
                     continue
-                offset = self._take(size)
+                offset = self._take(size, evict)
                 if offset is None:
                     self.stats["put_full"] += 1
                     offsets.append(FULL)
@@ -146,6 +163,7 @@ class SlotStore:
             for key, offset, size in entries:
                 self.reserved.discard(key)
                 self.objects[key] = (offset, size)
+                self._changed(key, True)
                 self.stats["committed"] += 1
 
     def abort(self, token, quarantine=False):
@@ -234,9 +252,30 @@ class SlotStore:
                 if key in self.objects and not self.pins[key]:
                     offset, size = self.objects.pop(key)
                     self.free.setdefault(size, []).append(offset)
+                    self._changed(key, False)
                     dropped += 1
             self.stats["dropped"] += dropped
         return dropped
+
+    def track_changes(self):
+        """Start a change log and return every key held now (the snapshot for a master)."""
+        with self.lock:
+            self._changes = {}
+            return list(self.objects)
+
+    def take_changes(self):
+        """(added, removed) since the last call or snapshot."""
+        with self.lock:
+            changes, self._changes = self._changes or {}, {}
+        added = [key for key, held in changes.items() if held]
+        return added, [key for key, held in changes.items() if not held]
+
+    def status(self):
+        """Bytes allocatable without evicting (quarantined slots excluded), for master placement."""
+        with self.lock:
+            free = self.capacity - self.cursor
+            free += sum(size * len(slots) for size, slots in self.free.items())
+            return dict(free=free, objects=len(self.objects))
 
     def snapshot(self):
         with self.lock:
@@ -281,6 +320,7 @@ class _Handler(socketserver.StreamRequestHandler):
                             raise PermissionError("bad or missing secret")
                         authenticated = True
                         value = dict(
+                            store_id=self.server.store_id,
                             descriptor=self.server.descriptor,
                             capacity=store.capacity,
                             numa=self.server.numa,
@@ -307,7 +347,10 @@ class _Handler(socketserver.StreamRequestHandler):
                         value = True
                     elif op == "alloc":
                         token, offsets, ttl_ms = store.alloc(
-                            req["keys"], int(req["size"]), req.get("ttl_ms")
+                            req["keys"],
+                            int(req["size"]),
+                            req.get("ttl_ms"),
+                            evict=req.get("evict", True),
                         )
                         writes.add(token)
                         value = dict(token=token, offsets=offsets, ttl_ms=ttl_ms)
@@ -373,6 +416,7 @@ class StoreClient:
             hello["numa"],
         )
         self.host, self.cluster_uuid = hello["host"], hello["cluster_uuid"]
+        self.store_id, self.epoch = hello["store_id"], self.descriptor["epoch"]
         if (
             local_cluster_uuid
             and self.cluster_uuid
@@ -473,13 +517,14 @@ class StoreClient:
     def release(self, token):
         self.rpc("release", token=token)
 
-    def alloc(self, keys, size, ttl_ms=None):
+    def alloc(self, keys, size, ttl_ms=None, evict=True):
         """(token, offsets, deadline); commit after ``deadline`` is rejected by the service."""
         sent = time.monotonic()
         got = self.rpc(
             "alloc",
             keys=list(keys),
             size=size,
+            evict=evict,
             **({} if ttl_ms is None else {"ttl_ms": ttl_ms}),
         )
         return got["token"], got["offsets"], sent + got["ttl_ms"] / 1e3
@@ -495,6 +540,94 @@ class StoreClient:
 
     def stats(self):
         return self.rpc("stats")
+
+
+class _Reporter:
+    """Keeps this store registered with the domain master and streams its key changes.
+
+    Any failure (master restart, network, unknown epoch) re-registers with a full
+    snapshot, so a dropped batch of changes never leaves the master out of date.
+    """
+
+    def __init__(self, *, store, master, identity, heartbeat_s, flush_s=0.02):
+        self.store, self.master, self.identity = store, master, identity
+        self.heartbeat_s, self.flush_s = heartbeat_s, flush_s
+        self._stopping = threading.Event()
+
+    def stop(self):
+        self._stopping.set()
+
+    def run(self):
+        from .master import StaleStore
+
+        registered, last = False, 0.0
+        while not self._stopping.is_set():
+            try:
+                if not registered:
+                    self._register()
+                    registered, last = True, time.monotonic()
+                elif self._flush(force=time.monotonic() - last >= self.heartbeat_s):
+                    last = time.monotonic()
+            except (
+                StaleStore,
+                ConnectionError,
+                RuntimeError,
+                PermissionError,
+            ) as error:
+                if registered:
+                    logger.warning(
+                        "EGM master report failed, re-registering: %s", error
+                    )
+                registered = False
+                self.store.stats["master_errors"] += 1
+                time.sleep(self.heartbeat_s)
+            time.sleep(self.flush_s)
+
+    def _register(self):
+        self.master.rpc("register", **self.identity)
+        keys = self.store.track_changes()
+        self.master.rpc(
+            "report",
+            store_id=self.identity["store_id"],
+            epoch=self.identity["epoch"],
+            snapshot=keys,
+            status=self.store.status(),
+        )
+        self.store.stats["master_registered"] += 1
+
+    def _flush(self, *, force):
+        added, removed = self.store.take_changes()
+        if not (added or removed or force):
+            return False
+        self.master.rpc(
+            "report",
+            store_id=self.identity["store_id"],
+            epoch=self.identity["epoch"],
+            add=added,
+            delete=removed,
+            status=self.store.status(),
+        )
+        return True
+
+
+def _store_identity(args, *, numa, epoch, capacity, domain):
+    host = socket.gethostname()
+    if args.tcp:
+        advertise = args.advertise or socket.gethostbyname(host)
+        address = f"tcp://{advertise}:{args.tcp.rsplit(':', 1)[1]}"
+        store_id = address
+    else:
+        # Reachable from this node only.
+        address, store_id = args.listen, f"unix:{args.listen}@{host}"
+    return dict(
+        store_id=store_id,
+        address=address,
+        host=host,
+        numa=numa,
+        cluster_uuid=domain,
+        epoch=epoch,
+        capacity=capacity,
+    )
 
 
 def main():
@@ -513,6 +646,12 @@ def main():
     p.add_argument(
         "--secret-file", help="job secret TCP clients must present; required with --tcp"
     )
+    p.add_argument("--master", help="tcp://HOST:PORT of the domain master (master.py)")
+    p.add_argument(
+        "--advertise",
+        help="host or IP other nodes use to reach --tcp; defaults to this host's address",
+    )
+    p.add_argument("--heartbeat-s", type=float, default=1.0)
     p.add_argument("--lease-ttl-ms", type=int, default=LEASE_TTL_MS)
     p.add_argument("--write-ttl-ms", type=int, default=WRITE_TTL_MS)
     p.add_argument("--quarantine-ms", type=int, default=QUARANTINE_MS)
@@ -529,8 +668,8 @@ def main():
     args = p.parse_args()
     if not args.listen and not args.tcp:
         p.error("need --listen and/or --tcp")
-    if args.tcp and not args.secret_file:
-        p.error("--tcp needs --secret-file")
+    if (args.tcp or args.master) and not args.secret_file:
+        p.error("--tcp and --master need --secret-file")
     from .region import Region
 
     device = args.device if args.device is not None else 2 * args.numa
@@ -550,13 +689,28 @@ def main():
         host, port = args.tcp.rsplit(":", 1)
         servers.append(_TcpServer((host, int(port)), _Handler))
     domain = cluster_uuid()
+    descriptor = region.descriptor()
+    identity = _store_identity(
+        args,
+        numa=args.numa,
+        epoch=descriptor["epoch"],
+        capacity=capacity,
+        domain=domain,
+    )
     for server in servers:
-        server.store, server.descriptor, server.numa = (
-            store,
-            region.descriptor(),
-            args.numa,
-        )
+        server.store, server.descriptor, server.numa = store, descriptor, args.numa
         server.secret, server.cluster_uuid = secret, domain
+        server.store_id = identity["store_id"]
+    if args.master:
+        from .master import MasterClient
+
+        reporter = _Reporter(
+            store=store,
+            master=MasterClient(args.master, secret=secret),
+            identity=identity,
+            heartbeat_s=args.heartbeat_s,
+        )
+        threading.Thread(target=reporter.run, daemon=True, name="egm-report").start()
 
     def stop(*_):
         if args.stats_out:
@@ -594,6 +748,7 @@ def main():
         with open(args.ready, "w") as out:
             json.dump(
                 dict(
+                    store_id=identity["store_id"],
                     listen=args.listen,
                     tcp=args.tcp,
                     numa=args.numa,

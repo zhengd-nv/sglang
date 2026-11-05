@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to SGLang project
 
-"""Direct linker over a standalone EGM store service (FULL MHA, TP1).
+"""Direct linker over standalone EGM store services (FULL MHA, TP1).
 
 Loaded through the ``dynamic`` external-linker backend::
 
@@ -9,30 +9,40 @@ Loaded through the ``dynamic`` external-linker backend::
     --unified-cache-external-linker-config '{"linker": "EGMDirectLinker",
         "linker_module_path": "sglang.srt.mem_cache.storage.egm.linker",
         "linker_extra_config": {"stores": ["/tmp/egm-numa0.sock", "tcp://10.0.0.2:29600"],
-                                "secret_file": "/shared/job/egm.secret", "namespace": "<model+weights>"}}'
+                                "secret_file": "/shared/job/egm.secret", "namespace": "<model+weights>",
+                                "master": "tcp://10.0.0.1:29700"}}'
 
 The Engine never owns EGM: the services (``service.py``) do, so the Engine can
 run CUDA Graph and read any NUMA's slab, on this node or another node of the same
 NVLink domain. One page is one object (K of every layer, then V), the layout of
 the MHA device pool entry.
 
-Placement and discovery need no directory: offloads go to ``write_store`` (by
-default the first configured store, normally this GPU's NUMA); a lookup asks every
-store in parallel and loads each page from the first store that holds it.
+Placement and discovery:
 
-Loads: one lease for the whole batch, then one gather launch per layer on a
-private stream; layer ``l`` completes as soon as its copy lands, so the forward
-overlaps the remaining layers. Offloads run on their own thread: ``alloc``
-(skips keys already stored), one gather launch, ``commit``.
+* With ``master`` (``master.py``): a lookup and the pre-write dedup are one
+  master RPC each; the Engine connects to every store the master lists and
+  re-imports a store's slab when it restarts. Offloads go to ``write_store``
+  without evicting; pages that do not fit go to the store the master places them
+  on, and only then to ``write_store`` with LRU eviction. If the master is
+  unreachable, the Engine falls back to the mode below.
+* Without a master: offloads go to ``write_store`` (by default the first
+  configured store, normally this GPU's NUMA); a lookup asks every connected
+  store in parallel and loads each page from the first store that holds it.
+
+Loads: one lease per store, then one gather launch per layer on a private
+stream; layer ``l`` completes as soon as its copy lands, so the forward overlaps
+the remaining layers. Offloads run on their own thread: ``alloc`` (skips keys
+already stored), one gather launch, ``commit``.
 """
 
 import hashlib
 import json
 import logging
 import os
+import socket
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
@@ -56,6 +66,9 @@ _DIRECTION_TO_REGION, _DIRECTION_FROM_REGION = 2, 3
 _METHODS = {"batchapi": 1, "kernel": 2}
 # Arbitrary bound on remembered key -> store routes between lookup and load.
 _ROUTE_CACHE_KEYS = 1 << 20
+# Arbitrary; one thread per store asked in parallel, an NVL72 has at most 36 stores.
+_FANOUT_THREADS = 36
+_MASTER_ERRORS = (ConnectionError, RuntimeError, PermissionError)
 
 
 def _ms(start, end):
@@ -132,6 +145,55 @@ class _TimedCounter(LayerWiseLoadCounter):
             )
 
 
+class _Stores:
+    """Connected stores by store id; a replaced client is closed once no copy still uses it.
+
+    A store that restarts owns a new slab; its old import must stay mapped until
+    every in-flight gather through it has drained.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients = {}  # store_id -> StoreClient
+        self._busy = Counter()  # id(client) -> holders
+        self._retired = {}  # id(client) -> client still held
+
+    def ids(self):
+        with self._lock:
+            return list(self._clients)
+
+    def get(self, store_id):
+        with self._lock:
+            return self._clients.get(store_id)
+
+    def install(self, client):
+        with self._lock:
+            old = self._clients.get(client.store_id)
+            self._clients[client.store_id] = client
+            if old is not None:
+                self._retired[id(old)] = old
+                self._close_idle(old)
+
+    def hold(self, store_id):
+        """The current client of ``store_id``, kept open until ``unhold``; None if unknown."""
+        with self._lock:
+            client = self._clients.get(store_id)
+            if client is not None:
+                self._busy[id(client)] += 1
+            return client
+
+    def unhold(self, client):
+        with self._lock:
+            self._busy[id(client)] -= 1
+            self._close_idle(client)
+
+    def _close_idle(self, client):
+        if id(client) in self._retired and self._busy[id(client)] <= 0:
+            del self._retired[id(client)]
+            self._busy.pop(id(client), None)
+            client.region.close()
+
+
 class EGMDirectLinker(UnifiedCacheLinker):
     def __init__(
         self, server_args, params, *, components, extra_config=None, forward_stream=None
@@ -148,6 +210,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
             "audit_path",
             "fault_dir",
             "read_only",
+            "master",
+            "refresh_s",
         }
         if set(config) - allowed:
             raise ValueError(
@@ -190,24 +254,34 @@ class EGMDirectLinker(UnifiedCacheLinker):
         # A consumer-only Engine: restores from the store but never offloads to it.
         self.read_only = bool(config.get("read_only", False))
         self.lease_ttl_ms = config.get("lease_ttl_ms")
-        secret = (
+        self.secret = (
             Path(config["secret_file"]).read_text().strip()
             if config.get("secret_file")
             else None
         )
+        self.master = None
+        if config.get("master"):
+            from .master import MasterClient
+
+            self.master = MasterClient(config["master"], secret=self.secret)
         start = time.perf_counter()
-        domain = (
-            cluster_uuid() if any(a.startswith("tcp://") for a in addresses) else None
+        self.domain = (
+            cluster_uuid()
+            if self.master is not None or any(a.startswith("tcp://") for a in addresses)
+            else None
         )
-        self.stores = [
-            StoreClient(a, device=self.device, secret=secret, local_cluster_uuid=domain)
-            for a in addresses
-        ]
-        self.write_index = int(config.get("write_store", 0))
-        self.store = self.stores[self.write_index]
-        self._routes = OrderedDict()  # key -> index of the store that held it at lookup
-        self._lookup_pool = ThreadPoolExecutor(
-            max_workers=len(self.stores), thread_name_prefix="egm-lookup"
+        self.stores = _Stores()
+        self._addresses = {}  # store_id -> configured address (Unix socket for local stores)
+        configured = [self._connect(a) for a in addresses]
+        for client, address in zip(configured, addresses):
+            self.stores.install(client)
+            self._addresses[client.store_id] = address
+        write_client = configured[int(config.get("write_store", 0))]
+        self.write_id, self.numa = write_client.store_id, write_client.numa
+        self.host = socket.gethostname()
+        self._routes = OrderedDict()  # key -> id of the store that held it at lookup
+        self._fanout_pool = ThreadPoolExecutor(
+            max_workers=_FANOUT_THREADS, thread_name_prefix="egm-lookup"
         )
         connect_import_ms = (time.perf_counter() - start) * 1e3
 
@@ -218,7 +292,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
             Queue(),
             Queue(),
         )
-        self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.stats = Counter(lookup=0, load=0, offload=0)
+        self._stopping = threading.Event()
         self.load_thread = threading.Thread(
             target=self._load_loop, daemon=True, name="egm-load"
         )
@@ -227,25 +302,36 @@ class EGMDirectLinker(UnifiedCacheLinker):
         )
         self.load_thread.start()
         self.offload_thread.start()
+        self.membership_thread = None
+        if self.master is not None:
+            self.refresh_s = float(config.get("refresh_s", 1.0))
+            self._sync_members()
+            self.membership_thread = threading.Thread(
+                target=self._membership_loop, daemon=True, name="egm-members"
+            )
+            self.membership_thread.start()
         # The slab is imported once here, so per-load "lease" is the acquire RPC only.
         self._audit(
             "init",
             device=self.device,
-            numa=self.store.numa,
+            numa=self.numa,
             prefix=self.prefix,
             object_bytes=self.layout.object_bytes,
             method=self.method,
             stores=[
-                dict(address=c.address, host=c.host, numa=c.numa) for c in self.stores
+                dict(store_id=c.store_id, address=a, host=c.host, numa=c.numa)
+                for c, a in zip(configured, addresses)
             ],
-            write_store=self.write_index,
-            cluster_uuid=domain,
+            write_store=self.write_id,
+            master=config.get("master"),
+            cluster_uuid=self.domain,
             connect_import_ms=round(connect_import_ms, 3),
         )
         logger.info(
-            "EGM direct linker: stores=%s write_store=%d device=%d object=%d B",
+            "EGM direct linker: stores=%s write_store=%s master=%s device=%d object=%d B",
             addresses,
-            self.write_index,
+            self.write_id,
+            config.get("master"),
             self.device,
             self.layout.object_bytes,
         )
@@ -260,6 +346,56 @@ class EGMDirectLinker(UnifiedCacheLinker):
     def _keys(self, keys):
         return [self.prefix + key for key in keys]
 
+    def _connect(self, address):
+        return StoreClient(
+            address,
+            device=self.device,
+            secret=self.secret,
+            local_cluster_uuid=self.domain,
+        )
+
+    # ---- membership (master only) ----
+
+    def _membership_loop(self):
+        while not self._stopping.wait(self.refresh_s):
+            self._sync_members()
+
+    def _sync_members(self):
+        """Import every listed store not imported yet, or imported under an older epoch."""
+        try:
+            members = self.master.rpc("members")
+        except _MASTER_ERRORS as error:
+            self._audit("members_failed", error=str(error))
+            return
+        for member in members:
+            current = self.stores.get(member["store_id"])
+            if current is not None and current.epoch == member["epoch"]:
+                continue
+            address = self._addresses.get(member["store_id"], member["address"])
+            if not address.startswith("tcp://") and member["host"] != self.host:
+                continue  # A Unix-only store on another node is out of reach.
+            try:
+                client = self._connect(address)
+            except (
+                ConnectionError,
+                RuntimeError,
+                ValueError,
+                PermissionError,
+            ) as error:
+                self._audit("import_failed", store=member["store_id"], error=str(error))
+                continue
+            if client.epoch != member["epoch"]:
+                client.region.close()  # Restarted again in between; the next round catches up.
+                continue
+            self.stores.install(client)
+            self.stats["imports"] += 1
+            self._audit(
+                "import",
+                store=client.store_id,
+                epoch=client.epoch,
+                replaced=current is not None,
+            )
+
     # ---- lookup / load ----
 
     def lookup(self, rid, transfers):
@@ -268,67 +404,96 @@ class EGMDirectLinker(UnifiedCacheLinker):
             return []
         start = time.perf_counter()
         keys = self._keys(kv.keys)
-        per_store = self._exists_everywhere(rid, keys)
+        holders, source = self._locate(rid, keys)
         lookup_ms = (time.perf_counter() - start) * 1e3
-        hits, used = 0, set()
-        for i, key in enumerate(keys):
-            # Prefer the store this Engine writes to (local NUMA), then configuration order.
-            holder = next(
-                (
-                    j
-                    for j in self._store_order()
-                    if per_store[j] is not None and per_store[j][i]
-                ),
-                None,
-            )
-            if holder is None:
-                break
+        for key, holder in zip(keys, holders):
             self._remember(key, holder)
-            used.add(holder)
-            hits += 1
         self.stats["lookup"] += 1
         self._audit(
             "lookup",
             rid=rid,
             pages=len(kv.keys),
-            hit_pages=hits,
-            stores_hit=sorted(used),
+            hit_pages=len(holders),
+            stores_hit=sorted(set(holders)),
+            source=source,
             lookup_ms=round(lookup_ms, 3),
         )
-        return list(range(1, hits + 1))
+        return list(range(1, len(holders) + 1))
+
+    def _locate(self, rid, keys):
+        """Store id per page of the longest held prefix, and where the answer came from."""
+        if self.master is not None:
+            try:
+                got = self.master.rpc(
+                    "lookup", keys=keys, host=self.host, numa=self.numa
+                )
+            except _MASTER_ERRORS as error:
+                self._audit("master_failed", rid=rid, op="lookup", error=str(error))
+            else:
+                known = set(self.stores.ids())
+                holders = []
+                for page in got["pages"]:
+                    if got["stores"][page] not in known:
+                        break  # Not imported yet: a miss until the next membership round.
+                    holders.append(got["stores"][page])
+                return holders, "master"
+        return self._locate_fanout(rid, keys), "fanout"
 
     def _store_order(self):
-        return [self.write_index] + [
-            j for j in range(len(self.stores)) if j != self.write_index
-        ]
+        return [self.write_id] + [s for s in self.stores.ids() if s != self.write_id]
 
-    def _exists_everywhere(self, rid, keys):
-        """One exists RPC per store, in parallel; None for a store that is down (treated as a miss)."""
+    def _exists_on(self, rid, store_ids, keys):
+        """One exists RPC per store, in parallel; None for a store that is down (a miss)."""
 
-        def ask(j):
+        def ask(store_id):
+            client = self.stores.get(store_id)
             try:
-                return self.stores[j].exists_many(keys)
-            except ConnectionError as error:
-                self._audit("lookup_failed", rid=rid, store=j, error=str(error))
+                return client.exists_many(keys)
+            except (ConnectionError, RuntimeError) as error:
+                self._audit("lookup_failed", rid=rid, store=store_id, error=str(error))
                 return None
 
-        if len(self.stores) == 1:
-            return [ask(0)]
-        return list(self._lookup_pool.map(ask, range(len(self.stores))))
+        if len(store_ids) == 1:
+            return [ask(store_ids[0])]
+        return list(self._fanout_pool.map(ask, store_ids))
+
+    def _locate_fanout(self, rid, keys):
+        order = self._store_order()
+        per_store = self._exists_on(rid, order, keys)
+        holders = []
+        for i in range(len(keys)):
+            # Prefer the store this Engine writes to (local NUMA), then the rest.
+            holder = next(
+                (
+                    s
+                    for s, flags in zip(order, per_store)
+                    if flags is not None and flags[i]
+                ),
+                None,
+            )
+            if holder is None:
+                break
+            holders.append(holder)
+        return holders
 
     def _held_elsewhere(self, keys):
-        held = np.zeros(len(keys), dtype=bool)
-        if len(self.stores) == 1:
-            return held
-
-        def ask(j):
+        """Pages some store other than ``write_store`` holds, so this Engine skips writing them."""
+        if self.master is not None:
             try:
-                return self.stores[j].exists_many(keys)
-            except ConnectionError:
-                return None
-
-        others = [j for j in range(len(self.stores)) if j != self.write_index]
-        for flags in self._lookup_pool.map(ask, others):
+                got = self.master.rpc(
+                    "lookup", keys=keys, host=self.host, numa=self.numa, prefix=False
+                )
+            except _MASTER_ERRORS as error:
+                self._audit("master_failed", op="dedup", error=str(error))
+            else:
+                stores = got["stores"]
+                return np.array(
+                    [p >= 0 and stores[p] != self.write_id for p in got["pages"]],
+                    dtype=bool,
+                )
+        held = np.zeros(len(keys), dtype=bool)
+        others = [s for s in self.stores.ids() if s != self.write_id]
+        for flags in self._exists_on(None, others, keys) if others else ():
             if flags is not None:
                 held |= np.asarray(flags, dtype=bool)
         return held
@@ -424,28 +589,27 @@ class EGMDirectLinker(UnifiedCacheLinker):
         fault = self._take_fault("fail-next-load")
         mode = None if fault is None else fault.get("mode", "copy")
         if mode == "evict":
-            self.stores[self._routes.get(keys[0], self.write_index)].drop(keys)
+            self.stores.get(self._routes.get(keys[0], self.write_id)).drop(keys)
         t1 = time.perf_counter()
-        groups = self._acquire_all(
-            keys
-        )  # [(store index, page positions, token, offsets, deadline)]
+        # [(client, page positions, token, offsets, deadline)], each client held until released.
+        groups = self._acquire_all(keys)
         t2 = time.perf_counter()
         batches = []
         try:
             ranges = [
                 (
-                    j,
+                    client,
                     self.layout.load_ranges(
                         rows[pos], np.asarray(offsets, dtype=np.uint64)
                     ),
                 )
-                for j, pos, _, offsets, _ in groups
+                for client, pos, _, offsets, _ in groups
             ]
             t3 = time.perf_counter()
             fail_layer = int(fault["layer"]) if mode == "copy" else None
-            for j, (off, ptr, size, ends) in ranges:
+            for client, (off, ptr, size, ends) in ranges:
                 batches.append(
-                    self.stores[j].region.submit(
+                    client.region.submit(
                         off, ptr, size, _DIRECTION_FROM_REGION, ends, method=self.method
                     )
                 )
@@ -470,8 +634,9 @@ class EGMDirectLinker(UnifiedCacheLinker):
         finally:
             for batch in batches:
                 batch.free()  # Drains every group, including those after a failure.
-            for j, _, token, _, _ in groups:
-                self._release_quietly(j, token)
+            for client, _, token, _, _ in groups:
+                self._release_quietly(client, token)
+                self.stores.unhold(client)
         t6 = time.perf_counter()
         # M8 segments: lease_ms / read_ms (build + submit + every layer landed) / finalize_ms;
         # lookup_ms is in the lookup event, exposed_wait_ms in load_finish (joined by index).
@@ -480,7 +645,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
             index=index,
             reqs=len(transfers),
             pages=len(keys),
-            stores=[dict(store=g[0], pages=len(g[1])) for g in groups],
+            stores=[dict(store=g[0].store_id, pages=len(g[1])) for g in groups],
             queue_ms=_ms(queued, t0),
             ready_ms=_ms(t0, t1),
             lease_ms=_ms(t1, t2),
@@ -497,33 +662,40 @@ class EGMDirectLinker(UnifiedCacheLinker):
         """Pin every page on the store the lookup found it in; all-or-nothing."""
         by_store = OrderedDict()
         for i, key in enumerate(keys):
-            by_store.setdefault(self._routes.get(key, self.write_index), []).append(i)
+            by_store.setdefault(self._routes.get(key, self.write_id), []).append(i)
         groups = []
         try:
-            for j, pos in by_store.items():
-                lease = self.stores[j].acquire(
-                    [keys[i] for i in pos], self.lease_ttl_ms
-                )
+            for store_id, pos in by_store.items():
+                client = self.stores.hold(store_id)
+                if client is None:
+                    raise RuntimeError(f"EGM store {store_id} is no longer connected")
+                try:
+                    lease = client.acquire([keys[i] for i in pos], self.lease_ttl_ms)
+                except BaseException:
+                    self.stores.unhold(client)
+                    raise
                 if lease is None:
+                    self.stores.unhold(client)
                     raise RuntimeError(
-                        f"EGM objects evicted before load ({len(pos)} pages on store {j})"
+                        f"EGM objects evicted before load ({len(pos)} pages on {store_id})"
                     )
                 token, offsets, deadline = lease
                 groups.append(
-                    (j, np.asarray(pos, dtype=np.int64), token, offsets, deadline)
+                    (client, np.asarray(pos, dtype=np.int64), token, offsets, deadline)
                 )
         except BaseException:
-            for j, _, token, _, _ in groups:
-                self._release_quietly(j, token)
+            for client, _, token, _, _ in groups:
+                self._release_quietly(client, token)
+                self.stores.unhold(client)
             raise
         return groups
 
-    def _release_quietly(self, j, token):
+    def _release_quietly(self, client, token):
         try:
-            self.stores[j].release(token)
+            client.release(token)
         except (ConnectionError, RuntimeError) as error:
             # The lease still expires on the service side.
-            self._audit("release_failed", store=j, error=str(error))
+            self._audit("release_failed", store=client.store_id, error=str(error))
 
     # ---- offload ----
 
@@ -558,47 +730,97 @@ class EGMDirectLinker(UnifiedCacheLinker):
     def _offload_one(self, transfer, ready, queued):
         t0 = time.perf_counter()
         ready.synchronize()
-        all_keys = self._keys(transfer.keys)
+        keys = self._keys(transfer.keys)
+        rows = np.asarray(
+            self.entry.prepare_locations(transfer.host_indices), dtype=np.uint64
+        )
         t1 = time.perf_counter()
-        # Domain-wide dedup without a directory: skip pages another store already holds.
-        elsewhere = self._held_elsewhere(all_keys)
-        keep = ~elsewhere
-        keys = [k for k, held in zip(all_keys, elsewhere) if not held]
-        if not keys:
-            self._audit(
-                "offload",
-                pages=len(all_keys),
-                new=0,
-                dedup=0,
-                dedup_remote=len(all_keys),
-                full=0,
-                total_ms=round((time.perf_counter() - queued) * 1e3, 3),
-            )
-            return True
-        token, offsets, deadline = self.store.alloc(keys, self.layout.object_bytes)
+        pending = ~self._held_elsewhere(keys)
+        dedup_remote = int((~pending).sum())
         t2 = time.perf_counter()
+        steps = []
+        for store_id, evict in self._write_plan():
+            if not pending.any():
+                break
+            if store_id is None:
+                store_id = self._place(int(pending.sum()))
+                if store_id is None:
+                    continue
+            pending, step = self._write_step(
+                store_id=store_id, keys=keys, rows=rows, pending=pending, evict=evict
+            )
+            steps.append(step)
+        self._audit(
+            "offload",
+            pages=len(keys),
+            new=sum(s["new"] for s in steps),
+            dedup=sum(s["dedup"] for s in steps),
+            dedup_remote=dedup_remote,
+            full=int(pending.sum()),
+            steps=steps,
+            queue_ms=_ms(queued, t0),
+            ready_ms=_ms(t0, t1),
+            dedup_ms=_ms(t1, t2),
+            total_ms=_ms(queued, time.perf_counter()),
+        )
+        return not pending.any()
+
+    def _write_plan(self):
+        """(store id, evict) attempts in order; None means "ask the master where"."""
+        if self.master is None:
+            return [(self.write_id, True)]
+        # Fill free space anywhere in the domain before evicting the local store.
+        return [(self.write_id, False), (None, False), (self.write_id, True)]
+
+    def _place(self, pages):
+        try:
+            store_id = self.master.rpc(
+                "place",
+                nbytes=pages * self.layout.object_bytes,
+                exclude=[self.write_id],
+                host=self.host,
+                numa=self.numa,
+            )
+        except _MASTER_ERRORS as error:
+            self._audit("master_failed", op="place", error=str(error))
+            return None
+        return store_id if store_id in self.stores.ids() else None
+
+    def _write_step(self, *, store_id, keys, rows, pending, evict):
+        """Write the pending pages to one store; returns (pages still pending, audit record)."""
+        client = self.stores.hold(store_id)
+        if client is None:
+            return pending, dict(store=store_id, evict=evict, new=0, dedup=0, full=0)
+        try:
+            return self._write_to(client, keys, rows, pending, evict)
+        finally:
+            self.stores.unhold(client)
+
+    def _write_to(self, client, keys, rows, pending, evict):
+        t0 = time.perf_counter()
+        idx = np.flatnonzero(pending)
+        token, offsets, deadline = client.alloc(
+            [keys[i] for i in idx], self.layout.object_bytes, evict=evict
+        )
         offsets = np.asarray(offsets, dtype=np.int64)
         new = offsets >= 0
-        copied = 0
+        t1 = time.perf_counter()
         fault = self._take_fault("stall-next-offload")
         if fault is not None:
             time.sleep(
                 float(fault.get("ms", 0)) / 1e3
             )  # A stuck writer: its reservation must expire.
-        try:
-            if new.any() and time.monotonic() > deadline:
-                # Too late to start: the service may already have quarantined these slots.
-                raise RuntimeError(
-                    "EGM write reservation expired before the copy started"
-                )
-            if new.any():
-                rows = np.asarray(
-                    self.entry.prepare_locations(transfer.host_indices), dtype=np.uint64
-                )[keep]
+        if new.any():
+            try:
+                if time.monotonic() > deadline:
+                    # Too late to start: the service may already have quarantined these slots.
+                    raise RuntimeError(
+                        "EGM write reservation expired before the copy started"
+                    )
                 off, ptr, size = self.layout.store_ranges(
-                    rows[new], offsets[new].astype(np.uint64)
+                    rows[idx[new]], offsets[new].astype(np.uint64)
                 )
-                batch = self.store.region.submit(
+                batch = client.region.submit(
                     off,
                     ptr,
                     size,
@@ -611,33 +833,30 @@ class EGMDirectLinker(UnifiedCacheLinker):
                     batch.wait(0)
                 finally:
                     batch.free()
-                copied = int(new.sum())
-        except BaseException:
-            self.store.abort(token)
-            raise
-        t3 = time.perf_counter()
-        if time.monotonic() > deadline:
-            # The service has quarantined these slots; committing would publish nothing useful.
-            self.store.abort(token)
-            raise RuntimeError("EGM write reservation expired before the copy landed")
-        self.store.commit(token)
-        t4 = time.perf_counter()
-        full = int((offsets == FULL).sum())
-        self._audit(
-            "offload",
-            pages=len(all_keys),
-            new=copied,
+            except BaseException:
+                client.abort(token)
+                raise
+            if time.monotonic() > deadline:
+                # The service has quarantined these slots; committing would publish nothing useful.
+                client.abort(token)
+                raise RuntimeError(
+                    "EGM write reservation expired before the copy landed"
+                )
+            # A reservation with no new slot is never recorded, so only commit when one was taken.
+            client.commit(token)
+        t2 = time.perf_counter()
+        full = offsets == FULL
+        remaining = pending.copy()
+        remaining[idx[~full]] = False
+        return remaining, dict(
+            store=client.store_id,
+            evict=evict,
+            new=int(new.sum()),
             dedup=int((offsets == EXISTS).sum()),
-            dedup_remote=int(elsewhere.sum()),
-            full=full,
-            queue_ms=_ms(queued, t0),
-            ready_ms=_ms(t0, t1),
-            alloc_ms=_ms(t1, t2),
-            copy_ms=_ms(t2, t3),
-            commit_ms=_ms(t3, t4),
-            total_ms=_ms(queued, t4),
+            full=int(full.sum()),
+            alloc_ms=_ms(t0, t1),
+            copy_commit_ms=_ms(t1, t2),
         )
-        return full == 0
 
     def num_completed_offloads(self):
         return self.offload_results.qsize()
@@ -660,8 +879,11 @@ class EGMDirectLinker(UnifiedCacheLinker):
 
     def close(self):
         self.reset()
+        self._stopping.set()
         self.load_queue.put(None)
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
-        logger.info("EGM direct linker stats: %s", self.stats)
+        if self.membership_thread is not None:
+            self.membership_thread.join()
+        logger.info("EGM direct linker stats: %s", dict(self.stats))
