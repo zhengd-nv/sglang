@@ -428,7 +428,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
                     "lookup", keys=keys, host=self.host, numa=self.numa
                 )
             except _MASTER_ERRORS as error:
-                self._audit("master_failed", rid=rid, op="lookup", error=str(error))
+                self._audit("master_failed", rid=rid, call="lookup", error=str(error))
             else:
                 known = set(self.stores.ids())
                 holders = []
@@ -484,7 +484,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
                     "lookup", keys=keys, host=self.host, numa=self.numa, prefix=False
                 )
             except _MASTER_ERRORS as error:
-                self._audit("master_failed", op="dedup", error=str(error))
+                self._audit("master_failed", call="dedup", error=str(error))
             else:
                 stores = got["stores"]
                 return np.array(
@@ -782,7 +782,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 numa=self.numa,
             )
         except _MASTER_ERRORS as error:
-            self._audit("master_failed", op="place", error=str(error))
+            self._audit("master_failed", call="place", error=str(error))
             return None
         return store_id if store_id in self.stores.ids() else None
 
