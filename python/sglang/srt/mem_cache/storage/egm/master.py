@@ -400,15 +400,21 @@ class MasterClient:
         return json.loads(line)
 
     def rpc(self, op, **args):
-        try:
-            reply = self._call(self._stream(), dict(op=op, **args))
-        except PermissionError:
-            raise  # A wrong secret is not an outage; it subclasses OSError.
-        except (OSError, ValueError) as error:
-            self._local.stream = None  # Reconnect next time.
-            raise ConnectionError(
-                f"EGM master {self.address} unreachable: {error}"
-            ) from error
+        # Every op is safe to replay (key sets, re-register plus snapshot, a placement estimate),
+        # so a cached connection that died with a restarted master is retried once on a fresh one.
+        for retry in (False, True):
+            reused = getattr(self._local, "stream", None) is not None
+            try:
+                reply = self._call(self._stream(), dict(op=op, **args))
+                break
+            except PermissionError:
+                raise  # A wrong secret is not an outage; it subclasses OSError.
+            except (OSError, ValueError) as error:
+                self._local.stream = None
+                if retry or not reused:
+                    raise ConnectionError(
+                        f"EGM master {self.address} unreachable: {error}"
+                    ) from error
         if not reply["ok"]:
             raise (StaleStore if reply.get("stale") else RuntimeError)(reply["error"])
         return reply["value"]
