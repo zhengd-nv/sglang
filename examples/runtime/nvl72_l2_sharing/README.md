@@ -33,6 +33,57 @@
  +-------------------------+     +----------+          +-------------------------+     +-------------------------+
 ```
 
+## 读写过程
+
+两种后端都挂在 SGLang 的 direct external linker 上（不开 HiCache，没有本地主机层）。SGLang 侧的流程相同，区别在 linker 怎么找、怎么读、往哪写。
+
+### SGLang 侧（两种后端共用）
+
+- **key**：radix cache 按页（64 token）算一条前缀哈希链，第 i 页的哈希覆盖前 i 页的全部 token。linker 在它前面加上模型标识，作为 store 里的 key，所以同一前缀在任何服务上得到同一组 key。
+- **查找**：请求排进调度时，GPU 缓存没命中的部分交给 linker 的 `lookup`，返回从头开始连续命中的页数。只认连续前缀：中间缺一页，后面的页都不用。
+- **读到 HBM**：命中的页先在本服务的 KV 池里分到一组私有页槽；linker 在后台线程里按层往这些槽里拷，每拷完一层就推进层计数器。forward 的第 l 层只等第 l 层的数据，所以加载与前面几层的计算重叠。forward 结束后这些页才插进 radix 树。
+- **失败**：任何一步失败（key 不见了、租约过期、store 不可达、拷贝出错），请求被撤回、按整段重算（`--unified-cache-external-linker-load-failure recompute`，默认），不会把半读的 KV 当真。
+- **写入时机**：`--hicache-write-policy write_through`：prefill 算出的新页在 forward 写完后交给 linker 的 `offload`，在后台线程里写；写完之前这些页在 radix 树里被锁住，不会被淘汰或覆盖。
+
+### `BACKEND=mooncake`
+
+**查找**：一次 `batch_is_exist` RPC 问 master：每页的 K、V 两个对象（`<页哈希>_<后缀>_k / _v`，每个对象含该页全部层）是否都在 store 里。
+
+**读到 HBM**：
+1. 对命中的全部 key 开一次读会话（`batch_get_session_start`），master 给这些对象加租约，期间不会被淘汰。
+2. 按层组读：每次调用读 4 层（`LOAD_LAYERS_PER_CALL`），最多 2 个调用在途（`LOAD_INFLIGHT`）。每次调用 `batch_get_into_multi_buffer_ranges`，按 key 的副本位置找到 provider 的 EGM 段，
+   每页每层的 K、V 各一个片段（Qwen2-1.5B 为 2 × 32 KiB），一起交给 Transfer Engine 的 nvlink transport，它用 `cudaMemcpyBatchAsync` 在本服务的 GPU 上从对方 EGM 直接拷进私有页槽。
+3. 按层顺序推进层计数器；全部读完关会话（释放租约）。
+
+**写入，确定目标**：offload 线程先 `batch_is_exist`，已存在的 key 跳过（全域按 key 去重），其余 `batch_put_from_multi_buffers`。
+master 为每个对象挑 segment：先试请求带来的 `preferred_segments`（本示例没传），再从**所有已挂载、有空间的 segment 里随机挑**（默认 `--allocation_strategy random`），挑中的分配失败就顺序换下一个。
+本示例只有节点 0 挂了 provider，所以全部写进节点 0 的 EGM；多个节点都挂 provider 时，写入会随机散到各节点。
+对象先是「写入中」，写方经 nvlink 从自己的 GPU 拷进分到的位置，再通知 master 置为「完成」，之后才能被查到。
+
+**写入，容量**：容量 = 各 provider 挂载的 EGM 之和（每 NUMA `POOL_GIB`，默认 64 GiB；SGLang 服务自己挂 0）。
+master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，跳过有租约、未完成的对象。没有空间可分配时这次写入失败，这些页只是不进 store。
+
+### `BACKEND=egm`
+
+**查找**：并行问配置里的每个 store（一个 `exists` RPC 带上全部 key），每页取第一个持有它的 store，顺序是「本服务写入的 store 优先，其余按配置顺序」，并记下 key → store 供随后的读用。
+对象是「一页一个」：该页全部层的 K，然后全部层的 V，与 SGLang MHA KV 池的布局一致。
+
+**读到 HBM**：
+1. 按 store 分组，每个 store 一次 `acquire`：整批 key 都在才加 Pin 并返回各自在 slab 里的偏移，缺任何一个就整批失败（走重算）。Pin 带截止时间：客户端在发 RPC 前取本机时间加 TTL。
+2. 各 store 的 slab 在服务启动时已经导入过一次（FABRIC handle 经 `hello` 拿到），这里不再导入。linker 用 numpy 一次算出每页每层的源地址（slab 基址 + 偏移 + 层偏移）和目的地址（私有页槽），
+   每层发一次 gather kernel（本服务的 GPU 直接从对方 EGM 读，经 NVLink），层后记一个 event。
+3. 加载线程按层等 event、核对截止时间、推进层计数器；超时就不再推进，请求走重算。全部完成后 `release` 去 Pin。
+
+**写入，确定目标**：
+1. 跨 store 去重：并行问其它 store，已经在别处的页不写（所以本示例里 reader 读回的页不会再写一份）。
+2. 其余页只写 `EGM_STORES` 的第一个，即本节点、本 GPU 所在 NUMA 的 store：写入只经过本 NUMA 的 C2C，不占别的节点的入口 GPU。**不会写到别的 store**。
+3. `alloc`：store 对已存在或正被别人写的 key 回「已存在」，其余预留槽位并给出偏移与截止时间；linker 用一次 gather kernel 从 GPU 页拷进 slab，确认没过截止时间后 `commit`，store 这时才让别人查到。失败或超时则 `abort`。
+
+**写入，容量**：每个 store 的容量在启动时固定（`POOL_GIB`，默认每 NUMA 64 GiB），按对象大小（64 B 对齐）切成槽位。
+分配顺序：空闲表 → 未用过的空间 → **淘汰本 store 里最久未用、没被 Pin 的同尺寸对象**。都没有（全被 Pin）时这页回 FULL、不写。
+过期或被放弃的预留先隔离 60 s 再复用，防止迟到的拷贝落进已被重新分配的槽位。
+容量只在本 store 内回收，不会借别的节点：一个节点写得多，就在本地淘汰旧页，即使别的节点的 store 还空着（与 Mooncake 的差别见「局限」）。
+
 ## 分支内容
 
 | 提交 / 路径 | 作用 |
@@ -183,7 +234,7 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
 - `egm`：查找与写前去重每次都要问所有 store，适合几个节点；整个域（最多 36 个 store）需要目录服务或按 key 哈希路由。
-  本节点 store 满了就不写，不会借别的节点的容量。按页 LRU 可能先淘汰前缀的头几页。store 服务重启后，已运行的服务要一起重启。
+  只写本节点的 store：满了在本地淘汰，不会借别的节点的容量（Mooncake 由 master 在全部 provider 里分配）。按页 LRU 可能先淘汰前缀的头几页。store 服务重启后，已运行的服务要一起重启。
 
 ## 排查
 
