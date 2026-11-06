@@ -16,12 +16,12 @@
 | | `mooncake`（默认）| `egm` |
 |---|---|---|
 | store | Mooncake Store：一个 master（带 HTTP 元数据服务）加每 NUMA 一个 EGM provider，只在节点 0 上 | 每个节点每 NUMA 一个 EGM store 服务（`sglang.srt.mem_cache.storage.egm.service`）|
-| 写到哪 | master 分配（本示例只有节点 0 有 provider）| 本节点、本 NUMA 的 store |
-| 怎么找到 | 问 master | 并行问所有 store，本节点优先 |
+| 写到哪 | master 分配（本示例只有节点 0 有 provider）| 本节点、本 NUMA 的 store；配了 master 时，本地不淘汰就放不下的页写到 master 选的 store |
+| 怎么找到 | 问 master | 并行问所有 store，本节点优先；配了 master 时一次 RPC 问 master |
 | 数据面 | Mooncake Transfer Engine 的 nvlink transport（`cudaMemcpyBatchAsync`）| 读方 / 写方 GPU 自己发 gather kernel，每层一次 |
 | 依赖 | 从源码构建 Mooncake（带补丁），CMake 约 8 分钟 | CUDA driver、numpy；`nvcc` 编一个 `libegm.so`，几秒 |
-| 端口 | master RPC、HTTP 元数据、metrics、每个进程一个 Transfer Engine 端口 | 每个 store 一个 TCP 端口（带作业密钥）|
-| 全局能力 | master 统一分配、全局去重、高水位淘汰、跨节点借容量 | 跨 store 去重；无目录服务、不跨节点借容量 |
+| 端口 | master RPC、HTTP 元数据、metrics、每个进程一个 Transfer Engine 端口 | 每个 store 一个 TCP 端口（带作业密钥）；master 一个 |
+| 全局能力 | master 统一分配、全局去重、高水位淘汰、跨节点借容量 | 跨 store 去重；配了 master 时加上目录、成员与存活、按空闲放置（跨节点借容量）。淘汰始终在各 store 内 |
 
 ```
  BACKEND=mooncake                                      BACKEND=egm
@@ -32,6 +32,25 @@
  | writer（GPU 0）          | NVL | （GPU 0）|          |                         | NVL | 写前去重：不再写一份      |
  +-------------------------+     +----------+          +-------------------------+     +-------------------------+
 ```
+
+本示例的 `egm` 不起 master，用于两个节点足够。
+
+### 两种 master 的分工
+
+两种后端都可以有一个域内 master，但分工不同。这决定了它能不能由 KVCM 这类外部元数据服务来承担：
+
+| | Mooncake master | EGM master（`egm/master.py`，可选）|
+|---|---|---|
+| 必需吗 | 必需：查找、分配、淘汰都经过它 | 可选：不可达时 linker 退回并行问所有 store，请求不失败 |
+| 分配 | 分配到 segment 内的偏移 | 只选 store；偏移由 store 在预留时给出 |
+| 目录 | 权威：读方按它给的副本位置读 | 只是提示：读方仍到那个 store 上按 key `acquire`，偏移在 Pin 之下当场返回，目录过时只会缺页、走重算 |
+| 淘汰 | master 按水位与租约淘汰 | 各 store 自己做 LRU，再上报删除 |
+| 状态 | 持有对象元数据 | 不持久化：store 上报失败时重新注册并发全量快照，master 重启后一个心跳内重建 |
+
+EGM master 的设计、协议、在 GB200 上的实测（功能、对恢复延迟的开销、一个 NVL72 最多 36 个 store 的规模），
+以及据此对 KVCM 承担这一层 master 的扩展建议，见 [`egm-l2-master-reference.md`](egm-l2-master-reference.md)。
+启用方式：起 `python -m sglang.srt.mem_cache.storage.egm.master --tcp <host>:<port> --secret-file <作业密钥>`，
+store 服务加 `--master tcp://<host>:<port>`，linker 的 `linker_extra_config` 加 `"master": "tcp://<host>:<port>"`（见 `egm/master.py`、`service.py`、`linker.py` 开头的说明）。
 
 ## 读写过程
 
@@ -210,8 +229,11 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 
 - 跨节点只比本节点多 0.2–0.8 ms；NVLink 计数显示数据只从 store 所在 NUMA 的入口 GPU 发到 reader GPU。
 - 长前缀 `egm` 快约 3.6 ms：它每层一次 gather kernel，不受页片段数影响；Mooncake 按片段提交批量拷贝，片段多时驱动工作会拖慢本服务的 kernel 发射。
-  短前缀 `mooncake` 快约 1.3 ms：`egm` 每次恢复多两次 RPC（查找要问所有 store，再加一次 Pin），p99 也更高。
-- writer 开 write-through 后吞吐下降：`mooncake` 约 2%，`egm` 4–6%（offload 线程的 Python 与 RPC，不是拷贝）。写本节点与写另一节点没有可分辨的差别。
+- 这张表与下面单节点表里 `egm` 的数字都偏高：当时 linker 每条计时记录都重新打开一次日志文件，日志在网络文件系统上，每次约 0.6 ms，其中一次在调度线程上（`[HiCache] EGM linker: keep the audit file open` 已修正）。
+  修正后同一作业、同一对节点上复测（`egm` 开 master，本节点）：2048 为 13.7 / 23.0（`mooncake` 14.6 / 16.9），16384 为 19.2 / 31.4（`mooncake` 25.0 / 27.7）。
+  所以短前缀上 `egm` 并不比 `mooncake` 慢，此前「多两次 RPC」的解释不成立（查找 RPC 约 0.25 ms，Pin 在加载线程里与 prefill 重叠）；`egm` 的 p99 仍更高，原因未查。
+- writer 开 write-through 后吞吐下降：`mooncake` 约 2%，`egm` 修正后复测约 3%，两者之差与两次不开写透的基线之差（约 2%）同量级。
+  `egm` 的 offload 线程只忙 2–4%，写前去重命中（几乎不拷贝）时损失也不变，推断损失在两种后端共用的 SGLang 写透记账上。写本节点与写另一节点没有可分辨的差别。
 
 **单节点，与本地主机内存 L2（HiCache）对比**（同一作业；Mooncake linker 4 层一组 × 4 在途）：
 
@@ -234,11 +256,12 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 
 - 只能在一个 NVL72 域内用。跨域导入另一个节点的 fabric 内存会失败（CUDA 800，not permitted）；
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
-- 只在 TP1、关 overlap 调度下验证过。TP > 1、PD 分离和投机解码都没测过；`egm` 只支持普通 MHA 的 KV 池。
+- 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」）；PD 分离和投机解码都没测过。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
-- `egm`：查找与写前去重每次都要问所有 store，适合几个节点；整个域（最多 36 个 store）需要目录服务或按 key 哈希路由。
-  只写本节点的 store：满了在本地淘汰，不会借别的节点的容量（Mooncake 由 master 在全部 provider 里分配）。按页 LRU 可能先淘汰前缀的头几页。store 服务重启后，已运行的服务要一起重启。
+- `egm` 不起 master 时（本示例）：查找与写前去重每次都要问所有 store，适合几个节点；只写本节点的 store，满了在本地淘汰，不借别的节点的容量；store 服务重启后，已运行的服务要一起重启。
+  起 master 后这三点都有解（一次 RPC 查找、本地放不下时溢出到 master 选的 store、按成员刷新重新导入重启的 store），一个 master 实测撑得住整个域的 36 个 store，见 [`egm-l2-master-reference.md`](egm-l2-master-reference.md)。
+  两种情况下按页 LRU 都可能先淘汰前缀的头几页。
 
 ## 排查
 
