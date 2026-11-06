@@ -282,6 +282,12 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 if dot
                 else f"{self.audit_path}.tp{self.tp_rank}"
             )
+        # Opened once: lookup audits run on the scheduler thread, and an open per
+        # event costs ~0.6 ms on a network filesystem (Lustre, measured).
+        self._audit_lock = threading.Lock()
+        self._audit_stream = (
+            open(self.audit_path, "a", buffering=1) if self.audit_path else None
+        )
         self.fault_dir = config.get("fault_dir")
         # A consumer-only Engine: restores from the store but never offloads to it.
         self.read_only = bool(config.get("read_only", False))
@@ -420,11 +426,11 @@ class EGMDirectLinker(UnifiedCacheLinker):
         return hashlib.sha256(json.dumps(schema).encode()).hexdigest()[:32] + ":"
 
     def _audit(self, op, **fields):
-        if self.audit_path:
-            with Path(self.audit_path).open("a") as stream:
-                stream.write(
-                    json.dumps(dict(op=op, time_ns=time.time_ns(), **fields)) + "\n"
-                )
+        if self._audit_stream is None:
+            return
+        line = json.dumps(dict(op=op, time_ns=time.time_ns(), **fields)) + "\n"
+        with self._audit_lock:
+            self._audit_stream.write(line)
 
     def _keys(self, keys):
         return [self.prefix + key for key in keys]
@@ -1040,3 +1046,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
         if self.broadcaster is not None:
             self.broadcaster.destroy()
         logger.info("EGM direct linker stats: %s", dict(self.stats))
+        if self._audit_stream is not None:
+            with self._audit_lock:
+                self._audit_stream.close()
+                self._audit_stream = None
