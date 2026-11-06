@@ -92,6 +92,10 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 | `[Feature] Unified Cache: Recompute requests whose external linker load fails` | store 读失败时撤回请求并重算（`--unified-cache-external-linker-load-failure`，默认 `recompute`），而不是返回 503 |
 | `[HiCache] Direct linker: group layers per range read and keep reads in flight` | Mooncake linker 按层读取时把几层合成一次调用（`load_layers_per_call`），并让多次调用同时在途（`load_inflight`）；默认 1 / 1 即原行为，本示例用 4 / 2 |
 | `[HiCache] EGM store service and direct linker` | `python/sglang/srt/mem_cache/storage/egm/`：`egm` 后端的 store 服务、linker（经 `dynamic` linker 后端加载）与 native 库，见该目录的 README |
+| `[HiCache] EGM: domain master for store membership, prefix directory and placement` 及其后两个修复 | `egm/master.py`：可选的域内 master（只管元数据：成员与存活、key 到 store 的目录、放置）；linker 配了 `master` 时一次 RPC 查找，本地 store 写满时溢出到 master 选的 store。本示例不起 master |
+| `[HiCache] EGM linker: page objects over every KV-indexed pool, TP ranks` | 一页一个对象装全部以 KV 页为索引的池（MLA / DSA：latent KV + indexer K），支持 TP（复制池只有 rank 0 写，可选 rank 0 读后逐层广播）|
+| `[HiCache] EGM linker: keep the audit file open` | linker 的计时日志只打开一次文件（每条重新打开在网络文件系统上约 0.6 ms，其中一条在调度线程上）|
+| `egm-l2-master-reference.md` | EGM L2 sharing 的 master 参考实现：分工、协议、实测与对 KVCM 的扩展建议 |
 | `examples/runtime/nvl72_l2_sharing/` | 本示例 |
 | `mooncake-nvlink-grouped-scatter.patch` | Mooncake 补丁：NVLink transport 把一次 scatter 作为一个 task 处理。不打的话每个 32 KiB 的页片段要单独轮询，负载下恢复 16k token 前缀约 70 ms 而不是 43 ms（不含 linker 分组）|
 

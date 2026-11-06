@@ -4,7 +4,9 @@ A small KV store for GB200 / GB300 NVL72 that keeps radix-cache pages in Grace
 CPU memory (EGM: CUDA `HOST_NUMA` allocations exported as FABRIC handles) and
 lets any SGLang Engine in the same NVLink domain read and write them directly
 with its own GPU. It needs only the CUDA driver, an IMEX channel, the Python
-standard library and numpy: no Mooncake, master, etcd or metadata server.
+standard library and numpy: no Mooncake, etcd or metadata server. A domain
+master (`master.py`) is optional: it adds a prefix directory, membership and
+placement; without it a lookup asks every store.
 
 An end-to-end two-node example lives in
 `examples/runtime/nvl72_l2_sharing/` (`BACKEND=egm`).
@@ -15,6 +17,7 @@ An end-to-end two-node example lives in
 |---|---|
 | `service.py` | Store service, one process per NUMA node. Owns the slab, hands out slots, pins objects for readers, evicts LRU unpinned objects. Control only: it never copies KV. Serves a Unix socket (same node) and optionally TCP with a job secret (other nodes). |
 | `linker.py` | `EGMDirectLinker`, loaded through the `dynamic` external-linker backend. Imports every configured store's slab once at startup, then copies pages between its GPU pool and the slabs. |
+| `master.py` | Optional domain master, one per NVLink domain. Metadata only: store registration and liveness, key -> store directory reported by the stores, and placement for pages that do not fit the local store. Not on the data path; the linker falls back to asking every store when it is down. |
 | `region.py`, `native.cpp`, `egm_gather.cu` | ctypes wrapper over `libegm.so`: allocate / export / import the slab, and one gather kernel launch per group of segments. |
 
 ## Build the native library
