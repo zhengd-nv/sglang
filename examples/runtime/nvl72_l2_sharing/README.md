@@ -125,7 +125,7 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 - 本分支对应的 SGLang nightly 容器，例如 `lmsysorg/sglang:nightly-dev-cu13-20261102-38d9e4a3`；
   本分支装进去，或者把 `<repo>/python` 放在 `PYTHONPATH` 最前面。
 - 一个两个节点都能看到的目录（下文的 `WORK`），放构建产物、作业密钥与运行日志。
-- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）。
+- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）；`egm` 另在 `nvidia/GLM-5.2-NVFP4` TP4 上测过多轮回放与精度（见「实测」）。
 
 ## 1. 构建（一次，在容器里）
 
@@ -252,11 +252,81 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 | writer，前缀在自己的 GPU 缓存里 | 58 ms | 58 ms |
 | reader，前缀从另一个节点的 Grace 内存读回 | 66 ms | 65 ms |
 
+### 生产模型：多轮 agentic 回放与 gsm8k（GLM-5.2-NVFP4，TP4，单节点）
+
+上面是机理层的数字（小模型、合成前缀）。这里换成生产模型和真实负载：用 SemiAnalysis 的
+[agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness)（aiperf 的分支）回放真实的 Claude Code 会话，
+多轮、带 subagent、保留轮间的思考时间，看 `egm` 作为 L2 对吞吐与延迟的作用；再用 gsm8k 检查从 store 读回的 KV 会不会影响精度。
+
+**配置**
+
+- 一个 GB200 节点，`nvidia/GLM-5.2-NVFP4`（DSA：每页对象装 78 层的 latent KV 与 indexer K，3.37 MiB），TP4 占满 4 张卡。
+  服务按部署默认：开 overlap 调度与 CUDA Graph，chunked prefill 16384，page size 64，fp8 KV，`--context-length 262144`。
+- 两个臂只差 linker。`base`：只有 GPU 前缀缓存。`egm`：direct linker 写透，每 NUMA 一个 300 GiB 的 store（写 NUMA 0，写满后经 master 放到 NUMA 1）加一个 master；
+  `linker_extra_config` 在 `start_server.sh` 的基础上加 `"master"`、`"write_store": 0`、`"broadcast": true`（rank 0 读后逐层广播，入口 GPU 只发一份）。
+- agentx-harness 1.0.13，语料 `semianalysis_cc_traces_weka_062126_256k`（393 条会话，单个请求不超过 256K token；本轮平均输入约 75K token），
+  32 个会话树并发，测 900 s，scenario 默认（`ignore_eos`、每次回放给首轮加 cache-bust 前缀、先 warmup）。两个臂都标 `submission_valid=true`。
+- 与 cookbook 的差别（[`GLM-5.2.mdx`](../../../docs/cookbook/autoregressive/GLM/GLM-5.2.mdx) 里 GB200 NVFP4 Agg TP4 的 agentic 配方）：
+  - **`base` 不带 offload**，而 cookbook 用 HiCache（主机内存 100 GB；它与 external linker 互斥）。所以下面是「无 offload 对 `egm`」，不是「HiCache 对 `egm`」。
+  - 没开 MTP：`egm` linker 还没覆盖 MTP draft 层。
+  - chunked prefill 16384（cookbook 8192），上下文 256K（cookbook 1M），`--max-running-requests` 用默认（cookbook 的 4 对应低并发点）。
+  - 没开多线程加载（`--model-loader-extra-config '{"enable_multithread_load": true}'`），权重从网络文件系统加载约 8 分钟。
+
+```bash
+agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
+  --model <served-model-name> --tokenizer <GLM-5.2-NVFP4 路径> \
+  --public-dataset semianalysis_cc_traces_weka_062126_256k \
+  --concurrency 32 --benchmark-duration 900 --max-context-length 262144 \
+  --use-server-token-count --random-seed 20261108
+```
+
+**性能**（同一节点先后跑两个臂；`egm` 在另一个节点上重复了一次，各项相差 1% 以内）：
+
+| | `base` | `egm` |
+|---|---|---|
+| 完成请求（900 s）| 360 | **655** |
+| 输出吞吐 | 212 tok/s | **452 tok/s** |
+| 前缀命中（含 warmup）| 31%，全在 GPU | 90%：GPU 16.5M + store 64.8M token |
+| 每个会话的中位 TTFT，跨会话 p50 / p90 | 137 / 154 s | **45 / 52 s** |
+| 全部请求的 TTFT p90 / p99 | 154 / 168 s | **60 / 75 s** |
+| ITL p99 | 136 ms | **23 ms** |
+| warmup（351 个请求）| 1500 s | **314 s** |
+
+- 32 个会话的上下文（单个请求输入中位约 65K、p90 约 140K、最长 254K token）远超 GPU 的 KV 池（约 1M token）。`base` 里被挤出的前缀只能整段重算（约 20K token/s），
+  `egm` 从 Grace 内存读回：单次加载中位约 2100 页（约 13 万 token），读取 p50 / p99 为 52 / 222 ms；查找（问 master）p50 / p99 为 4 / 15 ms。
+- **别看全部请求的 TTFT p50**（`base` 0.35 s，`egm` 39 s）。回放是闭环的，被重算堵住的会话发出的请求很少，
+  `base` 的 p50 由少数前缀还留在 GPU 里的会话撑起（前 5 个会话占 60% 的请求，TTFT 约 0.2 s；前缀命中不到一半的请求 TTFT 中位约 145 s），所以上表按会话取中位。
+- `egm` 剩下的约 40 s 排队来自 GPU 的 KV 容量：同时运行的请求中位只有 6 个，排队中位 28 个，KV 占用 p50 / p90 为 0.78 / 0.93。store 的读取不在这条路径上。
+- 一次 900 s 运行写进 store 约 9.3M token（478 GiB）：NUMA 0 写满后溢出到 NUMA 1，没有触发 store 淘汰，0 次读失败。
+- 并发 8 时，8 个会话的上下文放得进 GPU，store 0 命中，`egm` 只付写透的开销。
+
+**精度（gsm8k）**：用 agentx-harness 1.0.13 自带的 accuracy 模式（`aiperf profile --accuracy-benchmark gsm8k --num-requests 1319`，对齐 lighteval 的 `gsm8k_leaderboard`：zero-shot，`max_tokens=256`），
+温度 0，关 thinking（`chat_template_kwargs.enable_thinking=false`）。这些不是模型推荐的采样设置（`temperature=1.0`、`top_p=0.95`、开 thinking）：这里要比的是读路径，
+需要尽量确定的输出，不是准确率的绝对值；分数只能与同一 harness、同一设置的结果比，不能与 sgl-eval 等的 gsm8k 分数比。
+两遍法：第一遍在 `egm` 服务上跑（KV 写进 store）；停掉服务，换一个 GPU 缓存为空的新服务跑第二遍，每题的整页都从 store 读回；再与 `base` 比。
+
+| | 准确率 | 从 store 读回 |
+|---|---|---|
+| `egm` 第一遍 | 80.8% | 无 |
+| `egm` 第二遍（新服务）| 80.4% | 668 题全部命中（其余题不足一页），约占 prompt token 的一半 |
+| `base` | 80.4% | — |
+
+- 三者相差不到 0.5 个点；KV 或 indexer K 读错会让准确率大幅下滑。逐题看，两次整段 prefill（第一遍与 `base`）之间就有 30% 的题输出文本不同（TP4 批处理的不确定性），
+  第二遍走「前缀命中 + extend」的数值路径，分叉更多（约 62%），但对错翻转是双向的。
+- 绝对值偏低是因为 256 token 的上限会截断，且 GLM 不输出 `####`、评分取最后一个数，不影响对比。gsm8k 的提示约 100 token，每题只读回 1–2 页；
+  长前缀（上千页）的读回在上面的回放里跑通，但那里不评分。
+
+**开 linker 的容量代价**：开 `--enable-unified-cache-external-linker` 时，SGLang 不再为 DSA 的 shared-topk 层省略 indexer K
+（`kv_cache_configurator.py` 的 `_should_elide_dsa_index_k`），每层都分配，同样 47.4 GB 的 KV 池只装 0.92M token，`base` 是 1.07–1.09M（小 14–16%）。
+上面的对比没有给 `base` 限池，所以偏向不利于 `egm`。让 linker 的页对象跳过 0 行的 indexer K 层就能去掉这项代价，页对象也会变小。
+
 ## 局限
 
 - 只能在一个 NVL72 域内用。跨域导入另一个节点的 fabric 内存会失败（CUDA 800，not permitted）；
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
-- 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」）；PD 分离和投机解码都没测过。
+- 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」），
+  并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过多轮回放与 gsm8k（见「实测」，单节点）；PD 分离和投机解码都没测过。
+- 开 external linker 时 DSA 的 indexer K 不再按 shared-topk 层省略，GPU 的 KV 池小 14–16%（见「实测」）。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
 - `egm` 不起 master 时（本示例）：查找与写前去重每次都要问所有 store，适合几个节点；只写本节点的 store，满了在本地淘汰，不借别的节点的容量；store 服务重启后，已运行的服务要一起重启。
