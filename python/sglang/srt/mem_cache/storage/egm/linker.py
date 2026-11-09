@@ -83,6 +83,10 @@ def _ms(start, end):
     return round((end - start) * 1e3, 3)
 
 
+def _with_zero(values):
+    return np.append(values, np.zeros(1, dtype=values.dtype))
+
+
 class _Layout:
     """Vectorized range metadata for one object per page over every pool entry.
 
@@ -112,21 +116,26 @@ class _Layout:
                     continue
                 mapped = [mapped] if isinstance(mapped, int) else list(mapped)
                 per_layer[layer] += [first + i for i in mapped]
-        if len({len(x) for x in per_layer}) != 1:
-            raise ValueError("every layer must map to the same number of buffers")
         self.all_base = np.array(base, dtype=np.uint64)
         self.all_stride = np.array(stride, dtype=np.uint64)
         self.all_size = np.array(size, dtype=np.uint64)
         self.all_off = np.concatenate([[0], np.cumsum(size)[:-1]]).astype(np.uint64)
         self.all_owner = np.array(owner, dtype=np.int64)
         self.object_bytes = int(sum(size))
-        index = np.array(per_layer, dtype=np.int64)  # [layers, items]
-        self.layer_base, self.layer_stride = (
-            self.all_base[index],
-            self.all_stride[index],
-        )
-        self.layer_size, self.layer_off = self.all_size[index], self.all_off[index]
-        self.layer_owner = self.all_owner[index]
+        # Layers may map different buffer counts (a compact DSA indexer skips
+        # shared-topk layers); short layers pad with a 0-byte item at index len(base).
+        self.layer_items = np.array([len(x) for x in per_layer], dtype=np.uint64)
+        self.ragged = len(set(self.layer_items.tolist())) > 1
+        width = int(self.layer_items.max())
+        pad = len(base)
+        index = np.array(
+            [x + [pad] * (width - len(x)) for x in per_layer], dtype=np.int64
+        )  # [layers, items]
+        self.layer_base = _with_zero(self.all_base)[index]
+        self.layer_stride = _with_zero(self.all_stride)[index]
+        self.layer_size = _with_zero(self.all_size)[index]
+        self.layer_off = _with_zero(self.all_off)[index]
+        self.layer_owner = _with_zero(self.all_owner)[index]
 
     def load_ranges(self, rows, objects):
         """objects: uint64 [pages]. Returns layer-major flat arrays and per-layer group ends."""
@@ -136,8 +145,12 @@ class _Layout:
         ptr = self.layer_base[:, None, :] + item_rows * self.layer_stride[:, None, :]
         off = objects[None, :, None] + self.layer_off[:, None, :]
         size = np.broadcast_to(self.layer_size[:, None, :], ptr.shape)
-        per_layer = rows.shape[1] * items
-        ends = np.arange(1, layers + 1, dtype=np.uint64) * per_layer
+        pages = rows.shape[1]
+        if self.ragged:
+            keep = size != 0  # drop the padding items; each layer keeps >= 1 range
+            ends = np.cumsum(self.layer_items * np.uint64(pages))
+            return off[keep], ptr[keep], np.ascontiguousarray(size[keep]), ends
+        ends = np.arange(1, layers + 1, dtype=np.uint64) * (pages * items)
         return (
             off.reshape(-1),
             ptr.reshape(-1),

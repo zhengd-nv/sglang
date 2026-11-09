@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
-    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
+    """Shared-topk layers get a 0-row index-K buffer; HiCache, PD and the direct linker skip them."""
     memory_config = get_memory()
     # Ascend PD slices the KV list positionally (index-K rides in it, not in
     # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
@@ -137,11 +137,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_unified_cache_external_linker
-    )
+    return not memory_config.enable_hisparse and not is_draft_worker
 
 
 _is_hip = is_hip()

@@ -402,6 +402,26 @@ def _build_dsa_device_pool_group(
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
+    # Layers that reuse the previous layer's top-k hold a 0-row index-K placeholder
+    # (compact indexer layout), so the indexer entry maps only layers that store keys.
+    indexer_layers = [
+        layer for layer in range(num_layers) if not kvcache.skip_topk_layers[layer]
+    ]
+    target_indexer_mapping = {
+        layer: index for index, layer in enumerate(indexer_layers)
+    }
+    if any(
+        depth not in target_indexer_mapping
+        for depth in range(len(draft_indexer_buffers))
+    ):
+        raise ValueError(
+            "DSA MTP index-K packs onto target layers 0..n-1, which must store index-K."
+        )
+    indexer_mapping = _with_packed_draft_mapping(
+        target_indexer_mapping,
+        target_device_layer_num=len(indexer_layers),
+        draft_layer_num=len(draft_indexer_buffers),
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -416,8 +436,16 @@ def _build_dsa_device_pool_group(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
-            layer_mapping=layer_mapping,
+            components=[
+                [
+                    *(
+                        kvcache.index_k_with_scale_buffer[layer]
+                        for layer in indexer_layers
+                    ),
+                    *draft_indexer_buffers,
+                ]
+            ],
+            layer_mapping=indexer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
