@@ -256,19 +256,25 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 
 上面是机理层的数字（小模型、合成前缀）。这里换成生产模型和真实负载：用 SemiAnalysis 的
 [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness)（aiperf 的分支）回放真实的 Claude Code 会话，
-多轮、带 subagent、保留轮间的思考时间，看 `egm` 作为 L2 对吞吐与延迟的作用；再用 gsm8k 检查从 store 读回的 KV 会不会影响精度。
+多轮、带 subagent、保留轮间的思考时间，比较 `egm` 与 SGLang 自带的 HiCache（本地主机内存 L2）的吞吐与延迟；再用 gsm8k 检查从 store 读回的 KV 会不会影响精度。
 
 **配置**
 
 - 一个 GB200 节点，`nvidia/GLM-5.2-NVFP4`（DSA：每页对象装 78 层的 latent KV 与 indexer K，3.37 MiB），TP4 占满 4 张卡。
   服务按部署默认：开 overlap 调度与 CUDA Graph，chunked prefill 16384，page size 64，fp8 KV，`--context-length 262144`。
-- 两个臂只差 linker。`base`：只有 GPU 前缀缓存。`egm`：direct linker 写透，每 NUMA 一个 300 GiB 的 store（写 NUMA 0，写满后经 master 放到 NUMA 1）加一个 master；
-  `linker_extra_config` 在 `start_server.sh` 的基础上加 `"master"`、`"write_store": 0`、`"broadcast": true`（rank 0 读后逐层广播，入口 GPU 只发一份）。
+- 各臂只差 KV offload：
+  - **HiCache（基线）**：cookbook 的参数，`--enable-hierarchical-cache --hicache-size 100 --hicache-write-policy write_back --hicache-io-backend direct --hicache-mem-layout page_first_direct`。
+    `--hicache-size` 按 rank 计；DSA 的 KV 在 4 个 rank 上相同，每个 rank 各存一份，所以占主机内存 400 GB，有效容量 100 GB（约 2.2M token）。
+  - **HiCache 160**：同上，`--hicache-size 160`，主机内存 640 GB，与 `egm` 相当，有效容量约 3.6M token。
+  - **`egm`**：direct linker 写透，每 NUMA 一个 300 GiB 的 store（写 NUMA 0，写满后经 master 放到 NUMA 1）加一个 master，主机内存 644 GB；
+    节点内只存一份（rank 0 写），有效容量约 11.7M token。`linker_extra_config` 在 `start_server.sh` 的基础上加 `"master"`、`"write_store": 0`、
+    `"broadcast": true`（rank 0 读后逐层广播，入口 GPU 只发一份）。
+  - **无 offload**：只有 GPU 前缀缓存，作参考。
 - agentx-harness 1.0.13，语料 `semianalysis_cc_traces_weka_062126_256k`（393 条会话，单个请求不超过 256K token；本轮平均输入约 75K token），
-  32 个会话树并发，测 900 s，scenario 默认（`ignore_eos`、每次回放给首轮加 cache-bust 前缀、先 warmup）。两个臂都标 `submission_valid=true`。
+  32 个会话树并发，测 900 s，scenario 默认（`ignore_eos`、每次回放给首轮加 cache-bust 前缀、先 warmup）。各臂都标 `submission_valid=true`。
 - 与 cookbook 的差别（[`GLM-5.2.mdx`](../../../docs/cookbook/autoregressive/GLM/GLM-5.2.mdx) 里 GB200 NVFP4 Agg TP4 的 agentic 配方）：
-  - **`base` 不带 offload**，而 cookbook 用 HiCache（主机内存 100 GB；它与 external linker 互斥）。所以下面是「无 offload 对 `egm`」，不是「HiCache 对 `egm`」。
-  - 没开 MTP：`egm` linker 还没覆盖 MTP draft 层。
+  - HiCache 的参数照 cookbook；另加了与 `egm` 主机内存对齐的 160 GB/rank。
+  - 各臂都没开 MTP：`egm` linker 还没覆盖 MTP draft 层，为了同口径 HiCache 也不开。
   - chunked prefill 16384（cookbook 8192），上下文 256K（cookbook 1M），`--max-running-requests` 用默认（cookbook 的 4 对应低并发点）。
   - 没开多线程加载（`--model-loader-extra-config '{"enable_multithread_load": true}'`），权重从网络文件系统加载约 8 分钟。
 
@@ -280,45 +286,58 @@ agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
   --use-server-token-count --random-seed 20261108
 ```
 
-**性能**（同一节点先后跑两个臂；`egm` 在另一个节点上重复了一次，各项相差 1% 以内）：
+**性能**（以 HiCache 为基线，括号里是相对它的倍数。两个 HiCache 臂在同一节点先后跑，`egm` 与无 offload 在另一个节点先后跑；
+`egm` 在第三个节点上重复了一次，各项相差 1% 以内）：
 
-| | `base` | `egm` |
-|---|---|---|
-| 完成请求（900 s）| 360 | **655** |
-| 输出吞吐 | 212 tok/s | **452 tok/s** |
-| 前缀命中（含 warmup）| 31%，全在 GPU | 90%：GPU 16.5M + store 64.8M token |
-| 每个会话的中位 TTFT，跨会话 p50 / p90 | 137 / 154 s | **45 / 52 s** |
-| 全部请求的 TTFT p90 / p99 | 154 / 168 s | **60 / 75 s** |
-| ITL p99 | 136 ms | **23 ms** |
-| warmup（351 个请求）| 1500 s | **314 s** |
+| | HiCache（基线）| HiCache 160 | `egm` | 无 offload |
+|---|---|---|---|---|
+| 主机内存 / 有效容量 | 400 GB / 2.2M token | 640 GB / 3.6M token | 644 GB / 11.7M token | — |
+| GPU KV 池 | 1.09M token | 1.09M token | 0.92M token | 1.09M token |
+| 完成请求（900 s）| 535 | **691**（1.29×）| 655（1.22×）| 360（0.67×）|
+| 输出吞吐 | 350 tok/s | **473 tok/s**（1.35×）| 452 tok/s（1.29×）| 212 tok/s（0.61×）|
+| 前缀命中（含 warmup）| 75% | 89% | **90%** | 31% |
+| 每个会话的中位 TTFT，跨会话 p50 / p90 | 54 / 63 s | **40 / 45 s** | 45 / 52 s | 137 / 154 s |
+| 全部请求的 TTFT p90 / p99 | 91 / 105 s | **49 / 57 s** | 60 / 75 s | 154 / 168 s |
+| ITL p50 / p99 | 13.2 / 85 ms | 13.2 / 68 ms | **11.2 / 23 ms** | 11.8 / 136 ms |
+| warmup（351 个请求）| 607 s | 331 s | **314 s** | 1500 s |
 
-- 32 个会话的上下文（单个请求输入中位约 65K、p90 约 140K、最长 254K token）远超 GPU 的 KV 池（约 1M token）。`base` 里被挤出的前缀只能整段重算（约 20K token/s），
-  `egm` 从 Grace 内存读回：单次加载中位约 2100 页（约 13 万 token），读取 p50 / p99 为 52 / 222 ms；查找（问 master）p50 / p99 为 4 / 15 ms。
-- **别看全部请求的 TTFT p50**（`base` 0.35 s，`egm` 39 s）。回放是闭环的，被重算堵住的会话发出的请求很少，
-  `base` 的 p50 由少数前缀还留在 GPU 里的会话撑起（前 5 个会话占 60% 的请求，TTFT 约 0.2 s；前缀命中不到一半的请求 TTFT 中位约 145 s），所以上表按会话取中位。
-- `egm` 剩下的约 40 s 排队来自 GPU 的 KV 容量：同时运行的请求中位只有 6 个，排队中位 28 个，KV 占用 p50 / p90 为 0.78 / 0.93。store 的读取不在这条路径上。
-- 一次 900 s 运行写进 store 约 9.3M token（478 GiB）：NUMA 0 写满后溢出到 NUMA 1，没有触发 store 淘汰，0 次读失败。
+- **对基线**：`egm` 多完成 22% 的请求、输出吞吐高 29%，TTFT p90 / p99 低约 30%。基线的有效容量只有 100 GB：DSA 的 KV 在 4 个 rank 上相同，
+  HiCache 在主机内存里存了 4 份；`egm` 的 store 在节点内只存一份，同样的主机内存能放 4 倍的前缀。
+- **同样的主机内存（HiCache 160）**：两者相当。HiCache 的完成请求与吞吐高约 5%、TTFT 低 10–25%；`egm` 的 ITL p99 低得多（23 vs 68 ms）。
+  - 前缀命中几乎一样（89% vs 90%）：这个负载在 900 s 里要复用的前缀没超过 3.6M token，`egm` 多出的容量没有用上。
+  - 剩下的差距在 GPU 上：两者都卡在 GPU 的 KV 容量（同时运行的请求中位 `egm` 6 个、HiCache 7 个，排队中位 26–28 个），
+    而 `egm` 的 GPU KV 池小 16%（见下文「开 linker 的容量代价」）。这是推断，没有单独验证。
+  - ITL p99：HiCache 的 `--hicache-io-backend direct` 用 copy engine 搬 KV，SGLang 启动时就提示它可能排在 forward 的小块元数据拷贝前面、拖住 forward；
+    `egm` 每层发一次 gather kernel。差距的成因同样没有单独验证。
+- **无 offload**：被挤出 GPU 的前缀只能整段重算（约 20K token/s），吞吐只有基线的 0.61×。
+- `egm` 的读路径：单次加载中位约 2100 页（约 13 万 token），读取 p50 / p99 为 52 / 222 ms；查找（问 master）p50 / p99 为 4 / 15 ms。
+  一次 900 s 运行写进 store 约 9.3M token（478 GiB）：NUMA 0 写满后溢出到 NUMA 1，没有触发 store 淘汰，0 次读失败。
+- 32 个会话的上下文（单个请求输入中位约 65K、p90 约 140K、最长 254K token）远超 GPU 的 KV 池（约 1M token），所以各臂都要排队。
+- **别看全部请求的 TTFT p50**（HiCache 34–40 s，`egm` 39 s，无 offload 0.35 s）。回放是闭环的，被堵住的会话发出的请求很少：
+  无 offload 的 p50 由少数前缀还留在 GPU 里的会话撑起（前 5 个会话占 60% 的请求，TTFT 约 0.2 s；前缀命中不到一半的请求 TTFT 中位约 145 s），所以上表按会话取中位。
 - 并发 8 时，8 个会话的上下文放得进 GPU，store 0 命中，`egm` 只付写透的开销。
 
 **精度（gsm8k）**：用 agentx-harness 1.0.13 自带的 accuracy 模式（`aiperf profile --accuracy-benchmark gsm8k --num-requests 1319`，对齐 lighteval 的 `gsm8k_leaderboard`：zero-shot，`max_tokens=256`），
 温度 0，关 thinking（`chat_template_kwargs.enable_thinking=false`）。这些不是模型推荐的采样设置（`temperature=1.0`、`top_p=0.95`、开 thinking）：这里要比的是读路径，
 需要尽量确定的输出，不是准确率的绝对值；分数只能与同一 harness、同一设置的结果比，不能与 sgl-eval 等的 gsm8k 分数比。
-两遍法：第一遍在 `egm` 服务上跑（KV 写进 store）；停掉服务，换一个 GPU 缓存为空的新服务跑第二遍，每题的整页都从 store 读回；再与 `base` 比。
+两遍法：第一遍在 `egm` 服务上跑（KV 写进 store）；停掉服务，换一个 GPU 缓存为空的新服务跑第二遍，每题的整页都从 store 读回；再与无 offload 的服务比。
+参照用无 offload 而不是 HiCache：HiCache 的主机缓存随服务退出而清空，套不上两遍法。
 
 | | 准确率 | 从 store 读回 |
 |---|---|---|
 | `egm` 第一遍 | 80.8% | 无 |
 | `egm` 第二遍（新服务）| 80.4% | 668 题全部命中（其余题不足一页），约占 prompt token 的一半 |
-| `base` | 80.4% | — |
+| 无 offload | 80.4% | — |
 
-- 三者相差不到 0.5 个点；KV 或 indexer K 读错会让准确率大幅下滑。逐题看，两次整段 prefill（第一遍与 `base`）之间就有 30% 的题输出文本不同（TP4 批处理的不确定性），
+- 三者相差不到 0.5 个点；KV 或 indexer K 读错会让准确率大幅下滑。逐题看，两次整段 prefill（第一遍与无 offload）之间就有 30% 的题输出文本不同（TP4 批处理的不确定性），
   第二遍走「前缀命中 + extend」的数值路径，分叉更多（约 62%），但对错翻转是双向的。
 - 绝对值偏低是因为 256 token 的上限会截断，且 GLM 不输出 `####`、评分取最后一个数，不影响对比。gsm8k 的提示约 100 token，每题只读回 1–2 页；
   长前缀（上千页）的读回在上面的回放里跑通，但那里不评分。
 
 **开 linker 的容量代价**：开 `--enable-unified-cache-external-linker` 时，SGLang 不再为 DSA 的 shared-topk 层省略 indexer K
-（`kv_cache_configurator.py` 的 `_should_elide_dsa_index_k`），每层都分配，同样 47.4 GB 的 KV 池只装 0.92M token，`base` 是 1.07–1.09M（小 14–16%）。
-上面的对比没有给 `base` 限池，所以偏向不利于 `egm`。让 linker 的页对象跳过 0 行的 indexer K 层就能去掉这项代价，页对象也会变小。
+（`kv_cache_configurator.py` 的 `_should_elide_dsa_index_k`），每层都分配，同样 47.4 GB 的 KV 池只装 0.92M token；HiCache 与无 offload 保留省略，是 1.09M token
+（另一个节点上无 offload 是 1.07M），所以 `egm` 的池小 14–16%。上面的对比没有给其它臂限池，偏向不利于 `egm`。
+让 linker 的页对象跳过 0 行的 indexer K 层就能去掉这项代价，页对象也会变小。
 
 ## 局限
 
