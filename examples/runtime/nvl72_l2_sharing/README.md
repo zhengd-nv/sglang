@@ -114,6 +114,7 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 | `[HiCache] EGM: domain master for store membership, prefix directory and placement` 及其后两个修复 | `egm/master.py`：可选的域内 master（只管元数据：成员与存活、key 到 store 的目录、放置）；linker 配了 `master` 时一次 RPC 查找，本地 store 写满时溢出到 master 选的 store。本示例不起 master |
 | `[HiCache] EGM linker: page objects over every KV-indexed pool, TP ranks` | 一页一个对象装全部以 KV 页为索引的池（MLA / DSA：latent KV + indexer K），支持 TP（复制池只有 rank 0 写，可选 rank 0 读后逐层广播）|
 | `[HiCache] EGM linker: keep the audit file open` | linker 的计时日志只打开一次文件（每条重新打开在网络文件系统上约 0.6 ms，其中一条在调度线程上）|
+| `[HiCache] Direct linker: keep the compact DSA indexer layout` | 开 linker 时 DSA 仍为 shared-topk 层省略 indexer K（之前每层都分配，GPU 的 KV 池小 14–16%）；direct linker 的 indexer 池只登记有 indexer K 的层，`egm` 页对象跳过其余层 |
 | `egm-l2-master-reference.md` | EGM L2 sharing 的 master 参考实现：分工、协议、实测与对 KVCM 的扩展建议 |
 | `examples/runtime/nvl72_l2_sharing/` | 本示例 |
 | `mooncake-nvlink-grouped-scatter.patch` | Mooncake 补丁：NVLink transport 把一次 scatter 作为一个 task 处理。不打的话每个 32 KiB 的页片段要单独轮询，负载下恢复 16k token 前缀约 70 ms 而不是 43 ms（不含 linker 分组）|
@@ -260,14 +261,14 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 
 **配置**
 
-- 一个 GB200 节点，`nvidia/GLM-5.2-NVFP4`（DSA：每页对象装 78 层的 latent KV 与 indexer K，3.37 MiB），TP4 占满 4 张卡。
+- 一个 GB200 节点，`nvidia/GLM-5.2-NVFP4`（DSA：每页对象装 78 层的 latent KV 与其中 21 层的 indexer K，2.91 MiB），TP4 占满 4 张卡。
   服务按部署默认：开 overlap 调度与 CUDA Graph，chunked prefill 16384，page size 64，fp8 KV，`--context-length 262144`。
 - 各臂只差 KV offload：
   - **HiCache（基线）**：cookbook 的参数，`--enable-hierarchical-cache --hicache-size 100 --hicache-write-policy write_back --hicache-io-backend direct --hicache-mem-layout page_first_direct`。
     `--hicache-size` 按 rank 计；DSA 的 KV 在 4 个 rank 上相同，每个 rank 各存一份，所以占主机内存 400 GB，有效容量 100 GB（约 2.2M token）。
   - **HiCache 160**：同上，`--hicache-size 160`，主机内存 640 GB，与 `egm` 相当，有效容量约 3.6M token。
   - **`egm`**：direct linker 写透，每 NUMA 一个 300 GiB 的 store（写 NUMA 0，写满后经 master 放到 NUMA 1）加一个 master，主机内存 644 GB；
-    节点内只存一份（rank 0 写），有效容量约 11.7M token。`linker_extra_config` 在 `start_server.sh` 的基础上加 `"master"`、`"write_store": 0`、
+    节点内只存一份（rank 0 写），有效容量约 13.5M token。`linker_extra_config` 在 `start_server.sh` 的基础上加 `"master"`、`"write_store": 0`、
     `"broadcast": true`（rank 0 读后逐层广播，入口 GPU 只发一份）。
   - **无 offload**：只有 GPU 前缀缓存，作参考。
 - agentx-harness 1.0.13，语料 `semianalysis_cc_traces_weka_062126_256k`（393 条会话，单个请求不超过 256K token；本轮平均输入约 75K token），
@@ -286,34 +287,34 @@ agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
   --use-server-token-count --random-seed 20261108
 ```
 
-**性能**（以 HiCache 为基线，括号里是相对它的倍数。两个 HiCache 臂在同一节点先后跑，`egm` 与无 offload 在另一个节点先后跑；
-`egm` 在第三个节点上重复了一次，各项相差 1% 以内）：
+**性能**（以 HiCache 为基线，括号里是相对它的倍数。两个 HiCache 臂在同一节点先后跑，无 offload 在另一个节点上跑，`egm` 在第三个节点上跑。
+保留 compact indexer 之前，`egm` 在两个节点上各跑过一次，各项相差 1% 以内）：
 
 | | HiCache（基线）| HiCache 160 | `egm` | 无 offload |
 |---|---|---|---|---|
-| 主机内存 / 有效容量 | 400 GB / 2.2M token | 640 GB / 3.6M token | 644 GB / 11.7M token | — |
-| GPU KV 池 | 1.09M token | 1.09M token | 0.92M token | 1.09M token |
-| 完成请求（900 s）| 535 | **691**（1.29×）| 655（1.22×）| 360（0.67×）|
-| 输出吞吐 | 350 tok/s | **473 tok/s**（1.35×）| 452 tok/s（1.29×）| 212 tok/s（0.61×）|
+| 主机内存 / 有效容量 | 400 GB / 2.2M token | 640 GB / 3.6M token | 644 GB / 13.5M token | — |
+| GPU KV 池 | 1.09M token | 1.09M token | 1.07M token | 1.09M token |
+| 完成请求（900 s）| 535 | 691（1.29×）| **693**（1.30×）| 360（0.67×）|
+| 输出吞吐 | 350 tok/s | 473 tok/s（1.35×）| **482 tok/s**（1.38×）| 212 tok/s（0.61×）|
 | 前缀命中（含 warmup）| 75% | 89% | **90%** | 31% |
-| 每个会话的中位 TTFT，跨会话 p50 / p90 | 54 / 63 s | **40 / 45 s** | 45 / 52 s | 137 / 154 s |
-| 全部请求的 TTFT p90 / p99 | 91 / 105 s | **49 / 57 s** | 60 / 75 s | 154 / 168 s |
-| ITL p50 / p99 | 13.2 / 85 ms | 13.2 / 68 ms | **11.2 / 23 ms** | 11.8 / 136 ms |
-| warmup（351 个请求）| 607 s | 331 s | **314 s** | 1500 s |
+| 每个会话的中位 TTFT，跨会话 p50 / p90 | 54 / 63 s | 40 / 45 s | **38 / 42 s** | 137 / 154 s |
+| 全部请求的 TTFT p90 / p99 | 91 / 105 s | **49 / 57 s** | 51 / 61 s | 154 / 168 s |
+| ITL p50 / p99 | 13.2 / 85 ms | 13.2 / 68 ms | **12.1 / 33 ms** | 11.8 / 136 ms |
+| warmup（351 个请求）| 607 s | 331 s | **311 s** | 1500 s |
 
-- **对基线**：`egm` 多完成 22% 的请求、输出吞吐高 29%，TTFT p90 / p99 低约 30%。基线的有效容量只有 100 GB：DSA 的 KV 在 4 个 rank 上相同，
-  HiCache 在主机内存里存了 4 份；`egm` 的 store 在节点内只存一份，同样的主机内存能放 4 倍的前缀。
-- **同样的主机内存（HiCache 160）**：两者相当。HiCache 的完成请求与吞吐高约 5%、TTFT 低 10–25%；`egm` 的 ITL p99 低得多（23 vs 68 ms）。
+- **对基线**：`egm` 多完成 30% 的请求、输出吞吐高 38%，每个会话的中位 TTFT 低约 30%，TTFT p90 / p99 低 42–44%。基线的有效容量只有 100 GB：DSA 的 KV 在 4 个 rank 上相同，
+  HiCache 在主机内存里存了 4 份；`egm` 的 store 在节点内只存一份，同样的主机内存能放 4 倍以上的前缀（页对象还省掉了不需要的 indexer K）。
+- **同样的主机内存（HiCache 160）**：两者持平。`egm` 的完成请求与吞吐高 0–2%、每个会话的中位 TTFT 低 5–6%，TTFT p99 高约 7%（61 vs 57 s），
+  差别都在跨节点的噪声附近；`egm` 的 ITL p99 约为一半（33 vs 68 ms）。
   - 前缀命中几乎一样（89% vs 90%）：这个负载在 900 s 里要复用的前缀没超过 3.6M token，`egm` 多出的容量没有用上。
-  - 剩下的差距在 GPU 上：两者都卡在 GPU 的 KV 容量（同时运行的请求中位 `egm` 6 个、HiCache 7 个，排队中位 26–28 个），
-    而 `egm` 的 GPU KV 池小 16%（见下文「开 linker 的容量代价」）。这是推断，没有单独验证。
+  - 两者都卡在 GPU 的 KV 容量：同时运行的请求中位都是 7 个，排队中位 26–27 个。
   - ITL p99：HiCache 的 `--hicache-io-backend direct` 用 copy engine 搬 KV，SGLang 启动时就提示它可能排在 forward 的小块元数据拷贝前面、拖住 forward；
-    `egm` 每层发一次 gather kernel。差距的成因同样没有单独验证。
+    `egm` 每层发一次 gather kernel。差距的成因没有单独验证。
 - **无 offload**：被挤出 GPU 的前缀只能整段重算（约 20K token/s），吞吐只有基线的 0.61×。
-- `egm` 的读路径：单次加载中位约 2100 页（约 13 万 token），读取 p50 / p99 为 52 / 222 ms；查找（问 master）p50 / p99 为 4 / 15 ms。
-  一次 900 s 运行写进 store 约 9.3M token（478 GiB）：NUMA 0 写满后溢出到 NUMA 1，没有触发 store 淘汰，0 次读失败。
+- `egm` 的读路径：单次加载中位约 2100 页（约 13 万 token），读取 p50 / p99 为 49 / 210 ms；查找（问 master）p50 / p99 为 3 / 13 ms。
+  一次 900 s 运行写进 store 约 9.5M token（424 GiB）：NUMA 0 写满后溢出到 NUMA 1，没有触发 store 淘汰，0 次读失败。
 - 32 个会话的上下文（单个请求输入中位约 65K、p90 约 140K、最长 254K token）远超 GPU 的 KV 池（约 1M token），所以各臂都要排队。
-- **别看全部请求的 TTFT p50**（HiCache 34–40 s，`egm` 39 s，无 offload 0.35 s）。回放是闭环的，被堵住的会话发出的请求很少：
+- **别看全部请求的 TTFT p50**（HiCache 34–40 s，`egm` 34 s，无 offload 0.35 s）。回放是闭环的，被堵住的会话发出的请求很少：
   无 offload 的 p50 由少数前缀还留在 GPU 里的会话撑起（前 5 个会话占 60% 的请求，TTFT 约 0.2 s；前缀命中不到一半的请求 TTFT 中位约 145 s），所以上表按会话取中位。
 - 并发 8 时，8 个会话的上下文放得进 GPU，store 0 命中，`egm` 只付写透的开销。
 
@@ -322,6 +323,7 @@ agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
 需要尽量确定的输出，不是准确率的绝对值；分数只能与同一 harness、同一设置的结果比，不能与 sgl-eval 等的 gsm8k 分数比。
 两遍法：第一遍在 `egm` 服务上跑（KV 写进 store）；停掉服务，换一个 GPU 缓存为空的新服务跑第二遍，每题的整页都从 store 读回；再与无 offload 的服务比。
 参照用无 offload 而不是 HiCache：HiCache 的主机缓存随服务退出而清空，套不上两遍法。
+gsm8k 是在保留 compact indexer 之前跑的（页对象每层都带 indexer K）；改后的读回由下文「保留 compact indexer 的效果」里的 logprob 对比核对。
 
 | | 准确率 | 从 store 读回 |
 |---|---|---|
@@ -334,10 +336,12 @@ agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
 - 绝对值偏低是因为 256 token 的上限会截断，且 GLM 不输出 `####`、评分取最后一个数，不影响对比。gsm8k 的提示约 100 token，每题只读回 1–2 页；
   长前缀（上千页）的读回在上面的回放里跑通，但那里不评分。
 
-**开 linker 的容量代价**：开 `--enable-unified-cache-external-linker` 时，SGLang 不再为 DSA 的 shared-topk 层省略 indexer K
-（`kv_cache_configurator.py` 的 `_should_elide_dsa_index_k`），每层都分配，同样 47.4 GB 的 KV 池只装 0.92M token；HiCache 与无 offload 保留省略，是 1.09M token
-（另一个节点上无 offload 是 1.07M），所以 `egm` 的池小 14–16%。上面的对比没有给其它臂限池，偏向不利于 `egm`。
-让 linker 的页对象跳过 0 行的 indexer K 层就能去掉这项代价，页对象也会变小。
+**保留 compact indexer 的效果**：`[HiCache] Direct linker: keep the compact DSA indexer layout` 之前，开 `--enable-unified-cache-external-linker` 时
+SGLang 不为 DSA 的 shared-topk 层省略 indexer K，同样 47.4 GB 的 KV 池只装 0.92M token（HiCache 与无 offload 是 1.07–1.09M），页对象 3.37 MiB。
+那时 `egm` 同时运行的请求中位只有 6 个，比 HiCache 160 少完成约 5% 的请求（655 vs 691）、吞吐低约 5%（452 vs 473 tok/s），每个会话的中位 TTFT 高 12–15%，ITL p99 为 23 ms。
+改后 GPU 池与其它臂相同，差距消失；ITL p99 升到 33 ms，因为解码批次多了一个请求。
+在 GLM-5.2 的 8 层截断版（TP4）上核对过：开不开 linker KV 池相同；从 store 读回后（rank 0 读后广播，或各 rank 各读）尾部 token 的 logprob 与 GPU 缓存命中、从零重算的差别在同一量级（约 0.1–0.4）。
+页对象布局变了，`egm` 的 key 前缀随之改变，新旧对象不会混用；`mooncake` linker 的 key 不含布局，改版前后不要共用同一个 Mooncake store。
 
 ## 局限
 
@@ -345,7 +349,6 @@ agentx profile --url http://127.0.0.1:30000 --endpoint-type chat \
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
 - 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」），
   并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过多轮回放与 gsm8k（见「实测」，单节点）；PD 分离和投机解码都没测过。
-- 开 external linker 时 DSA 的 indexer K 不再按 shared-topk 层省略，GPU 的 KV 池小 14–16%（见「实测」）。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
 - `egm` 不起 master 时（本示例）：查找与写前去重每次都要问所有 store，适合几个节点；只写本节点的 store，满了在本地淘汰，不借别的节点的容量；store 服务重启后，已运行的服务要一起重启。
