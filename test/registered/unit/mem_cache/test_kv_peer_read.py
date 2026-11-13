@@ -815,6 +815,9 @@ class TestWrites(PageObjectTestBase):
         self.import_slab(writable=True)
         self.assertEqual(self.ops.maps, [True, True, False, False])
         self.assertEqual(self.ops.log.count("warmup-write"), 1)
+        region.writable = True  # the caller's handle; the mapping stays read-only
+        with self.assertRaises(ValueError):
+            self.reader.write([self.write_group(region, [0], [0])])
 
     def test_in_flight_writes_conflict_on_the_allocation_not_the_mapping(self):
         """Two leases of one allocation are one destination: the same item of the same

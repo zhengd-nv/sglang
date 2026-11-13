@@ -477,12 +477,15 @@ class KvPeerExporter:
 
 
 class _Region:
-    __slots__ = ("public", "desc", "batches")
+    __slots__ = ("public", "desc", "batches", "writable")
 
-    def __init__(self, public: PeerRegion, desc: PeerRegionDescriptor):
+    def __init__(self, public: PeerRegion, desc: PeerRegionDescriptor, writable: bool):
         self.public = public
         self.desc = desc
         self.batches: set[str] = set()
+        self.writable = (
+            writable  # the mapping's access; the public flag is the caller's copy
+        )
 
 
 class _BufferSet:
@@ -725,7 +728,9 @@ class KvPeerReader:
         # key -> [end, {batch id: [sorted destination pages of its groups]}].
         self._busy_groups: dict[str, list] = {}
         self._busy: dict[tuple, list] = {}
-        self._last_shape: Optional[_Shape] = None
+        self._last_shape: dict[
+            bool, _Shape
+        ] = {}  # by direction: loads and write-throughs interleave
         self._events: list = []  # recycled from released SUCCESS batches
         self._clique = self._ops.fabric_clique(self.device)
         self._fail_stop = ""
@@ -763,7 +768,7 @@ class KvPeerReader:
             desc.fabric_handle, desc.size, self.device, read_only=not writable
         )
         public = PeerRegion(uuid.uuid4().hex, desc.size, address, writable)
-        self._regions[public.region_id] = _Region(public, desc)
+        self._regions[public.region_id] = _Region(public, desc, writable)
         self._imported_leases[lease_key] = None  # survives unmap: a lease maps once
         if len(self._imported_leases) > _MAX_LEASE_TOMBSTONES:
             del self._imported_leases[next(iter(self._imported_leases))]
@@ -1051,7 +1056,7 @@ class KvPeerReader:
             if not isinstance(buf, PeerWriteBuffer):
                 raise ValueError(f"group {index}: expected PeerWriteBuffer entries")
             region = self._region(buf.dst_region)
-            if not region.public.writable:
+            if not region.writable:
                 raise ValueError(
                     f"group {index}: destination region is mapped read-only"
                 )
@@ -1148,7 +1153,8 @@ class KvPeerReader:
         """The batch's destination keys, checked alone; layer-wise loads repeat their
         buffer sets, so the last shape is reused while they do."""
         sets = [plan.buffer_set for plan in plans]
-        shape = self._last_shape
+        load = sets[0].load
+        shape = self._last_shape.get(load)
         if shape is not None and shape.sets == sets:
             return shape
         shape = _Shape(sets)
@@ -1157,7 +1163,7 @@ class KvPeerReader:
         # One buffer set was checked alone when it was validated.
         if shape.distinct > 1 and _first_overlap(shape.ends) is not None:
             raise ValueError("overlapping destination ranges within the batch")
-        self._last_shape = shape
+        self._last_shape[load] = shape
         return shape
 
     def _check_new_geometry(self, shape: _Shape, *, polled: bool = False) -> None:
