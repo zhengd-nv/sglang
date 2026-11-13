@@ -33,10 +33,12 @@ Placement and discovery:
   configured store, normally this GPU's NUMA); a lookup asks every connected
   store in parallel and loads each page from the first store that holds it.
 
-Loads: one lease per store, then one gather launch per layer on a private
-stream; layer ``l`` completes as soon as its copy lands, so the forward overlaps
-the remaining layers. Offloads run on their own thread: ``alloc`` (skips keys
-already stored), one gather launch, ``commit``.
+Data plane: ``kv_peer_read``. Each store slab is imported once, writable, through
+one ``KvPeerReader`` per Engine process. Loads pin every page (one lease per
+store), then submit one batch with a read group per layer (``layers_per_group``)
+and store; layer ``l`` completes as soon as its group lands, so the forward
+overlaps the remaining layers. Offloads run on their own thread: ``alloc``
+(skips keys already stored), one write batch of whole page objects, ``commit``.
 """
 
 import hashlib
@@ -58,6 +60,14 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.kv_peer_read import (
+    KvPeerReader,
+    PeerBuffer,
+    PeerWriteBuffer,
+    ReadGroup,
+    ReadState,
+    WriteGroup,
+)
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
 )
@@ -70,8 +80,8 @@ from .service import EXISTS, FULL, StoreClient, cluster_uuid
 
 logger = logging.getLogger(__name__)
 
-_DIRECTION_TO_REGION, _DIRECTION_FROM_REGION = 2, 3
-_METHODS = {"batchapi": 1, "kernel": 2}
+# kv_peer_read's alignment for page sizes, strides and offsets (PAGE_ALIGN_BYTES).
+_PAGE_ALIGN = 128
 # Arbitrary bound on remembered key -> store routes between lookup and load.
 _ROUTE_CACHE_KEYS = 1 << 20
 # Arbitrary; one thread per store asked in parallel, an NVL72 has at most 36 stores.
@@ -83,87 +93,76 @@ def _ms(start, end):
     return round((end - start) * 1e3, 3)
 
 
-def _with_zero(values):
-    return np.append(values, np.zeros(1, dtype=values.dtype))
-
-
 class _Layout:
-    """Vectorized range metadata for one object per page over every pool entry.
+    """Page-object geometry over every pool entry, for ``kv_peer_read``.
 
     The object holds each entry's buffers in entry order, e.g. K of every layer
-    then V for MHA, or latent KV of every layer then indexer K for DSA. ``rows``
-    is uint64 [entries, pages]: an entry's row of a page (its first token for a
-    token-row pool, the page itself for a page-row pool such as the indexer).
+    then V for MHA, or latent KV of every layer then indexer K for DSA. A store
+    slot holds one object, so ``slot offset // slot_bytes`` is the page id on the
+    store side. ``rows`` is uint64 [entries, pages]: an entry's row of a page (its
+    first token for a token-row pool, the page itself for a page-row pool such as
+    the indexer).
     """
 
     def __init__(self, entries, num_layers):
-        base, stride, size, owner = [], [], [], []
+        # (entry, local base, page bytes, local buffer capacity in pages, offset in the object)
+        self.items = []
+        rows_per_page = []
         per_layer = [[] for _ in range(num_layers)]
+        offset = 0
         for e, entry in enumerate(entries):
             if not entry.packed or len(entry.components) != 1:
                 raise ValueError(
                     f"EGM linker needs one packed component group per pool ({entry.name})"
                 )
-            first = len(base)
-            for b, s, n in entry.buffer_meta[0]:
-                base.append(b)
-                stride.append(s)
-                size.append(n)
-                owner.append(e)
+            spans, first = set(), len(self.items)
+            for (base, stride, size), buffer in zip(
+                entry.buffer_meta[0], entry.kv_buffer
+            ):
+                if size % stride or size % _PAGE_ALIGN or base % _PAGE_ALIGN:
+                    raise ValueError(
+                        f"EGM linker needs whole, {_PAGE_ALIGN}-byte aligned pages ({entry.name})"
+                    )
+                spans.add(size // stride)
+                self.items.append((e, base, size, buffer.nbytes // size, offset))
+                offset += size
+            if len(spans) != 1:
+                raise ValueError(
+                    f"EGM linker needs one page geometry per pool ({entry.name})"
+                )
+            rows_per_page.append(spans.pop())
             for layer in range(num_layers):
                 mapped = entry.layer_mapping.get(layer)
                 if mapped is None:
                     continue
                 mapped = [mapped] if isinstance(mapped, int) else list(mapped)
                 per_layer[layer] += [first + i for i in mapped]
-        self.all_base = np.array(base, dtype=np.uint64)
-        self.all_stride = np.array(stride, dtype=np.uint64)
-        self.all_size = np.array(size, dtype=np.uint64)
-        self.all_off = np.concatenate([[0], np.cumsum(size)[:-1]]).astype(np.uint64)
-        self.all_owner = np.array(owner, dtype=np.int64)
-        self.object_bytes = int(sum(size))
-        # Layers may map different buffer counts (a compact DSA indexer skips
-        # shared-topk layers); short layers pad with a 0-byte item at index len(base).
-        self.layer_items = np.array([len(x) for x in per_layer], dtype=np.uint64)
-        self.ragged = len(set(self.layer_items.tolist())) > 1
-        width = int(self.layer_items.max())
-        pad = len(base)
-        index = np.array(
-            [x + [pad] * (width - len(x)) for x in per_layer], dtype=np.int64
-        )  # [layers, items]
-        self.layer_base = _with_zero(self.all_base)[index]
-        self.layer_stride = _with_zero(self.all_stride)[index]
-        self.layer_size = _with_zero(self.all_size)[index]
-        self.layer_off = _with_zero(self.all_off)[index]
-        self.layer_owner = _with_zero(self.all_owner)[index]
+        self.object_bytes = offset
+        # The store rounds a slot up to its alignment; every item size is aligned, so this is exact.
+        self.slot_bytes = -(-offset // _PAGE_ALIGN) * _PAGE_ALIGN
+        self.rows_per_page = np.array(rows_per_page, dtype=np.uint64)
+        # A compact DSA indexer skips shared-topk layers, so layers may carry different item counts.
+        self.layer_items = tuple(tuple(x) for x in per_layer)
 
-    def load_ranges(self, rows, objects):
-        """objects: uint64 [pages]. Returns layer-major flat arrays and per-layer group ends."""
-        layers, items = self.layer_base.shape
-        # [layers, items, pages] -> [layers, pages, items]: each item reads its own entry's row.
-        item_rows = rows[self.layer_owner].transpose(0, 2, 1)
-        ptr = self.layer_base[:, None, :] + item_rows * self.layer_stride[:, None, :]
-        off = objects[None, :, None] + self.layer_off[:, None, :]
-        size = np.broadcast_to(self.layer_size[:, None, :], ptr.shape)
-        pages = rows.shape[1]
-        if self.ragged:
-            keep = size != 0  # drop the padding items; each layer keeps >= 1 range
-            ends = np.cumsum(self.layer_items * np.uint64(pages))
-            return off[keep], ptr[keep], np.ascontiguousarray(size[keep]), ends
-        ends = np.arange(1, layers + 1, dtype=np.uint64) * (pages * items)
-        return (
-            off.reshape(-1),
-            ptr.reshape(-1),
-            np.ascontiguousarray(size).reshape(-1),
-            ends,
-        )
+    def local_pages(self, rows):
+        """int64 [entries, pages]: page ids in each entry's own buffers."""
+        per_page = self.rows_per_page[:, None]
+        if (rows % per_page).any():
+            raise ValueError("EGM linker: a page row is not on a page boundary")
+        return (rows // per_page).astype(np.int64)
 
-    def store_ranges(self, rows, objects):
-        item_rows = rows[self.all_owner].T  # [pages, buffers]
-        ptr = self.all_base[None, :] + item_rows * self.all_stride[None, :]
-        off = objects[:, None] + self.all_off[None, :]
-        size = np.broadcast_to(self.all_size[None, :], ptr.shape)
-        return off.reshape(-1), ptr.reshape(-1), np.ascontiguousarray(size).reshape(-1)
+    @staticmethod
+    def spaces(local):
+        """Entries whose page ids agree, as tuples; one tuple when every pool is indexed alike."""
+        groups = []
+        for e in range(local.shape[0]):
+            for group in groups:
+                if np.array_equal(local[group[0]], local[e]):
+                    group.append(e)
+                    break
+            else:
+                groups.append([e])
+        return tuple(tuple(g) for g in groups)
 
 
 class _TimedCounter(LayerWiseLoadCounter):
@@ -208,9 +207,12 @@ class _Stores:
         with self._lock:
             old = self._clients.get(client.store_id)
             self._clients[client.store_id] = client
+            idle = None
             if old is not None:
                 self._retired[id(old)] = old
-                self._close_idle(old)
+                idle = self._take_idle(old)
+        if idle is not None:
+            _close_quietly(idle)
 
     def hold(self, store_id):
         """The current client of ``store_id``, kept open until ``unhold``; None if unknown."""
@@ -223,13 +225,42 @@ class _Stores:
     def unhold(self, client):
         with self._lock:
             self._busy[id(client)] -= 1
-            self._close_idle(client)
+            idle = self._take_idle(client)
+        if idle is not None:
+            _close_quietly(
+                idle
+            )  # Outside the lock: closing unmaps and may wait on an RPC.
 
-    def _close_idle(self, client):
+    def _take_idle(self, client):
         if id(client) in self._retired and self._busy[id(client)] <= 0:
             del self._retired[id(client)]
             self._busy.pop(id(client), None)
-            client.region.close()
+            return client
+        return None
+
+    def region_ids(self):
+        """Region ids of every mapped slab, current or retired-but-held."""
+        with self._lock:
+            clients = list(self._clients.values()) + list(self._retired.values())
+        return {c.region.region_id for c in clients if c.region is not None}
+
+    def close_all(self):
+        with self._lock:
+            clients = list(self._clients.values()) + list(self._retired.values())
+            self._clients, self._retired = {}, {}
+        for client in clients:
+            _close_quietly(client)
+
+
+class _UncertainCopy(RuntimeError):
+    """kv_peer_read could not tell whether a failed copy stopped writing."""
+
+
+def _close_quietly(client):
+    try:
+        client.close()
+    except Exception as error:  # noqa: BLE001 - an uncertain copy keeps its region mapped
+        logger.error("EGM: keeping the slab of %s mapped: %s", client.store_id, error)
 
 
 class EGMDirectLinker(UnifiedCacheLinker):
@@ -251,6 +282,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
             "master",
             "refresh_s",
             "broadcast",
+            "num_blocks",
+            "layers_per_group",
         }
         if set(config) - allowed:
             raise ValueError(
@@ -286,7 +319,15 @@ class EGMDirectLinker(UnifiedCacheLinker):
         self.device = self.entries[0].kv_buffer[0].device.index
         self._init_tp(params)
         self.prefix = self._key_prefix(config["namespace"])
-        self.method = _METHODS[config.get("copy_mode", "kernel")]
+        # copy_mode is accepted for old launch configs; kv_peer_read has one copy path.
+        self.num_blocks = int(config.get("num_blocks", 64))
+        per_group = int(config.get("layers_per_group", 1))
+        self._layer_chunks = tuple(
+            tuple(range(first, min(first + per_group, self.num_layers)))
+            for first in range(0, self.num_layers, per_group)
+        )
+        self._buffers_lock = threading.Lock()
+        self._buffers = {}  # (direction, region id, residue, layers, space) -> buffer tuple
         self.audit_path = config.get("audit_path")
         if self.audit_path and self.tp_size > 1:
             stem, dot, suffix = self.audit_path.rpartition(".")
@@ -321,6 +362,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
             if self.master is not None or any(a.startswith("tcp://") for a in addresses)
             else None
         )
+        # One reader per Engine process (its device); every store slab is imported through it.
+        self.reader = KvPeerReader(self.device, num_blocks=self.num_blocks)
         self.stores = _Stores()
         self._addresses = {}  # store_id -> configured address (Unix socket for local stores)
         configured = [self._connect(a) for a in addresses]
@@ -385,7 +428,9 @@ class EGMDirectLinker(UnifiedCacheLinker):
             rank_replicated=self.rank_replicated,
             offload_owner=self.offload_owner,
             broadcast=self.broadcaster is not None,
-            method=self.method,
+            data_plane="kv_peer_read",
+            num_blocks=self.num_blocks,
+            layers_per_group=len(self._layer_chunks[0]),
             stores=[
                 dict(store_id=c.store_id, address=a, host=c.host, numa=c.numa)
                 for c, a in zip(configured, addresses)
@@ -454,6 +499,8 @@ class EGMDirectLinker(UnifiedCacheLinker):
             device=self.device,
             secret=self.secret,
             local_cluster_uuid=self.domain,
+            reader=self.reader,
+            writable=not self.read_only,
         )
 
     # ---- membership (master only) ----
@@ -487,10 +534,14 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 self._audit("import_failed", store=member["store_id"], error=str(error))
                 continue
             if client.epoch != member["epoch"]:
-                client.region.close()  # Restarted again in between; the next round catches up.
+                _close_quietly(
+                    client
+                )  # Restarted again in between; the next round catches up.
                 continue
             self.stores.install(client)
             self.stats["imports"] += 1
+            if current is not None:
+                self._forget_buffers(self.stores.region_ids())
             self._audit(
                 "import",
                 store=client.store_id,
@@ -760,25 +811,14 @@ class EGMDirectLinker(UnifiedCacheLinker):
         # [(client, page positions, token, offsets, deadline)], each client held until released.
         groups = self._acquire_all(keys)
         t2 = time.perf_counter()
-        batches = []
+        batch = None
         try:
-            ranges = [
-                (
-                    client,
-                    self.layout.load_ranges(
-                        rows[:, pos], np.asarray(offsets, dtype=np.uint64)
-                    ),
-                )
-                for client, pos, _, offsets, _ in groups
-            ]
+            read_groups, layer_end = self._read_plan(
+                groups, self.layout.local_pages(rows)
+            )
             t3 = time.perf_counter()
             fail_layer = int(fault["layer"]) if mode == "copy" else None
-            for client, (off, ptr, size, ends) in ranges:
-                batches.append(
-                    client.region.submit(
-                        off, ptr, size, _DIRECTION_FROM_REGION, ends, method=self.method
-                    )
-                )
+            batch = self.reader.read(read_groups)
             t4 = time.perf_counter()
             if mode == "stall":
                 time.sleep(
@@ -787,8 +827,12 @@ class EGMDirectLinker(UnifiedCacheLinker):
             deadline = min(g[4] for g in groups)
             first = None
             for layer in range(self.num_layers):
-                for batch in batches:
-                    batch.wait(layer)
+                status = self.reader.wait_group(batch, layer_end[layer])
+                if status.groups_done <= layer_end[layer]:
+                    raise RuntimeError(
+                        f"EGM read failed before layer {layer} landed: "
+                        f"{status.state.value} {status.error}"
+                    )
                 if fail_layer is not None and layer >= fail_layer:
                     raise RuntimeError(f"injected EGM load failure at layer {layer}")
                 if time.monotonic() > deadline:
@@ -798,8 +842,10 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 first = first or time.perf_counter()
             t5 = time.perf_counter()
         finally:
-            for batch in batches:
-                batch.free()  # Drains every group, including those after a failure.
+            if batch is not None:
+                self._finish_batch(
+                    batch
+                )  # Drains every group, including those after a failure.
             for client, _, token, _, _ in groups:
                 self._release_quietly(client, token)
                 self.stores.unhold(client)
@@ -823,6 +869,94 @@ class EGMDirectLinker(UnifiedCacheLinker):
             finalize_ms=_ms(t5, t6),
             total_ms=_ms(queued, t5),
         )
+
+    def _read_plan(self, groups, local):
+        """ReadGroups in layer-major order, and the index of the last group carrying each layer."""
+        slot = self.layout.slot_bytes
+        spaces = self.layout.spaces(local)
+        parts = []  # (region, residue, store page ids, local page ids per space)
+        for client, pos, _, offsets, _ in groups:
+            offsets, pos = np.asarray(offsets, dtype=np.int64), np.asarray(pos)
+            residues = offsets % slot
+            for residue in np.unique(residues).tolist():
+                mask = residues == residue
+                dst = [local[space[0]][pos[mask]] for space in spaces]
+                parts.append((client.region, residue, offsets[mask] // slot, dst))
+        read_groups, layer_end = [], [0] * self.num_layers
+        for layers in self._layer_chunks:
+            for region, residue, src, dst in parts:
+                for space, dst_pages in zip(spaces, dst):
+                    buffers = self._read_buffers(region, residue, layers, space)
+                    if buffers:
+                        read_groups.append(
+                            ReadGroup(
+                                buffers=buffers, src_pages=src, dst_pages=dst_pages
+                            )
+                        )
+            for layer in layers:
+                layer_end[layer] = len(read_groups) - 1
+        return read_groups, layer_end
+
+    def _read_buffers(self, region, residue, layers, space):
+        """One tuple per (region, layers, space), reused so kv_peer_read's per-buffer checks are cached."""
+        key = ("r", region.region_id, residue, layers, space)
+        with self._buffers_lock:
+            got = self._buffers.get(key)
+        if got is None:
+            items = self.layout.items
+            got = tuple(
+                PeerBuffer(
+                    src_region=region,
+                    src_offset=residue + items[i][4],
+                    dst_base=items[i][1],
+                    page_bytes=items[i][2],
+                    dst_num_pages=items[i][3],
+                    src_stride=self.layout.slot_bytes,
+                )
+                for layer in layers
+                for i in self.layout.layer_items[layer]
+                if items[i][0] in space
+            )
+            with self._buffers_lock:
+                self._buffers[key] = got
+        return got
+
+    def _write_buffers(self, region, residue, space):
+        """Every buffer of the entries in ``space``: an offload writes whole page objects."""
+        key = ("w", region.region_id, residue, space)
+        with self._buffers_lock:
+            got = self._buffers.get(key)
+        if got is None:
+            got = tuple(
+                PeerWriteBuffer(
+                    dst_region=region,
+                    dst_offset=residue + offset,
+                    src_base=base,
+                    page_bytes=size,
+                    src_num_pages=pages,
+                    dst_stride=self.layout.slot_bytes,
+                )
+                for entry, base, size, pages, offset in self.layout.items
+                if entry in space
+            )
+            with self._buffers_lock:
+                self._buffers[key] = got
+        return got
+
+    def _forget_buffers(self, live_regions):
+        """Drop cached buffer tuples of regions no longer mapped (a restarted store)."""
+        with self._buffers_lock:
+            for key in [k for k in self._buffers if k[1] not in live_regions]:
+                del self._buffers[key]
+
+    def _finish_batch(self, batch):
+        """Wait out every group, then release; an uncertain batch stays pinned by the reader."""
+        status = self.reader.wait(batch)
+        if status.state in (ReadState.SUCCESS, ReadState.FAILED_DRAINED):
+            self.reader.release(batch)
+        else:
+            logger.error("EGM copy left %s: %s", status.state.value, status.error)
+        return status
 
     def _acquire_all(self, keys):
         """Pin every page on the store the lookup found it in; all-or-nothing."""
@@ -986,24 +1120,10 @@ class EGMDirectLinker(UnifiedCacheLinker):
                     raise RuntimeError(
                         "EGM write reservation expired before the copy started"
                     )
-                off, ptr, size = self.layout.store_ranges(
-                    rows[:, idx[new]], offsets[new].astype(np.uint64)
-                )
-                batch = client.region.submit(
-                    off,
-                    ptr,
-                    size,
-                    _DIRECTION_TO_REGION,
-                    [len(off)],
-                    method=self.method,
-                    writable=True,
-                )
-                try:
-                    batch.wait(0)
-                finally:
-                    batch.free()
-            except BaseException:
-                client.abort(token)
+                self._write_pages(client, rows[:, idx[new]], offsets[new])
+            except BaseException as error:
+                # A copy that may still land must not find its slots handed to someone else.
+                client.abort(token, quarantine=isinstance(error, _UncertainCopy))
                 raise
             if time.monotonic() > deadline:
                 # The service has quarantined these slots; committing would publish nothing useful.
@@ -1026,6 +1146,34 @@ class EGMDirectLinker(UnifiedCacheLinker):
             alloc_ms=_ms(t0, t1),
             copy_commit_ms=_ms(t1, t2),
         )
+
+    def _write_pages(self, client, rows, offsets):
+        """Scatter whole page objects into the store's reserved slots; returns once they landed."""
+        status = self._finish_batch(
+            self.reader.write(self._write_plan(client.region, rows, offsets))
+        )
+        if status.state == ReadState.FAILED_UNCERTAIN:
+            raise _UncertainCopy(status.error)
+        if status.state != ReadState.SUCCESS:
+            raise RuntimeError(f"EGM write failed: {status.state.value} {status.error}")
+
+    def _write_plan(self, region, rows, offsets):
+        """WriteGroups for pages at ``rows`` going to the slots at byte ``offsets`` of ``region``."""
+        local = self.layout.local_pages(rows)
+        slot = self.layout.slot_bytes
+        residues = offsets % slot
+        groups = []
+        for residue in np.unique(residues).tolist():
+            mask = residues == residue
+            for space in self.layout.spaces(local[:, mask]):
+                groups.append(
+                    WriteGroup(
+                        buffers=self._write_buffers(region, residue, space),
+                        src_pages=local[space[0]][mask],
+                        dst_pages=offsets[mask] // slot,
+                    )
+                )
+        return groups
 
     def num_completed_offloads(self):
         return self.offload_results.qsize()
@@ -1058,6 +1206,11 @@ class EGMDirectLinker(UnifiedCacheLinker):
             self.membership_thread.join()
         if self.broadcaster is not None:
             self.broadcaster.destroy()
+        self.stores.close_all()
+        try:
+            self.reader.close()
+        except Exception as error:  # noqa: BLE001 - an uncertain batch keeps it open
+            logger.error("EGM: kv_peer_read reader left open: %s", error)
         logger.info("EGM direct linker stats: %s", dict(self.stats))
         if self._audit_stream is not None:
             with self._audit_lock:

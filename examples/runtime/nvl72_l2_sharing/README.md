@@ -19,7 +19,7 @@
 | 写到哪 | master 分配（本示例只有节点 0 有 provider）| 本节点、本 NUMA 的 store；配了 master 时，本地不淘汰就放不下的页写到 master 选的 store |
 | 怎么找到 | 问 master | 并行问所有 store，本节点优先；配了 master 时一次 RPC 问 master |
 | 数据面 | Mooncake Transfer Engine 的 nvlink transport（`cudaMemcpyBatchAsync`）| 读方 / 写方 GPU 自己发 gather kernel，每层一次 |
-| 依赖 | 从源码构建 Mooncake（带补丁），CMake 约 8 分钟 | CUDA driver、numpy；`nvcc` 编一个 `libegm.so`，几秒 |
+| 依赖 | 从源码构建 Mooncake（带补丁），CMake 约 8 分钟 | CUDA driver、cuda-python；数据面是 sglang 的 `kv_peer_read`（JIT kernel，首次使用时编译），不用预先构建 |
 | 端口 | master RPC、HTTP 元数据、metrics、每个进程一个 Transfer Engine 端口 | 每个 store 一个 TCP 端口（带作业密钥）；master 一个 |
 | 全局能力 | master 统一分配、全局去重、高水位淘汰、跨节点借容量 | 跨 store 去重；配了 master 时加上目录、成员与存活、按空闲放置（跨节点借容量）。淘汰始终在各 store 内 |
 
@@ -136,7 +136,7 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 ./prepare_sglang.sh
 ```
 
-**`BACKEND=egm`**：编 `libegm.so`，写 `$WORK/egm-env.sh`（`run_slurm.sh` 会自动调用）：
+**`BACKEND=egm`**：不用编译，只写 `$WORK/egm-env.sh`（`run_slurm.sh` 会自动调用）：
 
 ```bash
 WORK=/shared/l2-sharing ./build_egm.sh

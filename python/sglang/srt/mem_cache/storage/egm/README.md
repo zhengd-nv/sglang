@@ -3,8 +3,10 @@
 A small KV store for GB200 / GB300 NVL72 that keeps radix-cache pages in Grace
 CPU memory (EGM: CUDA `HOST_NUMA` allocations exported as FABRIC handles) and
 lets any SGLang Engine in the same NVLink domain read and write them directly
-with its own GPU. It needs only the CUDA driver, an IMEX channel, the Python
-standard library and numpy: no Mooncake, etcd or metadata server. A domain
+with its own GPU. The copies go through `kv_peer_read`
+(`python/sglang/srt/mem_cache/kv_peer_read.py`: CUDA FABRIC import, page-row
+JIT kernel, grouped completion); otherwise it needs only an IMEX channel:
+no Mooncake, etcd or metadata server. A domain
 master (`master.py`) is optional: it adds a prefix directory, membership and
 placement; without it a lookup asks every store.
 
@@ -18,17 +20,7 @@ An end-to-end two-node example lives in
 | `service.py` | Store service, one process per NUMA node. Owns the slab, hands out slots, pins objects for readers, evicts LRU unpinned objects. Control only: it never copies KV. Serves a Unix socket (same node) and optionally TCP with a job secret (other nodes). |
 | `linker.py` | `EGMDirectLinker`, loaded through the `dynamic` external-linker backend. Imports every configured store's slab once at startup, then copies pages between its GPU pool and the slabs. |
 | `master.py` | Optional domain master, one per NVLink domain. Metadata only: store registration and liveness, key -> store directory reported by the stores, and placement for pages that do not fit the local store. Not on the data path; the linker falls back to asking every store when it is down. |
-| `region.py`, `native.cpp`, `egm_gather.cu` | ctypes wrapper over `libegm.so`: allocate / export / import the slab, and one gather kernel launch per group of segments. |
-
-## Build the native library
-
-```bash
-cd python/sglang/srt/mem_cache/storage/egm
-nvcc -O2 -std=c++17 -shared -Xcompiler -fPIC -DEGM_WITH_GATHER \
-  -gencode arch=compute_100,code=sm_100 -gencode arch=compute_100,code=compute_100 \
-  native.cpp egm_gather.cu -I"$CUDA_HOME/include" -L"$CUDA_HOME/lib64/stubs" -lcuda -o libegm.so
-export EGM_NATIVE_LIB="$PWD/libegm.so"   # both the service and the Engine read this
-```
+| `kv_peer_read` (outside this package) | The data plane: the service allocates the slab with `cuda_vmm_utils.create_host_numa_allocation` and hands each Engine a writable lease (`KvPeerExporter`); each Engine imports every slab once through one `KvPeerReader` and reads / writes pages with it. |
 
 ## Run
 
@@ -58,17 +50,19 @@ Linker settings (`linker_extra_config`):
 | `read_only` | Restore only, never offload. |
 | `lease_ttl_ms` | Read pin deadline; a load that outlives it is abandoned and the request is recomputed. |
 | `audit_path` | Append per-lookup / load / offload timing as JSON lines. |
+| `num_blocks` | CTA budget of the copy kernel (default 64; 64 already reaches the ~210 GB/s C2C limit of an EGM source on GB200). |
+| `layers_per_group` | Layers per read group (default 1): a layer completes when its group lands; more layers per group cut the per-group host cost. |
 
 ## Semantics
 
 - **Write**: `alloc` skips keys any store already holds (domain-wide dedup) and
-  reserves slots in the write store; the Engine copies with one gather launch
-  and `commit`s. Reservations have a deadline; an expired slot is quarantined
+  reserves slots in the write store; the Engine writes the page objects with
+  one `kv_peer_read` write batch and `commit`s. Reservations have a deadline; an expired slot is quarantined
   before reuse so a late copy cannot land in someone else's object.
 - **Read**: a lookup asks every store in parallel and takes each page from the
   first holder (write store first). `acquire` pins the whole batch or nothing;
-  the Engine then gathers layer by layer on a private stream so the forward
-  overlaps the remaining layers. Any failure (missing key, store down, expired
+  the Engine then submits one read batch, a group per layer, and completes each
+  layer as its group lands, so the forward overlaps the remaining layers. Any failure (missing key, store down, expired
   pin) is reported to the Unified Cache wrapper, which recomputes the request.
 - **Liveness**: pins and reservations carry deadlines computed by the client
   before the RPC; the service reaps expired ones, so a stuck or vanished client

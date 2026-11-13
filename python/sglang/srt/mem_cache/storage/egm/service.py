@@ -4,9 +4,10 @@
 """Standalone EGM store service: one process owns one NUMA's EGM slab; Engines are clients.
 
 The service never touches KV payloads. It allocates slots, publishes objects and
-pins them for readers; clients import the slab once over CUDA Fabric and copy
-directly between their own device pool and the slab (reads and writes). Clients
-may run on other nodes of the same NVLink domain.
+pins them for readers; clients import the slab once over CUDA Fabric (one
+writable ``kv_peer_read`` lease per client) and copy directly between their own
+device pool and the slab (reads and writes). Clients may run on other nodes of
+the same NVLink domain.
 
 * Writes: ``alloc`` reserves one slot per new key (existing or in-flight keys are
   reported so the writer skips them, which is the cross-Engine dedup), the client
@@ -29,13 +30,14 @@ Control is line-delimited JSON over a Unix socket and/or TCP (one persistent
 connection per client thread). TCP clients must present the job secret in
 ``hello``. Usage::
 
-    EGM_NATIVE_LIB=libegm.so python -m sglang.srt.mem_cache.storage.egm.service \\
+    python -m sglang.srt.mem_cache.storage.egm.service \\
         --numa 0 --capacity-gib 64 --listen /tmp/egm-numa0.sock \\
         --tcp 0.0.0.0:29600 --secret-file /shared/job/egm.secret \\
         [--master tcp://10.0.0.1:29700 --advertise 10.0.0.2]
 """
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -50,7 +52,8 @@ from collections import Counter, OrderedDict
 
 logger = logging.getLogger(__name__)
 
-ALIGN = 64
+# kv_peer_read needs 128-byte aligned offsets and strides; a slot is a page object.
+ALIGN = 128
 EXISTS, FULL = -1, -2
 LEASE_TTL_MS = 10_000
 WRITE_TTL_MS = 30_000
@@ -301,7 +304,7 @@ class _Handler(socketserver.StreamRequestHandler):
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     def handle(self):
-        store, writes = self.server.store, set()
+        store, writes, leases = self.server.store, set(), set()
         # Unix-socket peers are already restricted by the socket file mode; TCP peers must prove the secret.
         authenticated = (
             self.server.secret is None or self.connection.family == socket.AF_UNIX
@@ -331,6 +334,15 @@ class _Handler(socketserver.StreamRequestHandler):
                         )
                     elif not authenticated:
                         raise PermissionError("hello with the job secret first")
+                    elif op == "lease":
+                        value = self.server.exports.lease(
+                            writable=bool(req.get("writable"))
+                        )
+                        leases.add(value["lease_id"])
+                    elif op == "unlease":
+                        leases.discard(req["lease_id"])
+                        self.server.exports.unlease(req["lease_id"])
+                        value = True
                     elif op == "exists":
                         value = store.exists(req["keys"])
                     elif op == "acquire":
@@ -360,12 +372,16 @@ class _Handler(socketserver.StreamRequestHandler):
                         value = True
                     elif op == "abort":
                         writes.discard(req["token"])
-                        store.abort(req["token"])
+                        store.abort(
+                            req["token"], quarantine=bool(req.get("quarantine"))
+                        )
                         value = True
                     elif op == "drop":
                         value = store.drop(req["keys"])
                     elif op == "stats":
-                        value = store.snapshot()
+                        value = dict(
+                            store.snapshot(), leases=self.server.exports.outstanding()
+                        )
                     else:
                         raise ValueError(f"unknown op {op!r}")
                     response = dict(ok=True, value=value)
@@ -382,6 +398,45 @@ class _Handler(socketserver.StreamRequestHandler):
                 store.abort(token, quarantine=True)
             if writes:
                 store.stats["orphan_writes"] += len(writes)
+            # The slab outlives every lease (it is freed only with the process), so a lease
+            # whose client vanished is released here without waiting for an unmap ACK.
+            for lease_id in leases:
+                self.server.exports.unlease(lease_id)
+
+
+class _SlabExports:
+    """kv_peer_read leases on the slab, one per importing client, all under the slab epoch."""
+
+    def __init__(self, *, slab, exporter, epoch):
+        self.slab, self.exporter, self.epoch = slab, exporter, epoch
+        self._lock = threading.Lock()
+        self._open = set()  # lease ids handed out and not yet released
+
+    def lease(self, *, writable):
+        with self._lock:
+            desc = self.exporter.export(
+                self.slab.handle,
+                self.slab.size,
+                region_id=self.epoch,
+                writable=writable,
+            )
+            self._open.add(desc.lease_id)
+        return dict(
+            lease_id=desc.lease_id,
+            epoch=self.epoch,
+            descriptor=base64.b64encode(desc.to_bytes()).decode(),
+        )
+
+    def unlease(self, lease_id):
+        """Idempotent: the client's ``unlease`` and its connection closing both land here."""
+        with self._lock:
+            if lease_id in self._open:
+                self._open.discard(lease_id)
+                self.exporter.release_export(lease_id)
+
+    def outstanding(self):
+        with self._lock:
+            return len(self._open)
 
 
 class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -402,10 +457,24 @@ def parse_address(address):
 
 
 class StoreClient:
-    """Engine-side client: one persistent control connection per thread, one imported slab per process."""
+    """Engine-side client: one persistent control connection per thread, one imported slab per process.
 
-    def __init__(self, address, device, secret=None, local_cluster_uuid=None):
+    The slab is imported through ``reader`` (a ``kv_peer_read.KvPeerReader`` on ``device``),
+    writable unless ``writable=False``; :meth:`close` unmaps it once no copy uses it.
+    """
+
+    def __init__(
+        self,
+        address,
+        device,
+        secret=None,
+        local_cluster_uuid=None,
+        *,
+        reader,
+        writable=True,
+    ):
         self.address, self.device, self.secret = address, device, secret
+        self.reader, self.region, self.lease_id = reader, None, None
         self._kind, self._target = parse_address(address)
         self._local = threading.local()
         self.descriptor = None
@@ -426,15 +495,35 @@ class StoreClient:
                 f"EGM store {address} on {self.host} is in NVLink domain {self.cluster_uuid}, this "
                 f"Engine in {local_cluster_uuid}: a Fabric slab cannot be imported across domains"
             )
-        from .region import Region
+        from sglang.srt.mem_cache.kv_peer_read import PeerRegionDescriptor
 
+        lease = self.rpc("lease", writable=writable)
+        desc = PeerRegionDescriptor.from_bytes(base64.b64decode(lease["descriptor"]))
+        if lease["epoch"] != self.epoch:
+            raise ConnectionError("EGM store service restarted with a new slab")
+        self.lease_id = lease["lease_id"]
         try:
-            self.region = Region(descriptor=self.descriptor, device=device)
-        except RuntimeError as error:
+            self.region = reader.import_region(desc, writable=writable)
+        except Exception as error:
+            self._unlease_quietly()
             raise RuntimeError(
                 f"importing the EGM slab of {address} ({self.host}) failed; both ends must share "
                 f"an NVLink domain and an IMEX channel: {error}"
             ) from error
+        self.slab_bytes = self.region.size
+
+    def close(self):
+        """Unmap the slab; the caller guarantees no batch through it is unreleased."""
+        if self.region is not None:
+            region, self.region = self.region, None
+            self.reader.unmap(region)
+            self._unlease_quietly()
+
+    def _unlease_quietly(self):
+        try:
+            self.rpc("unlease", lease_id=self.lease_id)
+        except (ConnectionError, RuntimeError, PermissionError):
+            pass  # The service drops a lease when its connection closes anyway.
 
     def _connect(self):
         if self._kind == "tcp":
@@ -532,8 +621,9 @@ class StoreClient:
     def commit(self, token):
         self.rpc("commit", token=token)
 
-    def abort(self, token):
-        self.rpc("abort", token=token)
+    def abort(self, token, quarantine=False):
+        """``quarantine=True`` when a copy into the reserved slots may still land."""
+        self.rpc("abort", token=token, quarantine=quarantine)
 
     def drop(self, keys):
         return self.rpc("drop", keys=list(keys))
@@ -670,13 +760,21 @@ def main():
         p.error("need --listen and/or --tcp")
     if (args.tcp or args.master) and not args.secret_file:
         p.error("--tcp and --master need --secret-file")
-    from .region import Region
+    import torch
+
+    from sglang.srt.mem_cache.kv_peer_read import KvPeerExporter
+    from sglang.srt.utils.cuda_vmm_utils import create_host_numa_allocation
 
     device = args.device if args.device is not None else 2 * args.numa
     capacity = int(args.capacity_gib * (1 << 30)) // ALIGN * ALIGN
-    region = Region(capacity, args.numa, tier="dram", device=device)
+    torch.cuda.set_device(device)
+    torch.cuda.init()  # a current context for the driver calls below
+    # Unmapped here: the service never touches the bytes, it only exports the handle.
+    slab = create_host_numa_allocation(capacity, args.numa)
+    epoch = uuid.uuid4().hex
+    exports = _SlabExports(slab=slab, exporter=KvPeerExporter(device), epoch=epoch)
     store = SlotStore(
-        region, capacity, args.lease_ttl_ms, args.write_ttl_ms, args.quarantine_ms
+        slab, capacity, args.lease_ttl_ms, args.write_ttl_ms, args.quarantine_ms
     )
     secret = open(args.secret_file).read().strip() if args.secret_file else None
     servers = []
@@ -689,16 +787,18 @@ def main():
         host, port = args.tcp.rsplit(":", 1)
         servers.append(_TcpServer((host, int(port)), _Handler))
     domain = cluster_uuid()
-    descriptor = region.descriptor()
+    # No FABRIC handle in hello: each client asks for its own lease (op "lease").
+    descriptor = dict(epoch=epoch, logical_bytes=capacity, allocation_bytes=slab.size)
     identity = _store_identity(
         args,
         numa=args.numa,
-        epoch=descriptor["epoch"],
+        epoch=epoch,
         capacity=capacity,
         domain=domain,
     )
     for server in servers:
         server.store, server.descriptor, server.numa = store, descriptor, args.numa
+        server.exports = exports
         server.secret, server.cluster_uuid = secret, domain
         server.store_id = identity["store_id"]
     if args.master:
