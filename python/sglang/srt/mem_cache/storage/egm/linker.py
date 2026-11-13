@@ -35,9 +35,10 @@ Placement and discovery:
 
 Data plane: ``kv_peer_read``. Each store slab is imported once, writable, through
 one ``KvPeerReader`` per Engine process. Loads pin every page (one lease per
-store), then submit one batch with a read group per layer (``layers_per_group``)
-and store; layer ``l`` completes as soon as its group lands, so the forward
-overlaps the remaining layers. Offloads run on their own thread: ``alloc``
+store), then submit one batch with read groups of ``layers_per_group`` layers
+per store ("auto": every layer in one group for a small load, else 4); layer
+``l`` completes as soon as its group lands, so the forward overlaps the
+remaining layers. Offloads run on their own thread: ``alloc``
 (skips keys already stored), one write batch of whole page objects, ``commit``.
 """
 
@@ -79,6 +80,18 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from .service import EXISTS, FULL, StoreClient, cluster_uuid
 
 logger = logging.getLogger(__name__)
+
+# Measured on Qwen2-1.5B (M19d): 32 pages (56 MiB) gain from one group, 256 pages (448 MiB) from 4 layers per group.
+_AUTO_SINGLE_GROUP_BYTES = 128 << 20
+_AUTO_LAYERS_PER_GROUP = 4
+
+
+def _chunks(num_layers, per_group):
+    return tuple(
+        tuple(range(first, min(first + per_group, num_layers)))
+        for first in range(0, num_layers, per_group)
+    )
+
 
 # kv_peer_read's alignment for page sizes, strides and offsets (PAGE_ALIGN_BYTES).
 _PAGE_ALIGN = 128
@@ -284,6 +297,7 @@ class EGMDirectLinker(UnifiedCacheLinker):
             "broadcast",
             "num_blocks",
             "layers_per_group",
+            "single_group_bytes",
         }
         if set(config) - allowed:
             raise ValueError(
@@ -321,11 +335,17 @@ class EGMDirectLinker(UnifiedCacheLinker):
         self.prefix = self._key_prefix(config["namespace"])
         # copy_mode is accepted for old launch configs; kv_peer_read has one copy path.
         self.num_blocks = int(config.get("num_blocks", 64))
-        per_group = int(config.get("layers_per_group", 1))
-        self._layer_chunks = tuple(
-            tuple(range(first, min(first + per_group, self.num_layers)))
-            for first in range(0, self.num_layers, per_group)
+        # "auto": a load up to single_group_bytes reads every layer in one group (each group costs
+        # Python-side host time that a small, CPU-bound prefill feels), a larger one 4 layers per group
+        # so the forward can start before the whole copy lands (measured on Qwen2-1.5B, M19d).
+        per_group = config.get("layers_per_group", "auto")
+        self._auto_groups = per_group == "auto"
+        per_group = _AUTO_LAYERS_PER_GROUP if self._auto_groups else int(per_group)
+        self._single_group_bytes = int(
+            config.get("single_group_bytes", _AUTO_SINGLE_GROUP_BYTES)
         )
+        self._layer_chunks = _chunks(self.num_layers, per_group)
+        self._one_chunk = _chunks(self.num_layers, self.num_layers)
         self._buffers_lock = threading.Lock()
         self._buffers = {}  # (direction, region id, residue, layers, space) -> buffer tuple
         self.audit_path = config.get("audit_path")
@@ -430,7 +450,10 @@ class EGMDirectLinker(UnifiedCacheLinker):
             broadcast=self.broadcaster is not None,
             data_plane="kv_peer_read",
             num_blocks=self.num_blocks,
-            layers_per_group=len(self._layer_chunks[0]),
+            layers_per_group="auto"
+            if self._auto_groups
+            else len(self._layer_chunks[0]),
+            single_group_bytes=self._single_group_bytes if self._auto_groups else None,
             stores=[
                 dict(store_id=c.store_id, address=a, host=c.host, numa=c.numa)
                 for c, a in zip(configured, addresses)
@@ -883,7 +906,13 @@ class EGMDirectLinker(UnifiedCacheLinker):
                 dst = [local[space[0]][pos[mask]] for space in spaces]
                 parts.append((client.region, residue, offsets[mask] // slot, dst))
         read_groups, layer_end = [], [0] * self.num_layers
-        for layers in self._layer_chunks:
+        chunks = self._layer_chunks
+        if (
+            self._auto_groups
+            and local.shape[1] * self.layout.object_bytes <= self._single_group_bytes
+        ):
+            chunks = self._one_chunk
+        for layers in chunks:
             for region, residue, src, dst in parts:
                 for space, dst_pages in zip(spaces, dst):
                     buffers = self._read_buffers(region, residue, layers, space)

@@ -51,7 +51,7 @@ Linker settings (`linker_extra_config`):
 | `lease_ttl_ms` | Read pin deadline; a load that outlives it is abandoned and the request is recomputed. |
 | `audit_path` | Append per-lookup / load / offload timing as JSON lines. |
 | `num_blocks` | CTA budget of the copy kernel (default 64; 64 already reaches the ~210 GB/s C2C limit of an EGM source on GB200). |
-| `layers_per_group` | Layers per read group (default 1): a layer completes when its group lands; more layers per group cut the per-group host cost. |
+| `layers_per_group` | Layers per read group, or `"auto"` (default): a load up to `single_group_bytes` (128 MiB) reads every layer in one group, a larger one 4 layers per group. A layer completes when its group lands; fewer groups cut the Python-side host cost a small, CPU-bound prefill feels. |
 
 ## Semantics
 
