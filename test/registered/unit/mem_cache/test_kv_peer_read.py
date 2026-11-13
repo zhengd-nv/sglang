@@ -1,6 +1,8 @@
 """Contract tests for the peer KV page reader, against a fake CUDA layer."""
 
 import contextlib
+import threading
+import time
 import unittest
 
 import numpy as np
@@ -13,8 +15,10 @@ from sglang.srt.mem_cache.kv_peer_read import (
     PeerReadError,
     PeerRegion,
     PeerRegionDescriptor,
+    PeerWriteBuffer,
     ReadGroup,
     ReadState,
+    WriteGroup,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -46,6 +50,12 @@ class FakeOps:
         self.fail_record = False
         self.fail_event_at = None  # new_event call that raises
         self.hold = False
+        self.hold_from = None  # events from this id on stay in flight until synced
+        self.synced = set()  # events a sync_event saw fire
+        self.gate = None  # a threading.Event that sync_event blocks on
+        self.staged = []  # the spans of every stage() call
+        self.maps = []  # read_only of every map_import() call
+        self.streams = 0
         self._next = 1 << 20
 
     def alloc(self, size, device, fill=0):
@@ -71,8 +81,9 @@ class FakeOps:
         self.handles[handle] = base
         return handle
 
-    def map_import(self, fabric_handle, size, device):
+    def map_import(self, fabric_handle, size, device, *, read_only):
         self.log.append("map")
+        self.maps.append(read_only)
         return self.handles[fabric_handle]  # alias the owner's bytes
 
     def unmap_import(self, address, size):
@@ -85,40 +96,37 @@ class FakeOps:
         return None
 
     def new_stream(self, device):
-        return "copy-stream"
+        self.streams += 1
+        return f"stream-{self.streams}"
 
     def wait_stream(self, stream, producer):
         self.log.append(("wait", producer))
 
-    def warmup(self, stream):
-        self.log.append("warmup")
+    def warmup(self, stream, *, load):
+        self.log.append("warmup" if load else "warmup-write")
 
     def current(self, stream):
         return contextlib.nullcontext()
 
-    def stage(self, stream, meta, slices):
+    def stage(self, stream, meta, spans):
         self.log.append("stage")
+        self.staged.append(list(spans))
         meta = meta.copy()
-        views = [
-            [
-                (page_bytes, *(meta[o : o + n] for o, n in launch_slices))
-                for page_bytes, launch_slices in group
-            ]
-            for group in slices
-        ]
-        return meta, views
+        return meta, [meta[o : o + n] for o, n, _ in spans]
 
     def launch(self, view):
         if self.fail_launch_at == self.launches:
             raise RuntimeError("launch failed")
         self.launches += 1
         self.log.append("launch")
-        page_bytes, src_bases, dst_bases, src_pages, dst_pages = view
-        for s, d in zip(src_bases.tolist(), dst_bases.tolist()):
-            for sp, dp in zip(src_pages.tolist(), dst_pages.tolist()):
-                self.pending.append(
-                    (s + sp * page_bytes, d + dp * page_bytes, page_bytes)
-                )
+        load, page_bytes, stride, peer_bases, local_bases, peer_pages, local_pages = (
+            view
+        )
+        for peer, local in zip(peer_bases.tolist(), local_bases.tolist()):
+            for pp, lp in zip(peer_pages.tolist(), local_pages.tolist()):
+                at_peer, at_local = peer + pp * stride, local + lp * page_bytes
+                copy = (at_peer, at_local) if load else (at_local, at_peer)
+                self.pending.append((*copy, page_bytes))
 
     def new_event(self, stream):
         if self.fail_event_at == self.num_events:
@@ -130,6 +138,8 @@ class FakeOps:
         if self.fail_record:
             raise RuntimeError("record failed")
         self.event_marks[event] = len(self.pending)
+        self.synced.discard(event)
+        self.log.append(("record", event, stream))
 
     def _land(self, upto):
         while self.landed < upto:
@@ -142,13 +152,19 @@ class FakeOps:
     def query_event(self, event):
         if event in self.event_codes:
             return self.event_codes[event]
-        if self.hold:
+        held = self.hold or (self.hold_from is not None and event >= self.hold_from)
+        if held and event not in self.synced:
             return NOT_READY
         self._land(self.event_marks[event])
         return OK
 
     def sync_event(self, event):
         self.log.append(("sync", event))
+        if self.gate is not None:
+            assert self.gate.wait(10), "gate never opened"
+        if self.sync_code == OK:
+            self._land(self.event_marks[event])
+            self.synced.add(event)
         return self.sync_code
 
     def destroy_event(self, event):
@@ -543,6 +559,309 @@ class TestRegionsAndLeases(PeerReadTestBase):
         self.assertEqual(self.exporter.outstanding("kv"), 1)
         self.exporter.release_export(second.lease_id)
         self.assertEqual(self.exporter.outstanding(), 0)
+
+
+class TestGroupWait(PeerReadTestBase):
+    def test_returns_once_that_group_landed(self):
+        self.ops.hold_from = 1  # group 1 stays in flight until a wait blocks on it
+        batch = self.reader.read(
+            [self.group([4], [0], layers=[0]), self.group([5], [1], layers=[1])]
+        )
+        status = self.reader.wait_group(batch, 0)
+        self.assertEqual((status.state, status.groups_done), (ReadState.IN_FLIGHT, 1))
+        self.assertNotIn(("sync", 0), self.ops.log)  # it had landed: no blocking
+        self.assertEqual(self.dst_page(0, 0), self.src_page(0, 4))
+        self.assertEqual(self.dst_page(1, 1), b"\xee" * PAGE)
+        status = self.reader.wait_group(batch, 1)
+        self.assertIn(("sync", 1), self.ops.log)
+        self.assertEqual((status.state, status.groups_done), (ReadState.SUCCESS, 2))
+        self.assertEqual(self.dst_page(1, 1), self.src_page(1, 5))
+        self.reader.release(batch)
+
+    def test_blocked_waiter_holds_no_lock_and_pins_its_batch(self):
+        """A thread blocked on a group must not stop other threads from submitting or
+        polling, and the batch must not be released (its event recycled) under it."""
+        self.ops.hold_from = 0
+        self.ops.gate = threading.Event()
+        batch = self.reader.read([self.group([0], [0])])
+        results = []
+        waiter = threading.Thread(
+            target=lambda: results.append(self.reader.wait_group(batch, 0))
+        )
+        waiter.start()
+        deadline = time.monotonic() + 10
+        while ("sync", 0) not in self.ops.log:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(1e-3)
+        other = self.reader.read([self.group([1], [1])])  # takes the lock
+        self.ops.hold_from = None
+        self.assertEqual(self.reader.status(batch).state, ReadState.SUCCESS)
+        with self.assertRaises(PeerReadBusy):
+            self.reader.release(batch)
+        self.ops.gate.set()
+        waiter.join(10)
+        self.assertEqual(results[0].state, ReadState.SUCCESS)
+        self.reader.release(batch)
+        self.assertEqual(self.reader.wait(other).state, ReadState.SUCCESS)
+        self.reader.release(other)
+
+    def test_a_failed_earlier_group_ends_the_wait(self):
+        self.ops.event_codes[0] = NON_STICKY
+        batch = self.reader.read([self.group([0], [0]), self.group([1], [1])])
+        status = self.reader.wait_group(batch, 1)
+        self.assertEqual(
+            (status.state, status.groups_done), (ReadState.FAILED_DRAINED, 0)
+        )
+        self.reader.release(batch)
+
+    def test_timeout_polls_and_keeps_everything(self):
+        self.ops.hold = True
+        batch = self.reader.read([self.group([0], [0]), self.group([1], [1])])
+        with self.assertRaises(TimeoutError):
+            self.reader.wait_group(batch, 0, timeout=0)
+        self.assertNotIn(("sync", 0), self.ops.log)  # never blocks in the driver
+        with self.assertRaises(IndexError):
+            self.reader.wait_group(batch, 2)
+        with self.assertRaises(PeerReadBusy):
+            self.reader.release(batch)
+
+
+class TestPerBatchCost(PeerReadTestBase):
+    @staticmethod
+    def pointer_spans(spans):
+        return sum(pointer for _, _, pointer in spans)
+
+    def test_address_tables_go_up_once_per_buffer_tuple(self):
+        """Once a buffer tuple's address tables are resident, a batch stages only its
+        page arrays: layer-wise reads must not pay a table upload per group."""
+        group = self.group([0], [0])
+        for src, dst in ((0, 0), (1, 1)):
+            batch = self.reader.read(
+                [ReadGroup(group.buffers, np.array([src]), np.array([dst]))]
+            )
+            self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
+            self.reader.release(batch)
+        self.assertEqual([self.pointer_spans(s) for s in self.ops.staged], [2, 0])
+        self.assertEqual(self.dst_page(1, 1), self.src_page(1, 1))
+
+    def test_tables_go_up_again_after_a_failed_enqueue(self):
+        """An enqueue that failed may not have run its upload; the next batch must not
+        launch on those tables."""
+        group = self.group([0], [0])
+        self.ops.fail_launch_at = 0
+        with self.assertRaises(RuntimeError):
+            self.reader.read([group])
+        self.ops.fail_launch_at = None
+        batch = self.reader.read(
+            [ReadGroup(group.buffers, np.array([2]), np.array([2]))]
+        )
+        self.assertEqual([self.pointer_spans(s) for s in self.ops.staged], [2, 2])
+        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
+        self.assertEqual(self.dst_page(1, 2), self.src_page(1, 2))
+
+    def test_events_are_recycled_only_from_successful_batches(self):
+        first = self.reader.read([self.group([0], [0])])
+        self.reader.wait(first)
+        self.reader.release(first)
+        made = self.ops.num_events
+        failing = self.reader.read([self.group([1], [1])])
+        self.assertEqual(self.ops.num_events, made)  # the released event came back
+        self.ops.event_codes[0] = NON_STICKY
+        self.assertEqual(self.reader.wait(failing).state, ReadState.FAILED_DRAINED)
+        self.reader.release(failing)
+        self.assertIn(("destroy", 0), self.ops.log)  # a failed event is never reused
+        self.reader.read([self.group([2], [2])])
+        self.assertEqual(self.ops.num_events, made + 1)
+
+
+# Page objects as an EGM store lays them out: each slot holds one page of every
+# buffer, at that buffer's item offset; GAP bytes after each item belong to nobody.
+ITEMS = (256, 128)
+GAP = 128
+ITEM_OFF = (0, ITEMS[0] + GAP)
+OBJECT = sum(ITEMS) + GAP * len(ITEMS)
+INSIDE = (ITEM_OFF[0], ITEM_OFF[0] + 128)  # item 1 placed inside item 0
+
+
+class PageObjectTestBase(unittest.TestCase):
+    SLOTS = 6
+
+    def setUp(self):
+        self.ops = FakeOps()
+        self.slab_bytes = self.SLOTS * OBJECT
+        self.slab = self.ops.alloc(self.slab_bytes, OWNER_DEV, fill=0x5A)
+        buf, _ = self.ops.allocs[self.slab]
+        for slot in range(self.SLOTS):
+            for item, size in enumerate(ITEMS):
+                at = slot * OBJECT + ITEM_OFF[item]
+                buf[at : at + size] = bytes([slot, item]) * (size // 2)
+        self.local = [
+            self.ops.alloc(self.SLOTS * size, READER_DEV, fill=0xEE) for size in ITEMS
+        ]
+        self.exporter = KvPeerExporter(OWNER_DEV, _ops=self.ops)
+        self.reader = KvPeerReader(READER_DEV, _ops=self.ops)
+
+    def import_slab(self, writable=False, size=None):
+        desc = self.exporter.export(
+            self.slab, size or self.slab_bytes, region_id="slab", writable=writable
+        )
+        return self.reader.import_region(desc, writable=writable)
+
+    def local_page(self, item, page):
+        size = ITEMS[item]
+        return self.ops.read(self.local[item] + page * size, size)
+
+    def fill_local(self):
+        for item, size in enumerate(ITEMS):
+            buf, _ = self.ops.allocs[self.local[item]]
+            for page in range(self.SLOTS):
+                buf[page * size : (page + 1) * size] = bytes([0xA0 + page, item]) * (
+                    size // 2
+                )
+
+    def read_group(self, region, src_pages, dst_pages, stride=OBJECT):
+        buffers = tuple(
+            PeerBuffer(
+                src_region=region,
+                src_offset=ITEM_OFF[item],
+                dst_base=self.local[item],
+                page_bytes=size,
+                dst_num_pages=self.SLOTS,
+                src_stride=stride,
+            )
+            for item, size in enumerate(ITEMS)
+        )
+        return ReadGroup(buffers, np.array(src_pages), np.array(dst_pages))
+
+    def write_group(self, region, src_pages, dst_pages, items=(0, 1), offsets=ITEM_OFF):
+        buffers = tuple(
+            PeerWriteBuffer(
+                dst_region=region,
+                dst_offset=offsets[item],
+                src_base=self.local[item],
+                page_bytes=ITEMS[item],
+                src_num_pages=self.SLOTS,
+                dst_stride=OBJECT,
+            )
+            for item in items
+        )
+        return WriteGroup(buffers, np.array(src_pages), np.array(dst_pages))
+
+
+class TestSourceStride(PageObjectTestBase):
+    def test_items_of_page_objects_land_in_their_buffers(self):
+        """Page p of a buffer is read at p * object size from the buffer's item offset:
+        items of one object go to different buffers and gap bytes are not copied."""
+        region = self.import_slab()
+        batch = self.reader.read([self.read_group(region, [4, 0], [1, 5])])
+        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
+        for item, size in enumerate(ITEMS):
+            for slot, page in ((4, 1), (0, 5)):
+                self.assertEqual(
+                    self.local_page(item, page), bytes([slot, item]) * (size // 2)
+                )
+            for page in (0, 2, 3, 4):
+                self.assertEqual(self.local_page(item, page), b"\xee" * size)
+
+    def test_each_buffer_bounds_the_source_pages(self):
+        """The bound is per buffer: when the region ends inside the last object, its
+        first item still fits but the slot is out of range for the batch."""
+        short = (self.SLOTS - 1) * OBJECT + ITEM_OFF[1]
+        region = self.import_slab(size=short)
+        batch = self.reader.read([self.read_group(region, [self.SLOTS - 2], [0])])
+        self.reader.wait(batch)
+        self.reader.release(batch)
+        launches = self.ops.launches
+        with self.assertRaises(ValueError):
+            self.reader.read([self.read_group(region, [self.SLOTS - 1], [1])])
+        for stride in (ITEMS[0] // 2, OBJECT + 64):  # shorter than a page; misaligned
+            with self.assertRaises(ValueError):
+                self.reader.read([self.read_group(region, [0], [1], stride=stride)])
+        self.assertEqual(self.ops.launches, launches)
+
+
+class TestWrites(PageObjectTestBase):
+    def test_pages_land_in_their_slots_and_spare_everything_else(self):
+        """A write scatters each local page into its item of the destination object;
+        other slots and the gaps between items keep their bytes."""
+        self.fill_local()
+        expected = bytearray(self.ops.allocs[self.slab][0])
+        region = self.import_slab(writable=True)
+        batch = self.reader.write([self.write_group(region, [2, 5], [3, 0])])
+        self.assertEqual(self.reader.wait(batch).state, ReadState.SUCCESS)
+        for item, size in enumerate(ITEMS):
+            for page, slot in ((2, 3), (5, 0)):
+                at = slot * OBJECT + ITEM_OFF[item]
+                expected[at : at + size] = bytes([0xA0 + page, item]) * (size // 2)
+        self.assertEqual(bytes(self.ops.allocs[self.slab][0]), bytes(expected))
+        self.reader.release(batch)
+        self.reader.unmap(region)
+
+    def test_writing_needs_a_writable_lease_and_import(self):
+        read_only = self.exporter.export(self.slab, self.slab_bytes, region_id="slab")
+        with self.assertRaises(ValueError):
+            self.reader.import_region(read_only, writable=True)
+        region = self.reader.import_region(read_only)
+        with self.assertRaises(ValueError):
+            self.reader.write([self.write_group(region, [0], [0])])
+        self.assertNotIn("warmup-write", self.ops.log)
+        granted = self.exporter.export(
+            self.slab, self.slab_bytes, region_id="slab", writable=True
+        )
+        self.reader.import_region(granted)  # least privilege unless asked
+        start = len(self.ops.log)
+        self.import_slab(writable=True)
+        self.assertEqual(self.ops.log[start:], ["warmup-write", "map"])
+        self.import_slab(writable=True)
+        self.assertEqual(self.ops.maps, [True, True, False, False])
+        self.assertEqual(self.ops.log.count("warmup-write"), 1)
+
+    def test_in_flight_writes_conflict_on_the_allocation_not_the_mapping(self):
+        """Two leases of one allocation are one destination: the same item of the same
+        slot is busy through either mapping; another slot or item is not."""
+        self.fill_local()
+        first, second = self.import_slab(writable=True), self.import_slab(writable=True)
+        self.ops.hold = True
+        self.reader.write([self.write_group(first, [0], [3])])
+        with self.assertRaises(PeerReadBusy):
+            self.reader.write([self.write_group(second, [1], [3])])
+        self.reader.write([self.write_group(second, [1], [4])])
+        self.reader.write([self.write_group(first, [2], [5], items=(0,))])
+        self.reader.write([self.write_group(second, [3], [5], items=(1,))])
+        with self.assertRaises(PeerReadBusy):
+            self.reader.write([self.write_group(second, [4], [5], items=(0,))])
+        with self.assertRaises(
+            PeerReadBusy
+        ):  # another key, but inside item 0 of slot 5
+            self.reader.write(
+                [self.write_group(first, [4], [5], items=(1,), offsets=INSIDE)]
+            )
+
+    def test_overlapping_writes_within_a_batch_are_caller_errors(self):
+        region = self.import_slab(writable=True)
+        with self.assertRaises(ValueError):
+            self.reader.write(
+                [
+                    self.write_group(region, [0], [2]),
+                    self.write_group(region, [1], [2]),
+                ]
+            )
+        with self.assertRaises(ValueError):
+            self.reader.write([self.write_group(region, [0], [1], offsets=INSIDE)])
+        with self.assertRaises(ValueError):  # a slot past the region
+            self.reader.write([self.write_group(region, [0], [self.SLOTS])])
+        self.assertEqual(self.ops.launches, 0)
+
+    def test_reads_and_writes_run_on_separate_streams(self):
+        """A long write-through must not delay a later read: each direction has its
+        own stream, so neither queues behind the other."""
+        self.fill_local()
+        region = self.import_slab(writable=True)
+        self.ops.hold = True
+        self.reader.write([self.write_group(region, [0], [1])])
+        self.reader.read([self.read_group(region, [2], [3])])
+        streams = [entry[2] for entry in self.ops.log if entry[0] == "record"]
+        self.assertEqual(len(set(streams)), 2)
 
 
 if __name__ == "__main__":
