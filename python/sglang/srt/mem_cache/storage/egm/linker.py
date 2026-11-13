@@ -1150,14 +1150,14 @@ class EGMDirectLinker(UnifiedCacheLinker):
     def _write_pages(self, client, rows, offsets):
         """Scatter whole page objects into the store's reserved slots; returns once they landed."""
         status = self._finish_batch(
-            self.reader.write(self._write_plan(client.region, rows, offsets))
+            self.reader.write(self._write_groups(client.region, rows, offsets))
         )
         if status.state == ReadState.FAILED_UNCERTAIN:
             raise _UncertainCopy(status.error)
         if status.state != ReadState.SUCCESS:
             raise RuntimeError(f"EGM write failed: {status.state.value} {status.error}")
 
-    def _write_plan(self, region, rows, offsets):
+    def _write_groups(self, region, rows, offsets):
         """WriteGroups for pages at ``rows`` going to the slots at byte ``offsets`` of ``region``."""
         local = self.layout.local_pages(rows)
         slot = self.layout.slot_bytes
