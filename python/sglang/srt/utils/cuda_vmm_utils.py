@@ -10,6 +10,7 @@ import time
 from functools import cache
 from typing import Any, List, Optional
 
+import msgspec
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -1097,6 +1098,115 @@ def unmap_fabric_import(va: int, size: int) -> None:
     drv = _get_cuda_driver()
     check_drv(drv.cuMemUnmap(int(va), int(size)), "cuMemUnmap(import)")
     check_drv(drv.cuMemAddressFree(int(va), int(size)), "cuMemAddressFree(import)")
+
+
+class HostNumaAllocation(msgspec.Struct, frozen=True):
+    """Pinned host memory of one NUMA node, e.g. Grace memory a GPU reaches over C2C (EGM)."""
+
+    handle: Any  # CUmemGenericAllocationHandle; export it like a device allocation
+    size: int  # a multiple of granularity
+    numa_id: int
+    granularity: int
+    address: int = 0  # mapped VA in this process; 0 when not mapped
+    devices: tuple[int, ...] = ()  # GPUs with read-write access to address
+
+
+def get_device_host_numa_id(device_id: int) -> int:
+    """The host NUMA node a GPU is attached to, or -1 when the driver cannot tell."""
+    drv = _get_cuda_driver()
+    check_drv(drv.cuInit(0), "cuInit")
+    device = check_drv(drv.cuDeviceGet(int(device_id)), "cuDeviceGet")
+    err, numa_id = drv.cuDeviceGetAttribute(
+        drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device
+    )
+    return int(numa_id) if err == drv.CUresult.CUDA_SUCCESS else -1
+
+
+def make_host_numa_allocation_prop(numa_id: int, *, fabric: bool = True):
+    """A pinned allocation on host NUMA node ``numa_id``, FABRIC-exportable when ``fabric``."""
+    drv = _get_cuda_driver()
+    handle_types = drv.CUmemAllocationHandleType
+    prop = drv.CUmemAllocationProp()
+    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+    prop.location.id = int(numa_id)
+    prop.requestedHandleTypes = (
+        handle_types.CU_MEM_HANDLE_TYPE_FABRIC
+        if fabric
+        else handle_types.CU_MEM_HANDLE_TYPE_NONE
+    )
+    return prop
+
+
+def create_host_numa_allocation(
+    nbytes: int, numa_id: int, *, devices=(), fabric: bool = True
+) -> HostNumaAllocation:
+    """Allocate ``nbytes``, rounded up to the granularity, on host NUMA node ``numa_id``.
+
+    With ``devices`` the allocation is also mapped here, read-write for those GPUs;
+    the owner needs that only to fill or inspect the bytes, not to export them. The
+    driver accepts a node only when this process sees a GPU attached to it. Every
+    step is rolled back on failure. Undo with :func:`release_host_numa_allocation`
+    once no lease on it is outstanding.
+    """
+    drv = _get_cuda_driver()
+    prop = make_host_numa_allocation_prop(numa_id, fabric=fabric)
+    minimum = drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+    granularity = max(
+        get_allocation_granularity(prop), get_allocation_granularity(prop, minimum)
+    )
+    size = align_up(nbytes, granularity)
+    if size <= 0:
+        raise ValueError("nbytes must be positive")
+    devices = tuple(int(d) for d in devices)
+    handle = check_drv(drv.cuMemCreate(size, prop, 0), "cuMemCreate(HOST_NUMA)")
+    va = None
+    mapped = False
+    try:
+        if devices:
+            va = int(
+                check_drv(
+                    drv.cuMemAddressReserve(size, granularity, 0, 0),
+                    "cuMemAddressReserve(HOST_NUMA)",
+                )
+            )
+            check_drv(drv.cuMemMap(va, size, 0, handle, 0), "cuMemMap(HOST_NUMA)")
+            mapped = True
+            access = [make_rw_access_desc(d) for d in devices]
+            check_drv(
+                drv.cuMemSetAccess(va, size, access, len(access)),
+                "cuMemSetAccess(HOST_NUMA)",
+            )
+    except BaseException as error:
+        if mapped and drv.cuMemUnmap(va, size)[0] != drv.CUresult.CUDA_SUCCESS:
+            error.add_note("cuMemUnmap(HOST_NUMA rollback) also failed")
+        if va is not None:
+            drv.cuMemAddressFree(va, size)
+        drv.cuMemRelease(handle)
+        raise
+    return HostNumaAllocation(
+        handle=handle,
+        size=size,
+        numa_id=int(numa_id),
+        granularity=granularity,
+        address=va or 0,
+        devices=devices,
+    )
+
+
+def release_host_numa_allocation(allocation: HostNumaAllocation) -> None:
+    """Undo :func:`create_host_numa_allocation`; no access or lease may remain."""
+    drv = _get_cuda_driver()
+    if allocation.address:
+        check_drv(
+            drv.cuMemUnmap(allocation.address, allocation.size),
+            "cuMemUnmap(HOST_NUMA)",
+        )
+        check_drv(
+            drv.cuMemAddressFree(allocation.address, allocation.size),
+            "cuMemAddressFree(HOST_NUMA)",
+        )
+    check_drv(drv.cuMemRelease(allocation.handle), "cuMemRelease(HOST_NUMA)")
 
 
 class VmmGraphInputManager:
