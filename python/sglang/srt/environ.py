@@ -684,6 +684,9 @@ class Envs:
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
     # target's sliding window; ignored (with the reason logged) where it does not apply.
     SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
+    # Experimental startup-only GLM DSA pool; does not enable L1 sharing or TP coordination.
+    SGLANG_GLM_DSA_FIXED_FABRIC_POOL = EnvBool(False)
+    SGLANG_GLM_DSA_COALESCED_FABRIC_POOL = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission

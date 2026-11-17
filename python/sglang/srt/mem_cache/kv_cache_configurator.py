@@ -579,6 +579,16 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if (
+            envs.SGLANG_GLM_DSA_COALESCED_FABRIC_POOL.get()
+            and not envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get()
+        ):
+            raise ValueError(
+                "SGLANG_GLM_DSA_COALESCED_FABRIC_POOL requires "
+                "SGLANG_GLM_DSA_FIXED_FABRIC_POOL"
+            )
+        if envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get():
+            self._validate_fixed_fabric_launch()
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
@@ -2403,6 +2413,31 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _validate_fixed_fabric_launch(self):
+        parallel, memory = get_parallel(), get_memory()
+        if (
+            self.model_config.hf_config.architectures != ["GlmMoeDsaForCausalLM"]
+            or not self.use_mla_backend
+            or not self.spec_algorithm.is_none()
+            or self.is_draft_worker
+            or parallel.attn_cp_size != 1
+            or parallel.attn_dcp_size != 1
+            or parallel.attn_dp_size != 1
+            or parallel.pp_size != 1
+            or self.is_hybrid_swa
+            or memory.enable_unified_memory
+            or memory.enable_page_major_kv_layout
+            or memory.enable_hisparse
+            or get_exec().features.enable_memory_saver
+            or envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
+            or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python"
+        ):
+            raise ValueError(
+                "SGLANG_GLM_DSA_FIXED_FABRIC_POOL requires GLM DSA, Python URC, "
+                "fixed startup sizing, ordinary per-layer pools; "
+                "CP/DCP/DP/PP/MTP, HiSparse, memory saver and hybrid layouts unsupported"
+            )
+
     def _build_dsa_kv_pool(
         self,
         *,
@@ -2417,6 +2452,13 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
+        if envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get():
+            if dsa_pool_class is not DSATokenToKVPool:
+                raise ValueError("fixed FABRIC backing requires the built-in DSA pool")
+            pool_kwargs["fixed_fabric_pool"] = True
+            pool_kwargs["coalesced_fabric_pool"] = (
+                envs.SGLANG_GLM_DSA_COALESCED_FABRIC_POOL.get()
+            )
         if self.kv_shard_rank is not None:
             if dsa_cp_layer_shard_rank is not None or get_memory().enable_hisparse:
                 raise ValueError(
