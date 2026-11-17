@@ -3728,6 +3728,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rmpv",
  "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tonic",
