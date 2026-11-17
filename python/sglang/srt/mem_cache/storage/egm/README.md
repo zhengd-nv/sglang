@@ -45,24 +45,30 @@ Linker settings (`linker_extra_config`):
 |---|---|
 | `stores` | Store addresses: a Unix socket path or `tcp://host:port`. Required. |
 | `write_store` | Index into `stores` that offloads go to (default 0). |
+| `master` | Domain master address (`tcp://host:port`). Lookups and pre-write dedup become one master RPC, the Engine connects to every store the master lists, and pages that do not fit the write store go to a store the master places them on. Falls back to asking every store when the master is down. |
+| `refresh_s` | With `master`: how often to poll store membership and re-import restarted stores (default 1.0 s). |
 | `secret_file` | Job secret for TCP stores. |
 | `namespace` | Part of every key; must differ between models or weight versions. Required. |
 | `read_only` | Restore only, never offload. |
+| `broadcast` | Replicated pools (MLA / DSA) under TP: rank 0 reads and broadcasts each layer to the other ranks, so the store's entry GPU sends one copy per Engine. |
 | `lease_ttl_ms` | Read pin deadline; a load that outlives it is abandoned and the request is recomputed. |
 | `audit_path` | Append per-lookup / load / offload timing as JSON lines. |
 | `num_blocks` | CTA budget of the copy kernel (default 64; 64 already reaches the ~210 GB/s C2C limit of an EGM source on GB200). |
 | `layers_per_group` | Layers per read group, or `"auto"` (default): a load up to `single_group_bytes` (128 MiB) reads every layer in one group, a larger one 4 layers per group. A layer completes when its group lands; fewer groups cut the Python-side host cost a small, CPU-bound prefill feels. |
+| `single_group_bytes` | Threshold for `layers_per_group: "auto"` (default 128 MiB). |
 
 ## Semantics
 
 - **Write**: `alloc` skips keys any store already holds (domain-wide dedup) and
-  reserves slots in the write store; the Engine writes the page objects with
+  reserves slots in the write store (with a master: without evicting first, then
+  on the store the master places them on, and only then in the write store with
+  LRU eviction); the Engine writes the page objects with
   one `kv_peer_read` write batch and `commit`s. Reservations have a deadline; an expired slot is quarantined
   before reuse so a late copy cannot land in someone else's object.
-- **Read**: a lookup asks every store in parallel and takes each page from the
-  first holder (write store first). `acquire` pins the whole batch or nothing;
-  the Engine then submits one read batch, a group per layer, and completes each
-  layer as its group lands, so the forward overlaps the remaining layers. Any failure (missing key, store down, expired
+- **Read**: a lookup asks the master, or without one every store in parallel,
+  and takes each page from the first holder (write store first). `acquire` pins the whole batch or nothing;
+  the Engine then submits one read batch in groups of `layers_per_group` layers
+  and completes each layer as its group lands, so the forward overlaps the remaining layers. Any failure (missing key, store down, expired
   pin) is reported to the Unified Cache wrapper, which recomputes the request.
 - **Liveness**: pins and reservations carry deadlines computed by the client
   before the RPC; the service reaps expired ones, so a stuck or vanished client
@@ -72,9 +78,15 @@ Linker settings (`linker_extra_config`):
 
 - One NVLink domain. The client compares `ClusterUUID` with each store and
   refuses to start across domains (FABRIC import is not permitted there).
-- FULL MHA KV pools, TP1 / PP1 only. Overlap scheduling has only been tested off.
-- No capacity borrowing: when the write store is full the page is not written.
-- Lookups and dedup cost one RPC per configured store; fine for a few nodes,
-  a directory or key-hash routing is needed for a full 18-node domain.
-- Page-granular LRU can evict the head of a prefix and leave its tail stranded.
-- A restarted service is not re-imported by running Engines; restart them too.
+- Pools indexed by KV pages only: FULL MHA, MLA and DSA (including the compact
+  DSA indexer layout). TP is supported; PP, attention CP, Mamba hybrids and SWA
+  are not. MTP draft layers are not offloaded.
+- Without a master, lookups and dedup cost one RPC per configured store, there is
+  no capacity borrowing, and a restarted service is not re-imported by running
+  Engines. A master fixes all three; one master handles the 36 stores of a full
+  NVL72 domain (control plane measured, end to end only on two nodes).
+- Eviction is page-granular LRU and happens only in the writer's own store: it
+  can evict the head of a prefix and leave its tail stranded, and a store filled
+  by spill-over is never refreshed.
+- A failed load is recomputed except under chunked prefill and PD prefill, where
+  the request still fails with 503.

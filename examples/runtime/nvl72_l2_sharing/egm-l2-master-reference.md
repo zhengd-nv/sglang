@@ -1,6 +1,6 @@
 # EGM L2 sharing 的 master service：参考实现、实测与对 KVCM 的建议
 
-2026-11-05
+2026-11-05（2026-11-12 补 4.4 生产层数据，2026-11-16 换成新数据面的恢复延迟）
 
 ## 1. 背景与问题
 
@@ -100,6 +100,37 @@ store 与 Engine 之间的操作（`acquire` / `release` / `alloc` / `commit` / 
 - **上报成本低**：约 5.1 万新 key/s 的写透上报只占 master 0.35 核，且不影响查找延迟。
 
 （参考实现是单进程 Python，以上是它的数字，不代表 C++ 实现的上限。）
+
+### 4.4 生产层：GLM-5.2-NVFP4，TP4（2026-11-10 补）
+
+一个节点四张卡起一个 TP4 Engine，同一套 store + master。GLM-5.2 是 DSA 模型，每页一个对象装 latent KV 与 indexer K，约 3 MB / 页。
+对照是 sglang 自带的 HiCache（每个 rank 把 KV 存在本 rank 的主机内存里）。
+
+**恢复延迟**：perf128k 形状（前缀 90% 命中，输出 512 token），比「从 L2 恢复」与「同一 Engine 本地 HBM 命中」的平均 TTFT 之比：
+
+| 场景 | 本参考实现（从 EGM 恢复）| HiCache（write_through，从本 rank 主机内存恢复）|
+|---|---|---|
+| 128K × 8 并发 | 1.084 | 1.116 |
+| 256K × 2 并发 | 1.044 | 1.062 |
+| 512K × 2 并发 | 1.027 | 1.044 |
+
+- 两者差距都在 0.03 以内。从 L2 恢复比整段重算省掉约 80% 的 TTFT。
+- 数据面是 sglang 的 `kv_peer_read`（2026-11-15 复测）；最初的自带 native 库为 1.094 / 1.067 / 1.038。master 与 store 的控制面两版相同。
+- 512K 前缀一次恢复 7200 页（约 22 GB），读取约 121 ms（native 库约 140 ms）；**master 查找 7200 个 key 约 15 ms**，约占 TTFT 的 1%。这与 4.3 的「成本按 key 计」一致：对 KVCM 来说，长前缀的查找延迟是需要单独给出的数字。
+
+**真实多轮负载**（Claude Code 会话回放，平均输入约 75K token，32 并发，900 s，单 Engine；native 库数据面）：
+
+| | 主机内存 | 完成请求 | 输出 tok/s | ITL p99 |
+|---|---|---|---|---|
+| 本参考实现（2 × 300 GiB EGM store + master）| 644 GB | 693 | 482 | 33 ms |
+| HiCache 160 GB / rank | 640 GB | 691 | 473 | 68 ms |
+| HiCache 100 GB / rank（sglang cookbook 配置）| 400 GB | 535 | 350 | 85 ms |
+| 不开 L2 | — | 360 | 212 | 136 ms |
+
+- 同样的主机内存下两者吞吐持平。TP4 时 HiCache 每个 rank 各存一份相同的 KV，所以每单位主机内存的有效容量约是本实现的 1/4；这一负载的单 Engine 工作集放得下，这项差别没有体现在吞吐上。
+- 精度：gsm8k（1319 题）由一个新 Engine 每题从 EGM 恢复前缀后作答，准确率 80.4%，与不开 L2 的 80.4% 相同。
+  gsm8k 的提示只有 1–2 页；长前缀（到 32K token）的正确性另在 GLM-5.2 前 8 层的裁剪模型上用 teacher-forced logprob 核对（TP1 / TP2 / TP4），
+  恢复与重算的差与重算自身的波动同量级。
 
 ## 5. 对 KVCM 的建议
 

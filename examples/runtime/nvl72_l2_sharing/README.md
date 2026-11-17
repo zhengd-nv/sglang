@@ -18,7 +18,7 @@
 | store | Mooncake Store：一个 master（带 HTTP 元数据服务）加每 NUMA 一个 EGM provider，只在节点 0 上 | 每个节点每 NUMA 一个 EGM store 服务（`sglang.srt.mem_cache.storage.egm.service`）|
 | 写到哪 | master 分配（本示例只有节点 0 有 provider）| 本节点、本 NUMA 的 store；配了 master 时，本地不淘汰就放不下的页写到 master 选的 store |
 | 怎么找到 | 问 master | 并行问所有 store，本节点优先；配了 master 时一次 RPC 问 master |
-| 数据面 | Mooncake Transfer Engine 的 nvlink transport（`cudaMemcpyBatchAsync`）| 读方 / 写方 GPU 自己发 gather kernel，每层一次 |
+| 数据面 | Mooncake Transfer Engine 的 nvlink transport（`cudaMemcpyBatchAsync`）| sglang 的 `kv_peer_read`：读方 / 写方 GPU 自己发拷贝 kernel，读按层分组提交 |
 | 依赖 | 从源码构建 Mooncake（带补丁），CMake 约 8 分钟 | CUDA driver、cuda-python；数据面是 sglang 的 `kv_peer_read`（JIT kernel，首次使用时编译），不用预先构建 |
 | 端口 | master RPC、HTTP 元数据、metrics、每个进程一个 Transfer Engine 端口 | 每个 store 一个 TCP 端口（带作业密钥）；master 一个 |
 | 全局能力 | master 统一分配、全局去重、高水位淘汰、跨节点借容量 | 跨 store 去重；配了 master 时加上目录、成员与存活、按空闲放置（跨节点借容量）。淘汰始终在各 store 内 |
@@ -89,16 +89,17 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 
 **读到 HBM**：
 1. 按 store 分组，每个 store 一次 `acquire`：整批 key 都在才加 Pin 并返回各自在 slab 里的偏移，缺任何一个就整批失败（走重算）。Pin 带截止时间：客户端在发 RPC 前取本机时间加 TTL。
-2. 各 store 的 slab 在服务启动时已经导入过一次（FABRIC handle 经 `hello` 拿到），这里不再导入。linker 用 numpy 一次算出每页每层的源地址（slab 基址 + 偏移 + 层偏移）和目的地址（私有页槽），
-   每层发一次 gather kernel（本服务的 GPU 直接从对方 EGM 读，经 NVLink），层后记一个 event。
-3. 加载线程按层等 event、核对截止时间、推进层计数器；超时就不再推进，请求走重算。全部完成后 `release` 去 Pin。
+2. 各 store 的 slab 在服务启动时已经经 `kv_peer_read` 导入过一次（FABRIC handle 经 `hello` 拿到，每个服务进程一个可写的 `KvPeerReader`），这里不再导入。
+   linker 把命中的页提交成一个读批次，按层分组：一次加载不超过 128 MiB 时全部层一组，更大时每 4 层一组（`layers_per_group`，默认 `auto`）。
+   本服务的 GPU 直接从对方 EGM 读进私有页槽，经 NVLink。分组是为了摊薄每组的 host 开销：小加载一组最快，大加载分组后 forward 不必等整段拷完。
+3. 加载线程按组等完成、核对截止时间，推进该组各层的层计数器；超时就不再推进，请求走重算。全部完成后 `release` 去 Pin。
 
 **写入，确定目标**：
 1. 跨 store 去重：并行问其它 store，已经在别处的页不写（所以本示例里 reader 读回的页不会再写一份）。
 2. 其余页只写 `EGM_STORES` 的第一个，即本节点、本 GPU 所在 NUMA 的 store：写入只经过本 NUMA 的 C2C，不占别的节点的入口 GPU。**不会写到别的 store**。
-3. `alloc`：store 对已存在或正被别人写的 key 回「已存在」，其余预留槽位并给出偏移与截止时间；linker 用一次 gather kernel 从 GPU 页拷进 slab，确认没过截止时间后 `commit`，store 这时才让别人查到。失败或超时则 `abort`。
+3. `alloc`：store 对已存在或正被别人写的 key 回「已存在」，其余预留槽位并给出偏移与截止时间；linker 用一次 `kv_peer_read` 写批次把整页对象从 GPU 拷进 slab，确认没过截止时间后 `commit`，store 这时才让别人查到。失败或超时则 `abort`。
 
-**写入，容量**：每个 store 的容量在启动时固定（`POOL_GIB`，默认每 NUMA 64 GiB），按对象大小（64 B 对齐）切成槽位。
+**写入，容量**：每个 store 的容量在启动时固定（`POOL_GIB`，默认每 NUMA 64 GiB），按对象大小（128 B 对齐，`kv_peer_read` 的要求）切成槽位。
 分配顺序：空闲表 → 未用过的空间 → **淘汰本 store 里最久未用、没被 Pin 的同尺寸对象**。都没有（全被 Pin）时这页回 FULL、不写。
 过期或被放弃的预留先隔离 60 s 再复用，防止迟到的拷贝落进已被重新分配的槽位。
 容量只在本 store 内回收，不会借别的节点：一个节点写得多，就在本地淘汰旧页，即使别的节点的 store 还空着（与 Mooncake 的差别见「局限」）。
@@ -110,11 +111,14 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 | `[HiCache] Direct linker pool group for plain MHA KV` | 让 direct external linker 支持普通 MHA 模型（上游 main 只覆盖 DSv4 / DSA / Mamba），拒绝 DCP 与打包的 draft KV |
 | `[Feature] Unified Cache: Recompute requests whose external linker load fails` | store 读失败时撤回请求并重算（`--unified-cache-external-linker-load-failure`，默认 `recompute`），而不是返回 503 |
 | `[HiCache] Direct linker: group layers per range read and keep reads in flight` | Mooncake linker 按层读取时把几层合成一次调用（`load_layers_per_call`），并让多次调用同时在途（`load_inflight`）；默认 1 / 1 即原行为，本示例用 4 / 2 |
-| `[HiCache] EGM store service and direct linker` | `python/sglang/srt/mem_cache/storage/egm/`：`egm` 后端的 store 服务、linker（经 `dynamic` linker 后端加载）与 native 库，见该目录的 README |
+| `[HiCache] EGM store service and direct linker` | `python/sglang/srt/mem_cache/storage/egm/`：`egm` 后端的 store 服务与 linker（经 `dynamic` linker 后端加载），见该目录的 README。最初的数据面是自带的 native 库，后来换成 `kv_peer_read`（见下）|
 | `[HiCache] EGM: domain master for store membership, prefix directory and placement` 及其后两个修复 | `egm/master.py`：可选的域内 master（只管元数据：成员与存活、key 到 store 的目录、放置）；linker 配了 `master` 时一次 RPC 查找，本地 store 写满时溢出到 master 选的 store。本示例不起 master |
 | `[HiCache] EGM linker: page objects over every KV-indexed pool, TP ranks` | 一页一个对象装全部以 KV 页为索引的池（MLA / DSA：latent KV + indexer K），支持 TP（复制池只有 rank 0 写，可选 rank 0 读后逐层广播）|
 | `[HiCache] EGM linker: keep the audit file open` | linker 的计时日志只打开一次文件（每条重新打开在网络文件系统上约 0.6 ms，其中一条在调度线程上）|
 | `[HiCache] Direct linker: keep the compact DSA indexer layout` | 开 linker 时 DSA 仍为 shared-topk 层省略 indexer K（之前每层都分配，GPU 的 KV 池小 14–16%）；direct linker 的 indexer 池只登记有 indexer K 的层，`egm` 页对象跳过其余层 |
+| `[VMM] Export, import and unmap a single FABRIC allocation ...` 到 `[KV] Report a self-overlapping read as ValueError ...`（4 个）| 上游 PR [#49474](https://github.com/sgl-project/sglang/pull/49474) 的 `kv_peer_read`：经 FABRIC 导入另一个 Engine 的 KV 页，用 JIT 拷贝 kernel 经 NVLink 按页读取、按组完成 |
+| `[VMM] Allocate FABRIC-exportable host memory on a NUMA node`、`[KV] Page objects, shared writes and per-group waits ...`、`[KV] Trust only the reader's record ...` | 在 #49474 上补 EGM 需要的部分：EGM（HOST_NUMA）作为源、源端步长（整页对象）、写方向与多个写入方共享写、按组等待 |
+| `[HiCache] EGM: move the store and linker data plane to kv_peer_read` 及其后两个提交 | store 用 `create_host_numa_allocation` 分配 slab、每个 Engine 用一个 `KvPeerReader` 读写，原 native 库删除；槽位改为 128 B 对齐；读组按加载大小自动分（`layers_per_group` 默认 `auto`）|
 | `egm-l2-master-reference.md` | EGM L2 sharing 的 master 参考实现：分工、协议、实测与对 KVCM 的扩展建议 |
 | `examples/runtime/nvl72_l2_sharing/` | 本示例 |
 | `mooncake-nvlink-grouped-scatter.patch` | Mooncake 补丁：NVLink transport 把一次 scatter 作为一个 task 处理。不打的话每个 32 KiB 的页片段要单独轮询，负载下恢复 16k token 前缀约 70 ms 而不是 43 ms（不含 linker 分组）|
@@ -126,7 +130,7 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 - 本分支对应的 SGLang nightly 容器，例如 `lmsysorg/sglang:nightly-dev-cu13-20261102-38d9e4a3`；
   本分支装进去，或者把 `<repo>/python` 放在 `PYTHONPATH` 最前面。
 - 一个两个节点都能看到的目录（下文的 `WORK`），放构建产物、作业密钥与运行日志。
-- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）；`egm` 另在 `nvidia/GLM-5.2-NVFP4` TP4 上测过多轮回放与精度（见「实测」）。
+- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）；`egm` 另在 `nvidia/GLM-5.2-NVFP4` TP4 上测过恢复延迟、多轮回放与精度，以及两个节点各一个 Engine 的跨 Engine sharing 与 store 写满后的稳态（见「实测」）。
 
 ## 1. 构建（一次，在容器里）
 
@@ -218,6 +222,8 @@ DEMO_RESULT PASS prefix=16384 writer_cold=...ms reader_from_pool=...ms reader_ca
 
 ## 实测（GB200）
 
+`egm` 的数据面中途从自带的 native 库换成了 `kv_peer_read`。下文注明了每组数字用的是哪一版；换版前后在同一作业里对照过，新版不慢（见各节）。
+
 Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8 路并发流式负载，reader 循环恢复前缀 60 s，
 数值是负载下恢复延迟 p50 / p99（ms）。
 
@@ -232,7 +238,9 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 - 长前缀 `egm` 快约 3.6 ms：它每层一次 gather kernel，不受页片段数影响；Mooncake 按片段提交批量拷贝，片段多时驱动工作会拖慢本服务的 kernel 发射。
 - 这张表与下面单节点表里 `egm` 的数字都偏高：当时 linker 每条计时记录都重新打开一次日志文件，日志在网络文件系统上，每次约 0.6 ms，其中一次在调度线程上（`[HiCache] EGM linker: keep the audit file open` 已修正）。
   修正后同一作业、同一对节点上复测（`egm` 开 master，本节点）：2048 为 13.7 / 23.0（`mooncake` 14.6 / 16.9），16384 为 19.2 / 31.4（`mooncake` 25.0 / 27.7）。
-  所以短前缀上 `egm` 并不比 `mooncake` 慢，此前「多两次 RPC」的解释不成立（查找 RPC 约 0.25 ms，Pin 在加载线程里与 prefill 重叠）；`egm` 的 p99 仍更高，原因未查。
+  所以短前缀上 `egm` 并不比 `mooncake` 慢，此前「多两次 RPC」的解释不成立（查找 RPC 约 0.25 ms，Pin 在加载线程里与 prefill 重叠）。
+- 以上 `egm` 的数字都是 native 库数据面。换成 `kv_peer_read` 后，同一作业新旧交替（ABBA）对照：2048 为 14.0 ms（旧 13.7–13.9），16384 为 19.4–19.5 ms（旧 19.3–19.6），
+  p99 低约 25–30%；2048 的 p99 为 16.8–16.9 ms，与 `mooncake` 相当，此前 `egm` p99 偏高的问题不再出现。
 - writer 开 write-through 后吞吐下降：`mooncake` 约 2%，`egm` 修正后复测约 3%，两者之差与两次不开写透的基线之差（约 2%）同量级。
   `egm` 的 offload 线程只忙 2–4%，写前去重命中（几乎不拷贝）时损失也不变，推断损失在两种后端共用的 SGLang 写透记账上。写本节点与写另一节点没有可分辨的差别。
 
@@ -253,9 +261,25 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 | writer，前缀在自己的 GPU 缓存里 | 58 ms | 58 ms |
 | reader，前缀从另一个节点的 Grace 内存读回 | 66 ms | 65 ms |
 
+### 生产模型：恢复延迟（GLM-5.2-NVFP4，TP4，单节点）
+
+上面是机理层的数字（小模型、合成前缀）。这里用生产模型看从 store 恢复长前缀比 GPU 缓存命中慢多少：
+前缀 90% 命中、输出 512 token，比较同一个服务上「前缀被填充请求挤出 GPU 后从 L2 恢复」与「前缀还在 GPU 缓存里」的平均 TTFT 之比（每个场景 3 轮）。
+服务按部署默认（overlap、CUDA Graph、chunked prefill 16384、fp8 KV），上下文 512K。`egm` 每 NUMA 一个 150 GiB store 加 master，rank 0 读后广播；
+对照是 HiCache 160 GB/rank（从本 rank 主机内存恢复），为与 `egm` 同策略比较用 write_through（cookbook 是 write_back）。
+
+| 场景 | `egm`（`kv_peer_read`）| `egm`（native 库）| HiCache |
+|---|---|---|---|
+| 128K 前缀 × 并发 8 | **1.084** | 1.094 | 1.116 |
+| 256K 前缀 × 并发 2 | **1.044** | 1.067 | 1.062 |
+| 512K 前缀 × 并发 2 | **1.027** | 1.038 | 1.044 |
+
+- 从 EGM 恢复与 HiCache 从本 rank 主机内存恢复一样快；相对整段重算，TTFT 省掉约 80%。
+- 512K 前缀一次读回 7200 页（约 22 GB）约 121 ms（native 库 141 ms）；master 查找 7200 个 key 约 15 ms，约占 TTFT 的 1%。
+
 ### 生产模型：多轮 agentic 回放与 gsm8k（GLM-5.2-NVFP4，TP4，单节点）
 
-上面是机理层的数字（小模型、合成前缀）。这里换成生产模型和真实负载：用 SemiAnalysis 的
+本节数字用的是 native 库数据面。这里换成生产模型和真实负载：用 SemiAnalysis 的
 [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness)（aiperf 的分支）回放真实的 Claude Code 会话，
 多轮、带 subagent、保留轮间的思考时间，比较 `egm` 与 SGLang 自带的 HiCache（本地主机内存 L2）的吞吐与延迟；再用 gsm8k 检查从 store 读回的 KV 会不会影响精度。
 
@@ -343,17 +367,66 @@ SGLang 不为 DSA 的 shared-topk 层省略 indexer K，同样 47.4 GB 的 KV �
 在 GLM-5.2 的 8 层截断版（TP4）上核对过：开不开 linker KV 池相同；从 store 读回后（rank 0 读后广播，或各 rank 各读）尾部 token 的 logprob 与 GPU 缓存命中、从零重算的差别在同一量级（约 0.1–0.4）。
 页对象布局变了，`egm` 的 key 前缀随之改变，新旧对象不会混用；`mooncake` linker 的 key 不含布局，改版前后不要共用同一个 Mooncake store。
 
+### 生产模型：两个 Engine 跨节点共享（GLM-5.2-NVFP4，TP4 × 2）
+
+单个 Engine 时 `egm` 与同样主机内存的 HiCache 持平；跨 Engine 共享才是 L2 sharing 的增量。这里同一个 NVL72 域的两个节点各起一个 TP4 Engine，前面一个 `sglang_router`（0.3.2），
+agentx 回放同上（256k 语料），并发 64（每个 Engine 平均 32，与单 Engine 相同），测 900 s。router 分两种策略：
+
+- **随机**：同一会话的相邻轮次随机落到两个 Engine 上。HiCache 的主机层只有本 Engine 写过的前缀。
+- **cache_aware**：按前缀亲和路由，HiCache 的常规部署。
+
+`egm`：节点 A 起 master，每个节点 2 × 300 GiB store，linker 只配本节点的 store 加 master，写本节点 NUMA 0；另一个节点的 store 经 master 发现。
+HiCache：160 GB/rank，cookbook 参数（write_back），每节点主机内存 640 GB，与 `egm` 的 644 GB 相当。同一对节点先跑 `egm` 再跑 HiCache。
+每种路由跑了两次（两对不同的节点），第一次用 native 库数据面，第二次用 `kv_peer_read`。下表是第二次（两个 Engine 合计，测量阶段）：
+
+| | 随机：`egm` | 随机：HiCache | 亲和：`egm` | 亲和：HiCache |
+|---|---|---|---|---|
+| 完成请求 | **1079** | 629 | **1137** | 1081 |
+| 输出吞吐（tok/s）| **936**（1.83×）| 511 | **953**（1.09×）| 873 |
+| 两个 Engine 的前缀命中 | 90.5% / 89.8% | 57.1% / 53.9% | 91.0% / 90.0% | 86.7% / 87.7% |
+| 每个会话的中位 TTFT，跨会话 p50 / p90（s）| **24.6 / 54.3** | 84.0 / 126.4 | 39.7 / **46.5** | **36.5** / 47.7 |
+| 全部请求的 TTFT p90 / p99（s）| **76.7 / 111.1** | 139.7 / 157.0 | **52.9 / 65.6** | 56.6 / 79.7 |
+| ITL p50 / p99（ms）| **12.0 / 39.6** | 15.4 / 97.7 | **12.0 / 35.2** | 13.2 / 47.6 |
+
+- 第一次的吞吐：随机 904 vs 524 tok/s（1.73×），亲和 960 vs 895（1.07×），方向相同。
+- **随机路由**：`egm` 命中仍有 90%，读入的页约一半来自另一个节点的 store，写透时约一半的页另一节点已有、不再写。HiCache 掉到 54–57%。
+- **亲和路由**：HiCache 回到约 87%，`egm` 仍多 9% 吞吐，尾部 TTFT 与 ITL p99 更低；每个会话的中位 TTFT 两次分别高约 25% 与 9%，是 `egm` 唯一不领先的指标，波动较大。
+- `egm` 随机路由的吞吐（904–936 tok/s）与 HiCache 亲和路由（873–895）相当：用 `egm` 时吞吐不再依赖亲和路由。
+- 这一负载没有把整个域写满：每个节点的 NUMA 0 store 在测量中写满后经 master 溢出到 NUMA 1，结束时全域约 820 / 1200 GiB，没有发生淘汰。
+
+### 生产模型：store 写满后的稳态
+
+长期运行时 store 一定会满。同上的随机路由负载只跑 `egm`，把 store 调小到全域写满：每个 store 78 GiB（全域 312 GiB，约是上面 HiCache 两节点主机内存的四分之一，
+与 HiCache 160 GB/rank 在 TP4 下的有效容量相当），或 40 GiB（全域 160 GiB，每个 store 比一个 Engine 的 GPU KV 池还小）。
+两种容量在同一对节点上先后跑，两次运行用两对节点、先后顺序相反；数据面 `kv_peer_read`。
+
+| | 完成请求 | 输出吞吐（tok/s）| 两个 Engine 的前缀命中 | 每个会话的中位 TTFT p50 / p90（s）| warmup（s）|
+|---|---|---|---|---|---|
+| `egm` 1200 GiB（未满，上一节）| 1079 | 936 | 90% | 24.6 / 54.3 | 356 |
+| `egm` 312 GiB | 615–653 | 516–582 | 45–64% | 13.2–45.6 / 131–163 | 1311–1314 |
+| `egm` 160 GiB | 484–504 | 405–408 | 29–47% | 119–146 / 180–187 | 1589–1594 |
+| HiCache 160 GB/rank（三次运行）| 625–658 | 511–524 | 54–60% | 57–87 / — | 1070–1159 |
+
+- 全域写满后命中率从 90% 掉到一半左右，吞吐降约 40%。但用约四分之一的主机内存时，`egm` 的吞吐与 HiCache 持平或略高：每单位主机内存的有效容量约是 HiCache 的 4 倍（TP4 下 HiCache 每个 rank 各存一份）。
+- 满载下每个写入方本地的 store 每次运行淘汰 33–64 万页，加载失败与请求出错都是 0：「查找命中、Pin 时已被淘汰」在这一负载下没有出现。
+- **淘汰只发生在写入方本地的 store 上**（写入顺序：本 NUMA 0 不淘汰 → master 选的空闲 store 不淘汰 → 本 NUMA 0 按页 LRU 淘汰）。NUMA 1 被早期溢出写满后不再变化，
+  却提供了 39–65% 的读入页；NUMA 0 上同一前缀被反复淘汰、重写，去重很少。说明保住先写入的页有价值，前缀感知淘汰与跨 store 的淘汰是下一步的候选。
+- 每种容量两次运行之间吞吐相差 0.7–13%；两个节点的命中率相差 2–19 个百分点，高的一侧在各次运行间互换。
+
 ## 局限
 
 - 只能在一个 NVL72 域内用。跨域导入另一个节点的 fabric 内存会失败（CUDA 800，not permitted）；
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
 - 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」），
-  并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过多轮回放与 gsm8k（见「实测」，单节点）；PD 分离和投机解码都没测过。
+  并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过恢复延迟、多轮回放、gsm8k 与两个节点的跨 Engine 共享（见「实测」）；端到端只在两个节点上跑过，PD 分离没测过。
+- 数据面换成 `kv_peer_read` 后，本示例的 `run_slurm.sh` 演示（Qwen2，`BACKEND=egm`）还没在当前提交上重跑；同一套 store 与 linker 在「实测」的复测中跑通。
+- linker 不覆盖 MTP 的 draft 层：所有负载测试都没开 MTP（cookbook 的 GLM-5.2 配方默认开）。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
+- 开 external linker 时，解码单步偶尔慢约 12%（GLM-5.2 上 `egm` 吞吐因此比 HiCache 低 2–4%），空 linker 也会出现、HiCache 与不开 offload 没出现过，原因未查明。
 - `egm` 不起 master 时（本示例）：查找与写前去重每次都要问所有 store，适合几个节点；只写本节点的 store，满了在本地淘汰，不借别的节点的容量；store 服务重启后，已运行的服务要一起重启。
   起 master 后这三点都有解（一次 RPC 查找、本地放不下时溢出到 master 选的 store、按成员刷新重新导入重启的 store），一个 master 实测撑得住整个域的 36 个 store，见 [`egm-l2-master-reference.md`](egm-l2-master-reference.md)。
-  两种情况下按页 LRU 都可能先淘汰前缀的头几页。
+  两种情况下按页 LRU 都可能先淘汰前缀的头几页。起 master 时只有写入方本地的 store 会淘汰，其余 store 被溢出写满后不再更新（见「store 写满后的稳态」）。
 
 ## 排查
 
@@ -361,7 +434,7 @@ SGLang 不为 DSA 的 shared-topk 层省略 indexer K，同样 47.4 GB 的 KV �
 |---|---|
 | `start_store.sh` 报 `mooncake_master exited` | 该节点上元数据（18080）、RPC（50051）或 metrics（19003）端口被占。设 `METADATA_PORT` / `MASTER_PORT` / `METRICS_PORT`，`start_server.sh` 也设同样的 `METADATA_PORT` / `MASTER_PORT` |
 | provider 或 EGM store 报 `invalid argument` | 它看不到所在 NUMA 的入口 GPU。`PROVIDER_GPUS` 保持全部 GPU |
-| provider 或 EGM store 报 EGM 分配失败（`CUDA result 2` / out of memory）| 该节点这块 NUMA 上空闲内存不够分配 pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 `POOL_GIB` |
+| provider 或 EGM store 报 EGM 分配失败（`CUDA result 2` / out of memory）| 该节点这块 NUMA 上空闲内存不够分配 pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 `POOL_GIB`。300 GiB 的 store 偶尔在账面空闲比申请多约 65 GiB 时也会失败（11 次中 1 次），原因未查，换节点即可 |
 | 服务启动时报 `is in NVLink domain ..., this Engine in ...` | `egm`：列表里有别的 NVL72 域的 store。两个节点不在一个域，Slurm 上加 `--segment` |
 | 服务启动时报 `bad or missing secret` | `egm`：两边用的不是同一个 `SECRET_FILE` |
 | 重启的服务报 `Duplicate rpc_meta key` | `mooncake`：上一个实例被杀时没有注销 transfer-engine 端点。换一个 `TE_PORT` 或重启 master |
