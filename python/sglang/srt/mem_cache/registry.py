@@ -237,6 +237,7 @@ def create_unified_radix_cache(
             components=set(cache.components),
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
+        linker.bind_tree_cache(ctx, cache)
         cache.init_cache_linker(linker)
         counter = linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()

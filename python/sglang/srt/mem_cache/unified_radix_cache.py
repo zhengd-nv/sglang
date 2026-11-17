@@ -244,6 +244,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.disable = params.disable
         identity = cpu_page_identity(params.token_to_kv_pool_allocator)
         if identity is not None:
+            if (
+                tuple(params.tree_components or ()) != (ComponentType.FULL,)
+                or params.is_eagle
+                or params.mtp_draft_device_pools
+                or params.mtp_draft_mamba_pools
+            ):
+                raise ValueError(
+                    "SlotGuard v1 requires Full-only KV without MTP/SWA/Mamba"
+                )
             self.req_to_token_pool.attach_cpu_page_identity(identity.page_rows)
 
         if params.enable_metrics:
@@ -302,6 +311,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
+        if identity is not None and self._tree_core_backend != "python":
+            raise ValueError(
+                "SlotGuard CPU page provenance requires the Python tree core"
+            )
         # A disabled tree holds nothing, so it reports no KV events and never
         # evicts; its eviction policy config is not built or validated.
         tree_params = (
@@ -556,6 +569,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if cpu_page_identity(self.token_to_kv_pool_allocator) is not None:
+            raise ValueError("SlotGuard v1 does not support HiCache L2/L3")
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}

@@ -61,6 +61,10 @@ from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.cache_scheduler_hooks import (
+        CacheSchedulerHooks,
+    )
+    from sglang.srt.mem_cache.registry import TreeCacheBuildContext
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -173,6 +177,36 @@ class PrefetchContext(msgspec.Struct, frozen=True, kw_only=True):
     features: frozenset[str] = frozenset()
 
 
+class PrefetchAllocationOwner(ABC):
+    """Takes and publishes prefetched pages in steps every TP rank runs together.
+
+    A linker whose allocator histories must match across ranks returns one
+    from `UnifiedCacheLinker.prefetch_allocation_owner`.
+    """
+
+    @abstractmethod
+    def allocating(self) -> bool:
+        """Whether a common allocation step is open; lookups finish after it."""
+
+    @abstractmethod
+    def faulted(self) -> bool:
+        """Whether a failed common step fenced the owner on every rank."""
+
+    @abstractmethod
+    def allocate(
+        self, request: CacheRequestHandle, num_tokens: int, body: Callable[[], bool]
+    ) -> bool:
+        """Run ``body`` in a common step when every rank admits ``num_tokens``.
+
+        ``body`` takes the slots and returns whether every transfer got them;
+        returns False, without running ``body``, when a rank cannot admit.
+        """
+
+    @abstractmethod
+    def finish(self, request: CacheRequestHandle, body: Callable[[], None]) -> None:
+        """Run ``body``, which publishes or frees the slots, in a common step."""
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools.
 
@@ -257,6 +291,20 @@ class UnifiedCacheLinker(ABC):
 
     def poll_prefetch(self) -> None:
         """Bounded owner-thread progress; must not wait for RPCs or CUDA."""
+
+    def bind_tree_cache(
+        self, ctx: TreeCacheBuildContext, cache: UnifiedRadixCache
+    ) -> None:
+        """Called once on the scheduler thread after ``cache`` is built,
+        before the cache wraps this linker."""
+
+    def prefetch_allocation_owner(self) -> Optional[PrefetchAllocationOwner]:
+        """Who takes prefetched pages; None takes them on each rank alone."""
+        return None
+
+    def scheduler_hooks(self) -> Optional[CacheSchedulerHooks]:
+        """Scheduler steps this linker runs in lockstep across TP ranks."""
+        return None
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -410,6 +458,7 @@ class UnifiedCacheLinkerWrapper:
             CacheRequestHandle, tuple[NodeId, DecLockRefParams]
         ] = {}
         self.request_prefetch = cache_linker.request_prefetch is True
+        self.prefetch_allocation_owner = cache_linker.prefetch_allocation_owner()
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -427,6 +476,9 @@ class UnifiedCacheLinkerWrapper:
     @property
     def layer_done_counter(self) -> object:
         return self.cache_linker.layer_done_counter
+
+    def scheduler_hooks(self) -> Optional[CacheSchedulerHooks]:
+        return self.cache_linker.scheduler_hooks()
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
@@ -666,6 +718,11 @@ class UnifiedCacheLinkerWrapper:
             for request, state in self.prefetches.items()
             if state.looking_up
         ]
+        owner = self.prefetch_allocation_owner
+        if owner is not None and owner.allocating():
+            # Batch selection can poll completions inside an allocation epoch;
+            # lookup-to-load allocates, so it waits for the next outer tick.
+            lookup_pending = []
         if lookup_pending:
             ready = torch.tensor(
                 [
@@ -731,7 +788,8 @@ class UnifiedCacheLinkerWrapper:
         state.looking_up = False
         end = state.device_hit_len + pages * self.cache.page_size
         state.key = state.key[:end]
-        try:
+
+        def allocate():
             for component in self._components:
                 transfer = component.build_external_linker_transfer(
                     LinkerTransferPhase.LOAD, None, state.hashes[:pages]
@@ -739,7 +797,21 @@ class UnifiedCacheLinkerWrapper:
                 if transfer is None:
                     break
                 state.component_transfers.append((component, transfer))
-            if len(state.component_transfers) == len(self._components):
+            return len(state.component_transfers) == len(self._components)
+
+        owner = self.prefetch_allocation_owner
+        if (
+            owner is None
+            and cpu_page_identity(self.cache.token_to_kv_pool_allocator) is not None
+        ):
+            raise RuntimeError("guarded external prefetch has no allocation owner")
+        try:
+            allocated = (
+                allocate()
+                if owner is None
+                else owner.allocate(request, pages * self.cache.page_size, allocate)
+            )
+            if allocated:
                 transfers = [transfer for _, transfer in state.component_transfers]
                 if self.request_prefetch:
                     state.load_future = self.cache_linker.prefetch_request(
@@ -748,6 +820,8 @@ class UnifiedCacheLinkerWrapper:
                 else:
                     state.load_future = self.cache_linker.prefetch(transfers)
         except Exception:
+            if owner is not None and owner.faulted():
+                raise
             logger.warning("External linker prefetch submission failed", exc_info=True)
         accepted = torch.tensor([state.load_future is not None], dtype=torch.int)
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
@@ -755,6 +829,16 @@ class UnifiedCacheLinkerWrapper:
             self._cancel_prefetch(request)
 
     def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
+        owner = self.prefetch_allocation_owner
+        if owner is None:
+            return self._finish_prefetch_impl(request, publish=publish)
+        return owner.finish(
+            request, lambda: self._finish_prefetch_impl(request, publish=publish)
+        )
+
+    def _finish_prefetch_impl(
+        self, request: CacheRequestHandle, *, publish: bool
+    ) -> None:
         state = self.prefetches.pop(request, None)
         if state is None:
             return

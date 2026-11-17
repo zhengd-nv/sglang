@@ -260,6 +260,9 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.cache_scheduler_hooks import (
+    CacheSchedulerHooks,
+)
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -530,6 +533,9 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # Set by maybe_init_cache_scheduler_hooks; None runs every step on this
+    # rank alone, as for stub schedulers built via __new__.
+    cache_scheduler_hooks: Optional[CacheSchedulerHooks] = None
 
     def __init__(
         self,
@@ -778,6 +784,8 @@ class Scheduler(
         self.init_grammar_manager()
 
         self.maybe_init_scripted_scheduler_hook()
+
+        self.maybe_init_cache_scheduler_hooks()
 
         self.maybe_init_mm_feature_receive_budget()
 
@@ -2403,6 +2411,16 @@ class Scheduler(
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        if self.cache_scheduler_hooks is not None:
+            self.cache_scheduler_hooks.on_requests_received(
+                paused=self.pause_state.paused or self.gracefully_exit,
+                batches=(
+                    self.running_batch,
+                    self.last_batch,
+                    *(batch for batch, _ in self.result_queue),
+                ),
+                chunked_req=self.chunked_req,
+            )
 
         # A runtime PD role switch rebuilt the disaggregation structures for a new
         # role. The response has already been sent above; now break out of the
@@ -2580,6 +2598,11 @@ class Scheduler(
             )
         else:
             self.scripted_scheduler_hook = None
+
+    def maybe_init_cache_scheduler_hooks(self) -> None:
+        """Take the lockstep hooks an external cache linker installs, if any."""
+        if self.enable_unified_cache_external_linker:
+            self.cache_scheduler_hooks = self.tree_cache.linker.scheduler_hooks()
 
     def _hosts_rust_server(self) -> bool:
         """Whether this scheduler rank embeds the Rust server (rank 0 only) —
@@ -4529,11 +4552,20 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
-        prepared = self._prepare_new_batch_prefill(running_batch)
+        hooks = self.cache_scheduler_hooks
+        prepare = partial(self._prepare_new_batch_prefill, running_batch)
+        prepared = prepare() if hooks is None else hooks.agree_prefill_entry(prepare)
         if prepared is None:
             return None, running_batch
-        new_batch, adder, allocation = self._allocate_new_batch_prefill(
-            running_batch, prepared, prefill_delayer_single_pass, allocation_only=False
+        allocate = partial(
+            self._allocate_new_batch_prefill,
+            running_batch,
+            prepared,
+            prefill_delayer_single_pass,
+            allocation_only=hooks is not None,
+        )
+        new_batch, adder, allocation = (
+            allocate() if hooks is None else hooks.run_prefill_allocation(allocate)
         )
         if new_batch is None:
             return None, running_batch
@@ -5384,6 +5416,8 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        if self.cache_scheduler_hooks is not None:
+            self.cache_scheduler_hooks.assert_ready_for_forward()
         launch = self._on_step_launch(batch)
 
         if self.forward_sleep_time is not None:
@@ -6318,6 +6352,16 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        reset_pools = partial(self._flush_cache_pools, empty_cache=empty_cache)
+        if self.cache_scheduler_hooks is None:
+            return reset_pools()
+        return self.cache_scheduler_hooks.flush(
+            idle=self.is_fully_idle(ignore_waiting=self.pause_state.paused),
+            paused=self.pause_state.paused or self.gracefully_exit,
+            reset_pools=reset_pools,
+        )
+
+    def _flush_cache_pools(self, *, empty_cache: bool) -> bool:
         if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None

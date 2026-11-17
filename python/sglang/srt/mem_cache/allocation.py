@@ -406,6 +406,8 @@ def alloc_for_extend(
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
     prefix_page_spans = _prefix_kv_page_spans(batch)
     identity = cpu_page_identity(batch.tree_cache.token_to_kv_pool_allocator)
+    if identity is not None and batch.is_dllm():
+        raise ValueError("SlotGuard v1 does not support DLLM KV row reuse")
 
     reuse_kv = None
     if batch.is_dllm():
@@ -555,6 +557,8 @@ def alloc_for_extend(
             offset += local_count
         out_cache_loc = torch.cat(outputs) if outputs else out_cache_loc.new_empty((0,))
     if identity is not None:
+        if alloc_page_size <= 1:
+            raise ValueError("SlotGuard v1 requires paged KV allocation")
         for row, prefix, extension in zip(
             req_pool_indices, prefix_page_spans, identity.last_allocation_spans
         ):
