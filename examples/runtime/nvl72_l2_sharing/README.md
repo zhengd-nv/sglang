@@ -253,13 +253,15 @@ Qwen2-1.5B、TP1、page size 64、开 CUDA Graph、关 overlap。writer 上跑 8
 
 **Mooncake 各项改动的贡献**（16384 前缀，负载下 p50，单节点，跨作业）：原版 70.0 ms → grouped-scatter 补丁 42.9 ms → 再加 linker 分组与在途 24.5 ms。
 
-两个节点上空闲时各一次运行（16384 token 前缀，生成 16 个 token，每个数值都含解码；两列是不同作业、不同节点对）：
+两个节点上空闲时各一次运行（16384 token 前缀，生成 16 个 token，每个数值都含解码；各列是不同作业、不同节点对）：
 
-| 请求 | mooncake | egm |
-|---|---|---|
-| writer，冷 prefill | 118 ms | 114 ms |
-| writer，前缀在自己的 GPU 缓存里 | 58 ms | 58 ms |
-| reader，前缀从另一个节点的 Grace 内存读回 | 66 ms | 65 ms |
+| 请求 | mooncake | egm（native 库）| egm（`kv_peer_read`）|
+|---|---|---|---|
+| writer，冷 prefill | 118 ms | 114 ms | 113 ms |
+| writer，前缀在自己的 GPU 缓存里 | 58 ms | 58 ms | 56 ms |
+| reader，前缀从另一个节点的 Grace 内存读回 | 66 ms | 65 ms | 64 ms |
+
+`kv_peer_read` 一列是在当前提交上跑的 `run_slurm.sh`：`DEMO_RESULT PASS`，reader 节点只有 GPU 0 收到 896 MiB（两轮各 448 MiB），节点 0 的 store 512 个对象、节点 1 的 0 个。
 
 ### 生产模型：恢复延迟（GLM-5.2-NVFP4，TP4，单节点）
 
@@ -419,7 +421,6 @@ HiCache：160 GB/rank，cookbook 参数（write_back），每节点主机内存 
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
 - 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」），
   并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过恢复延迟、多轮回放、gsm8k 与两个节点的跨 Engine 共享（见「实测」）；端到端只在两个节点上跑过，PD 分离没测过。
-- 数据面换成 `kv_peer_read` 后，本示例的 `run_slurm.sh` 演示（Qwen2，`BACKEND=egm`）还没在当前提交上重跑；同一套 store 与 linker 在「实测」的复测中跑通。
 - linker 不覆盖 MTP 的 draft 层：所有负载测试都没开 MTP（cookbook 的 GLM-5.2 配方默认开）。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
