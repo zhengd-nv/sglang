@@ -784,6 +784,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.begin_insert_walk()
         # External linker offloads (BackupKV) issued by this insert carry its session.
         self.insert_session_id = params.session_id
+        publication_hook = getattr(self, "publication_hook", None)
+        if publication_hook is not None:
+            publication_hook.begin()
+        result = None
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -792,16 +796,28 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
-                    return step.result
+                    result = step.result
+                    break
                 step = self.tree_core.resume_insert()
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
             try:
                 self._apply_cache_actions(self.tree_core.end_insert())
+            except BaseException:
+                if publication_hook is not None:
+                    publication_hook.abort()
+                raise
             finally:
                 self.insert_session_id = None
-            if self.buffer_pipeline is not None:
-                self.buffer_pipeline.end_insert_walk()
+                if self.buffer_pipeline is not None:
+                    self.buffer_pipeline.end_insert_walk()
+            # Exceptions from the walk still execute the actions above, but
+            # cannot enqueue any of this transaction's captures.
+            if publication_hook is not None and result is None:
+                publication_hook.abort()
+        if publication_hook is not None:
+            publication_hook.commit()
+        return result
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:

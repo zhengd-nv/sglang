@@ -1552,6 +1552,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.pending_actions.append(
                     FreeDeviceKV([with_page_span(dup[swa_already_freed:], span)])
                 )
+
+        # A retry encounters the surviving canonical Full view, never the
+        # request-private duplicate pages freed by the actions above.
+        publication_hook = getattr(self, "publication_hook", None)
+        if publication_hook is not None:
+            publication_hook.stage(
+                node.component_data[BASE_COMPONENT_TYPE].content_span
+            )
         self._finish_insert_walk_node(state, node, prefix_len)
 
     def _finish_insert_walk_node(
@@ -1763,7 +1771,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         self.kv_events.record_store(new_node, session_id=session_id)
+        self._capture_full_content(new_node)
         return new_node
+
+    def _capture_full_content(self, node):
+        """Owner-only sidecar capture; no extra walk or publication/hash work."""
+        hook = getattr(self, "publication_hook", None)
+        if hook is None:
+            return
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        parent = node.parent
+        parent_content = parent.component_data[BASE_COMPONENT_TYPE].content_span
+        cd.content_span = hook.materialize(
+            node.key,
+            cd.page_span,
+            hook.parent_cursor(parent_content, parent is self.root_node),
+            previous=cd.content_span,
+        )
+        hook.stage(cd.content_span)
 
     def _unevict_node_on_insert(
         self,
@@ -1794,6 +1819,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             medium=StorageMedium.GPU,
             session_id=session_id,
         )
+        self._capture_full_content(node)
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
