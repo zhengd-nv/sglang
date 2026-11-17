@@ -245,6 +245,7 @@ from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.managers.schedule_batch import (
+    ExtendAllocation,
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -4528,6 +4529,25 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        prepared = self._prepare_new_batch_prefill(running_batch)
+        if prepared is None:
+            return None, running_batch
+        new_batch, adder, allocation = self._allocate_new_batch_prefill(
+            running_batch, prepared, prefill_delayer_single_pass, allocation_only=False
+        )
+        if new_batch is None:
+            return None, running_batch
+        return self._finish_new_batch_prefill(
+            new_batch, adder, running_batch, allocation=allocation
+        )
+
+    def _prepare_new_batch_prefill(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[Tuple[int, int, int]]:
+        """The pass's running batch size, chunk size and tile size; None skips it.
+
+        Takes no KV, so lockstep caches can agree on its result first.
+        """
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4545,7 +4565,7 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
-            return None, running_batch
+            return None
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4559,7 +4579,7 @@ class Scheduler(
                 ),
             )
         ):
-            return None, running_batch
+            return None
 
         num_allocatable_reqs = self.get_num_allocatable_reqs(
             running_bs, running_batch=running_batch
@@ -4581,7 +4601,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            return None, running_batch
+            return None
 
         # After the early returns, so a full-batch pass does not scan the queue.
         self._ack_waiting_health_checks()
@@ -4604,7 +4624,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return None
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -4622,6 +4642,21 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        return running_bs, chunked_prefill_size, prefill_tile_block_m
+
+    def _allocate_new_batch_prefill(
+        self,
+        running_batch: ScheduleBatch,
+        prepared: Tuple[int, int, int],
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        *,
+        allocation_only: bool,
+    ) -> Tuple[
+        Optional[ScheduleBatch], Optional[PrefillAdder], Optional[ExtendAllocation]
+    ]:
+        """Select requests and take their KV; ``allocation_only`` stops before
+        forward metadata and returns what was taken."""
+        running_bs, chunked_prefill_size, prefill_tile_block_m = prepared
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4851,7 +4886,7 @@ class Scheduler(
             self._maybe_log_schedule_decision(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
             )
-            return None, running_batch
+            return None, None, None
 
         can_run_set = set(can_run_list)
         if self.enable_unified_cache_external_linker:
@@ -4884,7 +4919,8 @@ class Scheduler(
             can_run_list=can_run_list, running_batch=running_batch, adder=adder
         )
 
-        set_time_batch(can_run_list, "set_forward_entry_time")
+        if not allocation_only:
+            set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4904,13 +4940,36 @@ class Scheduler(
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
+        if allocation_only:
+            return new_batch, adder, new_batch.prepare_for_extend_allocation()
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-
         new_batch.prepare_for_extend()
+        return new_batch, adder, None
+
+    def _finish_new_batch_prefill(
+        self,
+        new_batch: ScheduleBatch,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+        *,
+        allocation: Optional[ExtendAllocation],
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """Finish the batch: metadata of an ``allocation``-only pass, then stats."""
+        can_run_list = adder.can_run_list
+        if allocation is not None:
+            new_batch.finish_prepare_for_extend(allocation)
+            set_time_batch(can_run_list, "set_forward_entry_time")
+            if (
+                self.enable_hierarchical_cache
+                or self.enable_unified_cache_external_linker
+            ):
+                new_batch.hicache_consumer_index = (
+                    self.tree_cache.ready_to_load_host_cache()
+                )
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
