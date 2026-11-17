@@ -310,6 +310,22 @@ class PrefillBudget:
         self.current_offset += immediate
 
 
+class SlotGuardPrefillBudget(PrefillBudget):
+    """Common-epoch F+E-R admission, including continuing chunks."""
+
+    def _available_and_evictable(self):
+        return self.allocator.available_and_evictable_size(
+            self.tree_cache.evictable_size()
+        )
+
+    def available_chunk_tokens(self, chunk_limit):
+        available = min(
+            chunk_limit, int(self.remaining_total), int(self.remaining_current)
+        )
+        available = available // self.page_size * self.page_size
+        return available if available > 0 else None
+
+
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
 

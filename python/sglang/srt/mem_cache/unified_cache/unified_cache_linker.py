@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.allocator.page_identity import PageSpan, cpu_page_identity
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -787,6 +788,14 @@ class UnifiedCacheLinkerWrapper:
                 evicted[window.component_type] = end if skipped else max(0, end - kept)
             prefix = self.cache.path_device_indices(state.anchor_node_id)
             assert len(prefix) == start
+            page_span = None
+            if cpu_page_identity(self.cache.token_to_kv_pool_allocator) is not None:
+                tail_span = by_pool[PoolName.KV].page_span
+                if tail_span is None or tail_span.token_length != len(full):
+                    raise ValueError("restored Full tail lacks CPU page provenance")
+                page_span = PageSpan.concat(
+                    (self.cache.path_cpu_page_span(state.anchor_node_id), tail_span)
+                )
             # The normal insert protects the borrowed prefix and frees duplicate
             # fetched slots. Avoid writing the just-fetched data back to storage.
             mamba = by_pool.get(PoolName.MAMBA)
@@ -798,6 +807,7 @@ class UnifiedCacheLinkerWrapper:
                 InsertParams(
                     key=state.key,
                     value=torch.cat([prefix, full]),
+                    page_span=page_span,
                     mamba_value=mamba.device_indices if mamba is not None else None,
                     prev_prefix_len=start,
                     inserted_len=end,
@@ -806,7 +816,7 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
-            if self.request_prefetch:
+            if self.request_prefetch or page_span is not None:
                 node = inserted.last_device_node
                 self.prefetch_holds[request] = (
                     node,

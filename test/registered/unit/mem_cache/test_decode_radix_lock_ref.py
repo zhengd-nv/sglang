@@ -71,6 +71,7 @@ def _make_cache_with_pools(page_size=1):
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
     mock_allocator.page_size = page_size
+    mock_allocator.cpu_page_identity.return_value = None
 
     # req_to_token pool: stores kv indices per request slot
     max_seq_len = 64
