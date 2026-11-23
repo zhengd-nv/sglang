@@ -2,8 +2,8 @@
 
 This checkout contains the SlotGuard source protection, dynamic prefetch linker,
 request lifecycle extensions, and the fixed #49474 peer reader. No checkout of
-sglang2 or a separate experiment workspace is required. It stacks on #49474 and
-on #48820 with its request-release extension; KVCR #45650 is not a prerequisite.
+sglang2 or a separate experiment workspace is required. The branch composition,
+PR mapping and test record are in `L1UP-STATUS.md` at the repository root.
 This is a runnable draft, not a claim that all lifecycle faults or hardware
 configurations have passed.
 
@@ -121,7 +121,7 @@ replacement for that protocol migration.
 The launcher, HTTP PD dispatcher, KVCM provisioning and transfer workload are
 adapted from the existing sglang2 measurement harness. The small `gate_client`
 package has no imports of its old admin, performance or workspace helpers.
-SlotGuard integration follows those prerequisites as separate commits.
+SlotGuard integration is a layered commit stack; see `L1UP-STATUS.md`.
 Upstream refuses `/pause_generation` and `/continue_generation` unless the server has an
 admin API key, so the launcher generates one for the prefill servers and the gate sends it.
 
