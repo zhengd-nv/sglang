@@ -701,6 +701,8 @@ class Envs:
     # Back the GLM DSA KV and index buffers with one FABRIC allocation each, fixed at
     # startup, so an NVLink peer can import the whole pool.
     SGLANG_GLM_DSA_FIXED_FABRIC_POOL = EnvBool(False)
+    # KvPeerReader num_blocks of the SlotGuard target engine.
+    SGLANG_L1_KV_PEER_BLOCKS = EnvInt(64)
 
     # ===================================================================
     # Scheduler token budgeting and admission
