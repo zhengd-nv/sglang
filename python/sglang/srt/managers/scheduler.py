@@ -4636,6 +4636,24 @@ class Scheduler(
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         self.prefill_admission_no_token = False
+        prepared = self._prepare_new_batch_prefill(running_batch)
+        if prepared is None:
+            return None, running_batch
+        new_batch, adder = self._allocate_new_batch_prefill(
+            running_batch, prepared, prefill_delayer_single_pass
+        )
+        if new_batch is None:
+            return None, running_batch
+        return self._finish_new_batch_prefill(new_batch, adder, running_batch)
+
+    def _prepare_new_batch_prefill(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[Tuple[int, int, int, int, int]]:
+        """The pass's running batch size, chunk size, prefill token limit, mixed
+        decode tokens and tile size; None skips it.
+
+        Takes no KV, so lockstep caches can agree on its result first.
+        """
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4653,7 +4671,7 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
-            return None, running_batch
+            return None
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
@@ -4667,7 +4685,7 @@ class Scheduler(
                 ),
             )
         ):
-            return None, running_batch
+            return None
 
         num_allocatable_reqs = self.get_num_allocatable_reqs(
             running_bs, running_batch=running_batch
@@ -4689,7 +4707,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            return None, running_batch
+            return None
 
         # After the early returns, so a full-batch pass does not scan the queue.
         self._ack_waiting_health_checks()
@@ -4713,7 +4731,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
-            return None, running_batch
+            return None
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
@@ -4741,6 +4759,28 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        return (
+            running_bs,
+            chunked_prefill_size,
+            max_prefill_tokens,
+            num_mixed_decode_tokens,
+            prefill_tile_block_m,
+        )
+
+    def _allocate_new_batch_prefill(
+        self,
+        running_batch: ScheduleBatch,
+        prepared: Tuple[int, int, int, int, int],
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+    ) -> Tuple[Optional[ScheduleBatch], Optional[PrefillAdder]]:
+        """Select requests, take their KV and prepare the extend batch."""
+        (
+            running_bs,
+            chunked_prefill_size,
+            max_prefill_tokens,
+            num_mixed_decode_tokens,
+            prefill_tile_block_m,
+        ) = prepared
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4986,7 +5026,7 @@ class Scheduler(
             self._maybe_log_schedule_decision(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
             )
-            return None, running_batch
+            return None, None
 
         can_run_set = set(can_run_list)
         if self.enable_unified_cache_external_linker:
@@ -5044,8 +5084,17 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-
         new_batch.prepare_for_extend()
+        return new_batch, adder
+
+    def _finish_new_batch_prefill(
+        self,
+        new_batch: ScheduleBatch,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        """Finish the batch: prefill stats and mixed chunked prefill."""
+        can_run_list = adder.can_run_list
         self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)

@@ -2005,6 +2005,14 @@ def branch_checkpoint(
     return None
 
 
+class ExtendAllocation(msgspec.Struct, frozen=True):
+    """What `ScheduleBatch.prepare_for_extend_allocation` took for an extend batch."""
+
+    out_cache_loc: torch.Tensor
+    req_pool_indices: torch.Tensor
+    req_pool_indices_cpu: torch.Tensor
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2407,6 +2415,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        self.finish_prepare_for_extend(self.prepare_for_extend_allocation())
+
+    def prepare_for_extend_allocation(self) -> ExtendAllocation:
+        """Take the batch's request rows and KV slots and write its rows.
+
+        A cache that allocates in lockstep across TP ranks runs only this half
+        inside its common step, so that step builds no forward metadata.
+        """
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2415,33 +2431,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[r.prefix_len :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        extend_num_tokens = sum(r.extend_len for r in reqs)
         seq_lens = [r.extend_end for r in reqs]
-        orig_seq_lens = [max(r.extend_end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [r.prefix_len for r in reqs]
         extend_lens = [r.extend_len for r in reqs]
-        extend_logprob_start_lens = [
-            compute_extend_logprob_start_len(
-                logprob_start_len=r.logprob_start_len,
-                prefix_len=prefix_lens[i],
-                extend_len=extend_lens[i],
-                full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
-            )
-            for i, r in enumerate(reqs)
-        ]
 
         _pin = is_pin_memory_available(self.device)
-        # Stay on pinned CPU; H2D is deferred to forward stream via
-        # resolve_forward_inputs.
-        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -2476,6 +2475,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+        return ExtendAllocation(
+            out_cache_loc=out_cache_loc,
+            req_pool_indices=req_pool_indices_tensor,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+        )
+
+    def finish_prepare_for_extend(self, allocation: ExtendAllocation):
+        """Build the forward metadata of the batch `allocation` was taken for."""
+        out_cache_loc = allocation.out_cache_loc
+        req_pool_indices_tensor = allocation.req_pool_indices
+        req_pool_indices_cpu = allocation.req_pool_indices_cpu
+        reqs = self.reqs
+        input_ids = [r.get_fill_ids()[r.prefix_len :] for r in reqs]
+        extend_num_tokens = self.extend_num_tokens
+        seq_lens = [r.extend_end for r in reqs]
+        orig_seq_lens = [max(r.extend_end, len(r.origin_input_ids)) for r in reqs]
+        prefix_lens, extend_lens = self.prefix_lens, self.extend_lens
+        seq_lens_tensor, seq_lens_cpu = self.seq_lens, self.seq_lens_cpu
+        extend_logprob_start_lens = [
+            compute_extend_logprob_start_len(
+                logprob_start_len=r.logprob_start_len,
+                prefix_len=prefix_lens[i],
+                extend_len=extend_lens[i],
+                full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
+            )
+            for i, r in enumerate(reqs)
+        ]
+        _pin = is_pin_memory_available(self.device)
+        # Stay on pinned CPU; H2D is deferred to the forward stream.
+        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        orig_seq_lens_tensor = torch.tensor(
+            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
 
         # Set fields
         input_embeds = []
