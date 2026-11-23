@@ -1022,6 +1022,16 @@ class Envs:
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
     # ===================================================================
+    # SlotGuard L1 KV sharing over NVLink (external cache linker)
+    # ===================================================================
+    # Path of the JSON serving manifest; the bearer token stays in its own env var.
+    SGLANG_NVLINK_CONFIG = EnvStr(None)
+    # JSONL transfer trace path prefix, suffixed with ".rank<N>"; unset disables it.
+    SGLANG_NVLINK_TRACE_PATH = EnvStr(None)
+    # Test-only byte check of each restored page against its source; needs TRACE_PATH.
+    SGLANG_NVLINK_VERIFY_BYTES = EnvBool(False)
+
+    # ===================================================================
     # MoRI transport and expert dispatch
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)

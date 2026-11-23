@@ -458,6 +458,10 @@ class KVCacheConfigurator:
             and not self.is_draft_worker
         )
 
+    # Private RAM only: contains a POC bearer token, never put on ServerArgs.
+    _nvlink_serving_config: Any = field(default=None, init=False, repr=False)
+    _nvlink_config_loaded: bool = field(default=False, init=False, repr=False)
+
     @property
     def draft_attn_tp_size(self) -> int:
         if self.draft_parallel_layout is not None:
@@ -3151,6 +3155,34 @@ class KVCacheConfigurator:
     ) -> BaseTokenToKVPoolAllocator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
+        memory = get_memory()
+        if (
+            not self._nvlink_config_loaded
+            and memory.enable_unified_cache_external_linker
+            and memory.unified_cache_external_linker_backend == "dynamic"
+            and (memory.unified_cache_external_linker_config or {}).get(
+                "linker_module_path"
+            )
+            == "sglang.srt.mem_cache.l1_transfer.slotguard_linker"
+            and (memory.unified_cache_external_linker_config or {}).get("linker")
+            == "SlotGuardLinker"
+        ):
+            from sglang.srt.mem_cache.l1_transfer.config import ServingConfig
+
+            self._nvlink_serving_config = ServingConfig.from_env(get_parallel().tp_rank)
+            self._nvlink_config_loaded = True
+        if self._nvlink_serving_config is not None:
+            from sglang.srt.mem_cache.l1_transfer.config import (
+                validate_slotguard_factory,
+            )
+
+            validate_slotguard_factory(
+                self,
+                self._nvlink_serving_config,
+                get_parallel(),
+                memory,
+                get_schedule(),
+            )
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
@@ -3280,6 +3312,32 @@ class KVCacheConfigurator:
                             current_platform.get_paged_allocator_cls()
                             or PagedTokenToKVPoolAllocator
                         )
+                        allocator_kwargs = {}
+                        config = self._nvlink_serving_config
+                        if config is not None:
+                            from sglang.srt.mem_cache.allocator.slotguard_paged import (
+                                SlotGuardPagedTokenToKVPoolAllocator,
+                            )
+
+                            if (
+                                paged_allocator_cls is not PagedTokenToKVPoolAllocator
+                                or get_schedule().page_size != 64
+                                or get_parallel().attn_dcp_size != 1
+                                or self.pp_size != 1
+                                or self.attn_dp_size != 1
+                                or self.is_draft_worker
+                                or not is_deepseek_dsa(self.model_config.hf_config)
+                            ):
+                                raise ValueError(
+                                    "unsupported SlotGuard allocator topology"
+                                )
+                            paged_allocator_cls = SlotGuardPagedTokenToKVPoolAllocator
+                            allocator_kwargs = {
+                                "slot_guard": config.slotguard_limits.make_guard(
+                                    config.directory.target.incarnation
+                                ),
+                                "active": False,
+                            }
                         token_to_kv_pool_allocator = paged_allocator_cls(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
@@ -3288,7 +3346,23 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            **allocator_kwargs,
                         )
+
+            if self._nvlink_serving_config is not None:
+                from sglang.srt.mem_cache.allocator.slotguard_paged import (
+                    SlotGuardPagedTokenToKVPoolAllocator,
+                )
+
+                config = self._nvlink_serving_config
+                if (
+                    type(token_to_kv_pool_allocator)
+                    is not SlotGuardPagedTokenToKVPoolAllocator
+                ):
+                    raise ValueError(
+                        "SlotGuard requires the supported plain paged pool"
+                    )
+                token_to_kv_pool_allocator._frozen_serving_config = config
 
             if get_memory().enable_hisparse and is_compressed_kv_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
