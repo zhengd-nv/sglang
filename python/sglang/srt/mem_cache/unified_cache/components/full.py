@@ -167,6 +167,10 @@ class FullComponent(TreeComponent):
             new_parent.component_data[ct].metadata["host_uuid"] = host_uuid
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
+        if child_cd.content_span is not None:
+            content = child_cd.content_span
+            new_parent.component_data[ct].content_span = content.slice(0, split_len)
+            child_cd.content_span = content.slice(split_len, content.length)
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()

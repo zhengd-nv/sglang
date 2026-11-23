@@ -150,6 +150,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.l1_transfer.publication_capture import (
+        CanonicalPublicationHook,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         BaseEvictionResult,
     )
@@ -232,6 +235,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Installed by CanonicalPublicationHook.attach; None leaves insert unchanged.
+    publication_hook: Optional[CanonicalPublicationHook] = None
 
     def __init__(
         self,
@@ -798,6 +803,21 @@ class UnifiedRadixCache(BasePrefixCache):
             identity.page_refs(params.page_span)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
+        publication_hook = self.publication_hook
+        if publication_hook is None:
+            return self._pump_insert(params)
+        # begin() may refuse (closed hook, new pool epoch) before any walk state exists.
+        publication_hook.begin()
+        try:
+            result = self._pump_insert(params)
+        except BaseException:
+            # A failed walk, final action or walk cleanup enqueues none of its captures.
+            publication_hook.abort()
+            raise
+        publication_hook.commit()
+        return result
+
+    def _pump_insert(self, params: InsertParams) -> InsertResult:
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
         # External linker offloads (BackupKV) issued by this insert carry its session.
@@ -818,8 +838,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._apply_cache_actions(self.tree_core.end_insert())
             finally:
                 self.insert_session_id = None
-            if self.buffer_pipeline is not None:
-                self.buffer_pipeline.end_insert_walk()
+                if self.buffer_pipeline is not None:
+                    self.buffer_pipeline.end_insert_walk()
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:

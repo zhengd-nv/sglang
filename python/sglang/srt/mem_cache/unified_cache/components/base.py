@@ -109,6 +109,8 @@ class ComponentData:
     session_ids: Optional[set[str]] = None
     # Physical page identities mirror value slicing; never read from the GPU.
     page_span: Any = None
+    # Opt-in immutable CPU content view, independent of KV event recording.
+    content_span: Any = None
 
 
 class _AbsentComponentData(ComponentData):

@@ -10,6 +10,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.allocator.page_identity import PageSpan
+from sglang.srt.mem_cache.l1_transfer.publication_capture import ContentSpan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -52,6 +53,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "value": "divide",
             "host_value": "divide",
             "page_span": "divide",
+            "content_span": "divide",
             "lock_ref": "copy",
             "host_lock_ref": "copy",
             "session_ref": "copy",
@@ -62,6 +64,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "value": "divide",
             "host_value": "divide",
             "page_span": "reset",
+            "content_span": "reset",
             "lock_ref": "copy",
             "host_lock_ref": "copy",
             "session_ref": "copy",
@@ -74,6 +77,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             "value": "reset",
             "host_value": "reset",
             "page_span": "reset",
+            "content_span": "reset",
             "lock_ref": "reset",
             "host_lock_ref": "reset",
             "session_ref": "reset",
@@ -127,6 +131,14 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
             cd.page_span = PageSpan(
                 tuple(range(1, self.CHILD_LEN + 1)), 1, 0, self.CHILD_LEN
             )
+            cd.content_span = ContentSpan(
+                object(),
+                None,
+                array("q", range(self.CHILD_LEN)).tobytes(),
+                0,
+                self.CHILD_LEN,
+                cd.page_span,
+            )
         return node
 
     def _split(self, component_type):
@@ -172,7 +184,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
                         )
                     elif rule == "divide":
                         self.assertIsNotNone(got, f"{component_type.name}.{name}")
-                        if name == "page_span":
+                        if name in ("page_span", "content_span"):
                             span = getattr(before, name)
                             self.assertEqual(got, span.slice(0, self.SPLIT_LEN))
                             self.assertEqual(
