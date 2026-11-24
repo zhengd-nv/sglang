@@ -9,6 +9,103 @@
 
 这里的「节点」即 Slurm 节点，GB200 NVL72 上对应一个 compute tray（4 GPU + 2 Grace）；节点内按 NUMA 划分。
 
+## 进展：11-23 同步会关心的问题（2026-11-24）
+
+本节回答 2026-11-23 同步会针对下文「生产模型：两个 Engine 跨节点共享」提出的问题。数字都来自生产模型上的实测，模拟的部分单独标出；此前的数字仍在后面的「实测」一节。
+
+**记号**：E = 本分支的 `egm` 后端（store + master）；H = SGLang HiCache（本地主机内存 L2，160 GB/rank，cookbook 参数，write_back）；
+R = 本分支的 Mooncake direct linker 改走 RDMA，Mooncake store 用 host DRAM（不用 EGM）。
+
+**共同配置**：`nvidia/GLM-5.2-NVFP4`，每个节点一个 TP4 Engine，前面一个 `sglang_router` 0.3.2；agentx-harness 1.0.13 回放（256k 语料，同「生产模型：多轮 agentic 回放」），
+每个 Engine 平均 32 个会话并发，测 900 s。E 每节点 2 × 300 GiB store 加一个 master；R 每节点 2 × 300 GiB Mooncake provider；H 每节点主机内存 640 GB。
+同一组节点上各臂先后跑。每个 Engine 的排队取自 Engine 的 `/metrics`（每 15 s 抓一次，只算测量窗口）；「迁移」按请求 ID 把每一轮对到 Engine 上，
+统计同一会话的下一轮换了 Engine 的比例。
+
+**路由**：亲和 = `cache_aware`（默认阈值）；只看负载 = `power_of_two` + `SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests`（在全部 Engine 里选 router 在途请求最少的）；
+P2C 按 token = `power_of_two` + `SGLANG_ROUTER_P2C_LOAD_METRIC=tokens`（随机挑两个 Engine，比它们 `/v1/loads` 报的 `num_total_tokens`，即已用 KV 加排队请求的 token，router 每 5 s 拉一次）。
+
+### 答复一览
+
+| # | 问题 | 答复 |
+|---|---|---|
+| 1 | 亲和调度有没有考虑负载均衡；HiCache 有没有淘汰 | `cache_aware` 有均衡分支，但比的是 router 记的各 Engine 在途请求数（默认差超过 64 且超过 1.5 倍才触发）；这个负载下每个 Engine 的运行加排队最多 42–50 个，不可能触发。实际起均衡作用的是「前缀匹配率低时发到在途最少的 Engine」：会话首轮按负载放置，之后粘在原 Engine。把阈值调到 abs 4–16 也几乎不起作用（见「路由消融」）。HiCache 的主机层在每个臂都写满并持续淘汰，写入量是容量的 14–22 倍 |
+| 2 | 只考虑负载均衡的实验 | 两节点、四节点都跑了。只看负载时 E 的命中不变，H 掉到一半以下：两节点 E ÷ H = 1.93，四节点 2.29。两节点下两个 Engine 的排队均衡（平均等待差 16%），不需要按 token 均衡；四节点下只看在途数不够，按 token 的 P2C 明显更好（模拟，见「路由消融」）|
+| 3 | 扩到四节点体现负载均衡的效果 | 四个 Engine 时亲和的失衡有限：请求数差 1.7–1.8 倍，平均等待差约 1.5 倍。只看负载反而更不均衡：H 有一个 Engine 平均等 156 s，其余 44–57 s。E 仍以亲和吞吐最高 |
+| 4 | 体现迁移 cache 的优势 | 会话换了 Engine 后，E 的那一轮仍命中 95–97%，H 只有 32–42%，所以 E ÷ H 随迁移率上升：亲和 1.07–1.11，两节点只看负载 1.93，四节点 2.29。迁移也有代价：迁移过来的请求要在新 Engine 的 GPU 里为整段前缀（约 100K token）重新分配 KV，排队更久（两节点多 15 s），而 prefill 时间与要新算的 token 不变。所以对 E 最好的仍是亲和；不得不放弃亲和时，P2C 按 token 只比亲和低 3–5%，只看负载低 20%（模拟）|
+| 5 | 随机路由下 E 的 TTFT 中位数低 30%，吞吐却不变 | 分布变宽，不是变快。TTFT 均值相同（29.1 vs 29.2 s），中位数的下降由尾部补回（p90 高 45%、p99 高 69%）：回放是闭环的，在途请求数固定，吞吐不变则平均延迟不变。随机路由没有负载反馈，两个 Engine 长期一轻一重（测量期平均排队 30.1 vs 7.9），落在轻的一边很快、重的一边很慢。站得住的是「E 让吞吐不依赖亲和」|
+| 6 | 对比 EGM 与 Mooncake RDMA | 生产模型上同一前缀从 L2 恢复，R 的开销是 E 的 2.0–2.4 倍，但只占 TTFT 的 3–8%；到端到端又被排队（占服务端 TTFT 的 94–99%）摊薄：两节点 agentx 三次运行 E ÷ R = 1.045 / 1.075 / 1.037，命中相同。负载下 R 的解码还慢 3–6%，原因未查。Mooncake EGM（nvlink）没有再加实验 |
+| 7 | 每个节点的排队时间 | 排队占服务端 TTFT 的 94–99%，吞吐由 GPU 的 KV 容量决定。各 Engine 的平均等待见下表。E 从两方面影响排队：要新算的 token 少，每个请求占用 KV 的时间短；命中不依赖亲和，路由可以按负载分发。代价是迁移后在新 Engine 上重新分配 KV（见第 4 条）|
+
+### 路由与迁移（生产模型）
+
+**两个节点**（并发 64）：
+
+| 路由 | E tok/s | H tok/s | E ÷ H | 命中 E / H | 迁移率 E / H | 迁移后那一轮的命中 E / H | TTFT p90 / p99 s，E | H |
+|---|---|---|---|---|---|---|---|---|
+| 亲和 | 953 | 873 | 1.09 | 90–91% / 87–88% | — | — | 52.9 / 65.6 | 56.6 / 79.7 |
+| 随机 | 936 | 511 | 1.83 | 90% / 54–57% | — | — | 76.7 / 111.1 | 139.7 / 157.0 |
+| 只看负载 | 927 | 481 | **1.93** | 90% / 62% | 44% / 43% | 97% / **42%** | 75.5 / 119.8 | 155.8 / 261.7 |
+
+亲和与随机是「实测」里第二次运行的数字，那时还没有逐请求归属，没有迁移率。三种路由在三对不同的节点上，每种路由的 E / H 在同一对节点上。
+
+**四个节点**（并发 128）：
+
+| 路由 | E tok/s | H tok/s | E ÷ H | 命中 E / H | 迁移率 E / H | 迁移后那一轮的命中 E / H | TTFT p90 / p99 s，E | H |
+|---|---|---|---|---|---|---|---|---|
+| 亲和 | 2352（2405）| 2163 | 1.09–1.11 | 89% / 86% | 1% / 1% | — | 59.8 / 99.0 | 70.5 / 111.3 |
+| 只看负载 | 2082 | 910 | **2.29** | 89% / 36% | 69% / 80% | 95% / **37%** | 86.0 / 179.0 | 136.2 / 558.2 |
+
+- E 亲和一臂在另一组四个节点上补跑（第一次因端口冲突没起来），所以它与其余三臂是跨作业比较。那一次最后约 3 分钟有一个节点的 Engine 报 `CUDA error: unspecified launch failure` 退出，7% 的请求出错，原因未查；括号里是出错前 825 s 的吞吐。
+- 只看负载让 E 的吞吐比亲和低 12–13%，TTFT p99 从 99 s 升到 179 s；H 低 58%。
+
+**每个 Engine 的平均等待**（测量窗口，s）：
+
+| | 两节点只看负载 | 四节点亲和 | 四节点只看负载 |
+|---|---|---|---|
+| E | 32.6 / 28.1 | 27.5 / 40.0 / 28.6 / — | 32.5 / 31.2 / 23.5 / 53.4 |
+| H | 71.8 / 47.9 | 27.1 / 32.5 / 26.7 / 42.7 | 56.9 / **156.4** / 44.3 / 48.8 |
+
+- 「—」：出错的那个 Engine 缺测量结束时的快照。
+- 两节点只看负载时，E 迁移过来的轮比留在原 Engine 的多排队（38.3 vs 23.6 s），而服务端 prefill（0.41 vs 0.40 s）与要新算的 token（3.1K vs 3.3K）相同；调度是 FCFS。四节点只看负载时迁移率 69%，多数轮都在付这笔代价，两者的排队接近（34.1 vs 31.2 s），Engine 之间的不均衡成了主导。
+
+### 路由消融（模拟）
+
+单节点上 4 个 TP1 Engine 跑 GLM-5.2-NVFP4 的前 20 层，模拟四个生产 Engine：GPU 的 KV 池、store 与 HiCache 主机层的容量都按 token 对齐生产。
+与生产对照过：命中率、迁移率、排队的方向一致，与上面四节点的三项比较方向全部吻合；但单个 Engine 的速度约为生产的两倍，所以只用来排先后，不报幅度。
+只跑 E，每个作业以亲和为锚点，同一节点上先后跑：
+
+| 路由 | 吞吐相对亲和 | 迁移率 | 迁移后那一轮的命中 |
+|---|---|---|---|
+| `cache_aware` 调小均衡阈值（abs 16 / 8 / 4）| +0.7% / −0.7% / +0.1% | 1% / 3% / 11% | 18% / 78% / 93% |
+| P2C 按 token | −3.0% / −4.8%（两个作业）| 73–75% | 96% |
+| 只看负载 | −20.1% | 64% | 96% |
+
+- 调小阈值几乎不起作用：每个会话粘在一个 Engine 上，各 Engine 的在途请求数本来就接近，失衡在于每个请求带来的工作量。
+- 只看负载与 P2C 按 token 的迁移率相近，E 在迁移后都命中 96%，差别全在负载信号：只看在途数时 Engine 时而空着（队列非空的时间 48–54%，亲和 65–71%），时而堆出 100 以上的队列。
+- 同一配置在不同节点上，各 Engine 平均等待的差距在 1.3–2.1 倍之间变化，TTFT p99 在 33–47 s 之间变化，比候选之间的差别还大，所以这里只比吞吐。
+- `prefix_hash` 不能用：HTTP router 不向策略传 token（`sgl-model-gateway/src/routers/http/router.rs` 里是 `tokens: None`），选不出 worker。
+
+### EGM 与 Mooncake RDMA
+
+R 的配置：Mooncake 的构建同 `build_mooncake.sh`（`522b716` 加 grouped-scatter 补丁）。每节点每 NUMA 一个 provider，挂 host DRAM segment（Mooncake 默认按网卡所在的 NUMA 分段），master 在其中一个节点上。
+Engine 用本分支的 Mooncake direct linker，`--hicache-storage-backend-extra-config` 与 `start_server.sh` 相同，只是 `"protocol": "rdma"`、`"device_name": "mlx5_0,mlx5_1,mlx5_3,mlx5_4"`，
+另加 `--enable-linker-mla-dedup`（rank 0 读后广播，对应 `egm` 的 `broadcast`）；`MC_MS_AUTO_DISC=0`，不设 `MC_FORCE_MNNVL`。本示例的 `start_server.sh` 仍只走 nvlink。
+
+| 层 | 负载 | E | R | 差别 |
+|---|---|---|---|---|
+| 机理：Qwen2-1.5B TP1，两节点，负载下恢复 p50 / p99（ms）| 2048 / 16384 token 前缀 | 14.0 / 16.6，19.7 / 22.5 | 14.9–15.0 / 17.3–17.7，26.4–26.8 / 29.6–30.4 | 16384 时 E 快约 26%；跨节点与本节点都只差不到 0.6 ms |
+| 生产模型单请求：GLM TP4，单节点，l2 ÷ l1 的 TTFT 之比（同「生产模型：恢复延迟」）| 128K × 8 / 256K × 2 / 512K × 2 | 1.066 / 1.041 / 1.029 | 1.144 / 1.096 / 1.059 | 恢复开销（l2 − l1）E 0.18–0.40 s，R 0.42–0.82 s，R 是 E 的 2.0–2.4 倍 |
+| 生产模型 agentx：两节点，只看负载 | 并发 64（两次）/ 32 | 920 / 949 / 790 tok/s | 880 / 883 / 761 tok/s | **E ÷ R = 1.045 / 1.075 / 1.037**，命中都是 90–92% |
+
+- 三次 agentx 运行里 R 的服务端「加载 + prefill」多 0.07–0.21 s，TTFT 中位数 E 低 13–22%（24.0 vs 30.7、24.5 vs 28.5、4.2 vs 4.8 s），吞吐只高 3.7–7.5%：
+  排队占服务端 TTFT 的 94–99%，并发从 64 降到 32 也没有降低这个占比（这个负载的请求成批到达）。
+- 负载下 R 的解码也更慢：ITL p50 高 3–6%（E 11.8–12.9 ms，R 12.4–13.4 ms）；没有并发负载时两者 TPOT 相同。原因未查，吞吐差里它与恢复速度各占多少还分不开。
+- 运维上，R 的 provider 是普通锁页内存，4–6 s 起来；E 的 300 GiB HOST_NUMA store 常拿不到（见「排查」）。
+
+### 进行中
+
+同一组四个节点上一次跑 E 的亲和 / P2C 按 token / 只看负载、H 的 P2C 按 token / 亲和、R 的只看负载：核对 P2C 按 token 在真实四节点上是否接近亲和、它下面 E 相对 H 的增量，以及四节点迁移率约 70% 时 E ÷ R 是否变大。
+
 ## 两种后端
 
 用 `BACKEND` 选择，两者用同一个客户端、同一套判据：
@@ -130,7 +227,7 @@ master 后台在总使用率超过 90% 时按租约到期顺序淘汰约 5%，�
 - 本分支对应的 SGLang nightly 容器，例如 `lmsysorg/sglang:nightly-dev-cu13-20261102-38d9e4a3`；
   本分支装进去，或者把 `<repo>/python` 放在 `PYTHONPATH` 最前面。
 - 一个两个节点都能看到的目录（下文的 `WORK`），放构建产物、作业密钥与运行日志。
-- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）；`egm` 另在 `nvidia/GLM-5.2-NVFP4` TP4 上测过恢复延迟、多轮回放与精度，以及两个节点各一个 Engine 的跨 Engine sharing 与 store 写满后的稳态（见「实测」）。
+- 用 `Qwen/Qwen2-1.5B` TP1 测过（普通 MHA 模型都应该能用）；`egm` 另在 `nvidia/GLM-5.2-NVFP4` TP4 上测过恢复延迟、多轮回放与精度，两个与四个节点上每节点一个 Engine 的跨 Engine sharing、不同路由，store 写满后的稳态，以及与 Mooncake RDMA 的对比（见开头「进展」与「实测」）。
 
 ## 1. 构建（一次，在容器里）
 
@@ -420,7 +517,7 @@ HiCache：160 GB/rank，cookbook 参数（write_back），每节点主机内存 
 - 只能在一个 NVL72 域内用。跨域导入另一个节点的 fabric 内存会失败（CUDA 800，not permitted）；
   `egm` 在服务启动时比 `ClusterUUID` 直接拒绝，`mooncake` 在首次拷贝时报错。跨域请用走 RDMA 的 Mooncake。
 - 本示例只演示 TP1、关 overlap 调度。`egm` 另外验证过 MLA / DSA 池（GLM-5.2）与 TP2（见「分支内容」），
-  并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过恢复延迟、多轮回放、gsm8k 与两个节点的跨 Engine 共享（见「实测」）；端到端只在两个节点上跑过，PD 分离没测过。
+  并在 GLM-5.2-NVFP4 TP4、开 overlap 下跑过恢复延迟、多轮回放、gsm8k 与两个、四个节点的跨 Engine 共享（见「进展」与「实测」）；PD 分离没测过。
 - linker 不覆盖 MTP 的 draft 层：所有负载测试都没开 MTP（cookbook 的 GLM-5.2 配方默认开）。
 - direct linker 不能和 `--enable-hierarchical-cache` 同时开，所以没有本地主机层：从 GPU 淘汰的内容只存在于 store 里。
 - chunked prefill 遇到 store 读失败仍返回 503，而不是重算。
@@ -435,7 +532,7 @@ HiCache：160 GB/rank，cookbook 参数（write_back），每节点主机内存 
 |---|---|
 | `start_store.sh` 报 `mooncake_master exited` | 该节点上元数据（18080）、RPC（50051）或 metrics（19003）端口被占。设 `METADATA_PORT` / `MASTER_PORT` / `METRICS_PORT`，`start_server.sh` 也设同样的 `METADATA_PORT` / `MASTER_PORT` |
 | provider 或 EGM store 报 `invalid argument` | 它看不到所在 NUMA 的入口 GPU。`PROVIDER_GPUS` 保持全部 GPU |
-| provider 或 EGM store 报 EGM 分配失败（`CUDA result 2` / out of memory）| 该节点这块 NUMA 上空闲内存不够分配 pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 `POOL_GIB`。300 GiB 的 store 偶尔在账面空闲比申请多约 65 GiB 时也会失败（11 次中 1 次），原因未查，换节点即可 |
+| provider 或 EGM store 报 EGM 分配失败（`CUDA result 2` / out of memory）| 该节点这块 NUMA 上空闲内存不够分配 pool。先看 `/sys/devices/system/node/node*/meminfo`，换节点或调小 `POOL_GIB`。300 GiB 的 store 常在 NUMA 1 上失败，而账面空闲比申请多 50–70 GiB：HOST_NUMA 按 2 MiB 粒度锁页、不为此回收页缓存。一次失败时 NUMA 1 空闲 370 GiB，其中 ≥ 2 MiB 的连续块只有约 286 GiB（`/proc/buddyinfo`，64K 页内核为 order ≥ 5），另有约 79 GiB 页缓存。四节点作业的 8 个节点里多数 NUMA 1 拿不到 300 GiB、255 GiB 能拿到；每 NUMA 定在 250 GiB 以内，或失败时缩容重试 |
 | 服务启动时报 `is in NVLink domain ..., this Engine in ...` | `egm`：列表里有别的 NVL72 域的 store。两个节点不在一个域，Slurm 上加 `--segment` |
 | 服务启动时报 `bad or missing secret` | `egm`：两边用的不是同一个 `SECRET_FILE` |
 | 重启的服务报 `Duplicate rpc_meta key` | `mooncake`：上一个实例被杀时没有注销 transfer-engine 端点。换一个 `TE_PORT` 或重启 master |
